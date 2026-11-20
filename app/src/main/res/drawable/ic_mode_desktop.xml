@@ -1,0 +1,18 @@
+<!--
+  Desktop mode: computer monitor. Squarer panel on a center stem with a base
+  foot. Pairs with ic_mode_theater (see the differentiator note there).
+  Stroke-drawn; strokeColor is a placeholder tinted at runtime.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M5,5 L19,5 A1,1 0 0 1 20,6 L20,15 A1,1 0 0 1 19,16 L5,16 A1,1 0 0 1 4,15 L4,6 A1,1 0 0 1 5,5 Z M12,16 L12,19 M8,20 L16,20"
+        android:strokeWidth="2"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+</vector>

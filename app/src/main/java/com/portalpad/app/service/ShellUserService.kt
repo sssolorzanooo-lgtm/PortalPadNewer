@@ -1,0 +1,3232 @@
+package com.portalpad.app.service
+
+import android.content.Context
+import android.graphics.Rect
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.os.Binder
+import android.os.IBinder
+import android.os.ParcelFileDescriptor
+import android.os.Process
+import android.os.SystemClock
+import android.util.Log
+import android.view.InputDevice
+import android.view.InputEvent
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.Surface
+import com.portalpad.app.DisplayUtil
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.lang.reflect.Method
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * Privileged helper running inside Shizuku's process (shell UID 2000).
+ *
+ * Architecture (reference-behavior analysis):
+ *
+ *   1. createVirtualDisplay(name, w, h, dpi, flags, surface) — VD backed by
+ *      caller-provided Surface (caller owns the Surface, e.g. ImageReader).
+ *      Returns a virtual display id which becomes a TRUSTED display.
+ *   2. startSurfaceMirror(physicalGlassesId, surface) — mirrors the glasses'
+ *      content INTO our Surface. Two paths:
+ *      a) DisplayManager.createVirtualDisplay(name, w, h, glassesId, surface)
+ *         — preferred — uses the glasses display id as input
+ *      b) SurfaceControl reflection — fallback for OEMs where (a) fails
+ *
+ * Then clicks target the VD id (not glasses id). VD is trusted and we own it.
+ *
+ * Heavy reflection because SurfaceControl APIs are @hide.
+ */
+class ShellUserService : IShellService.Stub {
+
+    private var context: Context? = null
+
+    // Cached reflection — set up once
+    private var inputManager: Any? = null
+    private var injectInputEventMethod: Method? = null
+    private val injectModeAsync = 0
+    private val injectModeWaitForResult = 1
+    private var displayManagerGlobal: Any? = null
+    private var dmCreateMirrorMethod: Method? = null
+    private var getDisplayInfoMethod: Method? = null
+    private var scClass: Class<*>? = null
+    private var scOpenTransaction: Method? = null
+    private var scCloseTransaction: Method? = null
+    private var scCreateDisplay: Method? = null
+    private var scDestroyDisplay: Method? = null
+    private var scSetDisplayLayerStack: Method? = null
+    private var scSetDisplayProjection: Method? = null
+    private var scSetDisplaySurface: Method? = null
+    private var setMotionDisplayId: Method? = null
+    private var setKeyDisplayId: Method? = null
+    private var setActionButtonMethod: Method? = null
+
+    private var reflectionBroken = false
+    private var lastMouseActionButton = 0
+    @Volatile private var cachedTouchDeviceId: Int? = null
+    @Volatile private var cachedMouseDeviceId: Int? = null
+
+    private val virtualDisplays = ConcurrentHashMap<Int, VirtualDisplay>()
+    private val mirrorVirtualDisplays = ConcurrentHashMap<Int, VirtualDisplay>()
+    private val surfaceMirrorTokens = ConcurrentHashMap<Int, IBinder>()
+
+    @Suppress("unused")
+    constructor() {
+        reapStaleHelpers()
+        setupReflection()
+        Log.d(TAG, "ShellUserService init (no-arg); uid=${Process.myUid()}")
+    }
+
+    @Suppress("unused")
+    constructor(context: Context) {
+        this.context = context
+        reapStaleHelpers()
+        setupReflection()
+        Log.d(TAG, "ShellUserService init (Context); uid=${Process.myUid()}")
+    }
+
+    /**
+     * Kill any OTHER live PortalPad helper process before this one starts work.
+     *
+     * WHY (2026-07-25, Pixel 8 Pro session): helpers leak. SH's device had FIVE
+     * live `com.portalpad.app:portalpad_shell` processes at once — the app dying
+     * (or being reinstalled) without unbinding leaves the old helper running,
+     * and with it the shell-owned VirtualDisplay it created. Consequences seen
+     * in the field:
+     *   - a stale VD keeps hosting tasks, so a singleTask launch (the wallpaper
+     *     backdrop, Chrome) is brought to front on the DEAD display and the
+     *     panel stays black — only a phone reboot cleared it;
+     *   - stale helpers keep serving OLD code after an APK update, which made
+     *     three consecutive fixes look like they "didn't work".
+     *
+     * Safe by construction: this runs only when a NEW helper process starts
+     * (a rebind to a live helper doesn't re-run the constructor), i.e. before
+     * the app has created this session's VD. Killing the old processes takes
+     * their orphaned VDs with them. Same-uid (shell) kills are permitted; the
+     * app process is untouched — its cmdline has no `portalpad_shell` suffix.
+     */
+    private fun reapStaleHelpers() {
+        runCatching {
+            val self = Process.myPid()
+            var reaped = 0
+            java.io.File("/proc").listFiles()?.forEach { entry ->
+                val pid = entry.name.toIntOrNull() ?: return@forEach
+                if (pid == self) return@forEach
+                val cmdline = runCatching {
+                    java.io.File(entry, "cmdline").readText().replace('\u0000', ' ').trim()
+                }.getOrNull() ?: return@forEach
+                if (!cmdline.contains(HELPER_PROCESS_TAG)) return@forEach
+                runCatching {
+                    Process.killProcess(pid)
+                    reaped++
+                    Log.w(TAG, "REAP stale helper pid=$pid ($cmdline)")
+                }
+            }
+            if (reaped > 0) Log.w(TAG, "REAP done — $reaped stale helper(s) killed")
+        }.onFailure { Log.w(TAG, "REAP failed (non-fatal)", it) }
+    }
+
+    private fun setupReflection() {
+        try {
+            // ROOT CAUSE of "nothing injects on Pixel" (2026-07-25):
+            // AOSP REMOVED InputManager.getInstance() in Android 14 — the
+            // singleton and injectInputEvent moved to InputManagerGlobal.
+            // Samsung One UI (and the XREAL Beam Pro) keep the legacy method,
+            // so S24 always worked while stock Android silently failed here:
+            // getMethod threw → catch → reflectionBroken = true → EVERY
+            // injectPointer/injectKey/injectTap/injectSwipe became a no-op
+            // that still returned success to the caller. Try the modern class
+            // first, fall back to the legacy one.
+            var mgr: Any? = null
+            var injectMethod: Method? = null
+            runCatching {
+                val g = Class.forName("android.hardware.input.InputManagerGlobal")
+                val instance = g.getMethod("getInstance").invoke(null)
+                val m = g.getMethod(
+                    "injectInputEvent", InputEvent::class.java, Int::class.javaPrimitiveType,
+                )
+                if (instance != null) { mgr = instance; injectMethod = m }
+            }
+            if (mgr == null || injectMethod == null) {
+                val cls = Class.forName("android.hardware.input.InputManager")
+                mgr = cls.getMethod("getInstance").invoke(null)
+                injectMethod = cls.getMethod(
+                    "injectInputEvent", InputEvent::class.java, Int::class.javaPrimitiveType,
+                )
+            }
+            inputManager = mgr
+            injectInputEventMethod = injectMethod
+            setMotionDisplayId = runCatching {
+                MotionEvent::class.java.getMethod("setDisplayId", Int::class.javaPrimitiveType)
+            }.getOrNull()
+            setKeyDisplayId = runCatching {
+                KeyEvent::class.java.getMethod("setDisplayId", Int::class.javaPrimitiveType)
+            }.getOrNull()
+            setActionButtonMethod = runCatching {
+                MotionEvent::class.java.getMethod("setActionButton", Int::class.javaPrimitiveType)
+            }.getOrNull()
+            // KEYDIAG (Pixel D-pad, 2026-07-25): these lookups fail SILENTLY
+            // (getOrNull) and an unstamped key falls back to "the focused
+            // display" — invisible misrouting. Log resolution once at init so
+            // a capture shows stamping health without a debugger.
+            Log.w(
+                TAG,
+                "KEYDIAG reflect: mgr=${inputManager?.javaClass?.simpleName} " +
+                    "inject=${injectInputEventMethod != null} " +
+                    "motionStamp=${setMotionDisplayId != null} keyStamp=${setKeyDisplayId != null}",
+            )
+        } catch (t: Throwable) {
+            // LOUD: this used to fail silently and turn the whole Shizuku
+            // injection backend into a no-op (see the note above).
+            Log.e(TAG, "KEYDIAG reflect FAILED — Shizuku injection is DEAD", t)
+            reflectionBroken = true
+        }
+    }
+
+    /**
+     * Resolve an active InputDevice id matching [source] (fallback -1 virtual device, never 0).
+     * For SOURCE_MOUSE synthetic hover/click events, always use virtual -1 rather than a
+     * connected physical mouse's hardware id; stamping a physical mouse id wakes Android's
+     * black system PointerController cursor alongside PortalPad's white cursor.
+     */
+    private fun resolvePointerDeviceId(source: Int): Int {
+        val isMouse = (source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE || source == 8194
+        if (isMouse) return -1
+        val cached = cachedTouchDeviceId
+        if (cached != null) return cached
+        val resolved = runCatching {
+            InputDevice.getDeviceIds().firstOrNull { id ->
+                val dev = InputDevice.getDevice(id) ?: return@firstOrNull false
+                !dev.isVirtual && (dev.sources and InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
+            }
+        }.getOrNull() ?: -1
+        cachedTouchDeviceId = resolved
+        return resolved
+    }
+
+    // ─── Input injection ────────────────────────────────────────────────
+
+    override fun injectPointer(
+        action: Int, x: Float, y: Float, displayId: Int,
+        source: Int, buttonState: Int, downTime: Long,
+    ): Boolean {
+        if (reflectionBroken) return false
+        val mode = when (action) {
+            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE -> injectModeAsync
+            else -> injectModeWaitForResult
+        }
+        return injectInternal(
+            action = action,
+            x = x,
+            y = y,
+            displayId = displayId,
+            downTime = downTime,
+            eventTime = SystemClock.uptimeMillis(),
+            source = source,
+            buttonState = buttonState,
+            mode = mode,
+        )
+    }
+
+    private fun injectInternal(
+        action: Int, x: Float, y: Float, displayId: Int,
+        downTime: Long, eventTime: Long, source: Int, buttonState: Int,
+        mode: Int = injectModeAsync, actionButton: Int = 0,
+    ): Boolean {
+        val isMouse = (source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE || source == 8194
+        val props = MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = if (isMouse) MotionEvent.TOOL_TYPE_MOUSE else MotionEvent.TOOL_TYPE_FINGER
+        }
+        val coords = MotionEvent.PointerCoords().apply {
+            this.x = x; this.y = y
+            pressure = if (
+                buttonState != 0 ||
+                action == MotionEvent.ACTION_DOWN ||
+                action == MotionEvent.ACTION_MOVE
+            ) 1f else 0f
+            size = 1f
+        }
+        return try {
+            var effectiveActionButton = actionButton
+            val devId = resolvePointerDeviceId(source)
+            val event = MotionEvent.obtain(
+                downTime, eventTime, action, 1, arrayOf(props), arrayOf(coords),
+                0, buttonState, 1f, 1f, devId, 0, source, 0,
+            )
+            if (isMouse) {
+                if (effectiveActionButton == 0) {
+                    if (buttonState != 0) {
+                        lastMouseActionButton = buttonState
+                        effectiveActionButton = buttonState
+                    } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_BUTTON_RELEASE) {
+                        effectiveActionButton = lastMouseActionButton
+                    }
+                }
+                if (effectiveActionButton != 0) {
+                    runCatching {
+                        val m = setActionButtonMethod
+                            ?: MotionEvent::class.java.getMethod("setActionButton", Int::class.javaPrimitiveType)
+                                .also { setActionButtonMethod = it }
+                        m.invoke(event, effectiveActionButton)
+                    }
+                }
+                if (action == MotionEvent.ACTION_UP) lastMouseActionButton = 0
+            }
+            setDisplayId(event, displayId)
+            val accepted = (injectInputEventMethod?.invoke(inputManager, event, mode) as? Boolean)
+                ?: false
+            event.recycle()
+            accepted
+        } catch (t: Throwable) {
+            Log.e(TAG, "Inject failed (action=$action src=$source disp=$displayId)", t)
+            false
+        }
+    }
+
+    override fun injectScroll(x: Float, y: Float, vScroll: Float, hScroll: Float, displayId: Int) {
+        if (reflectionBroken) return
+        val now = SystemClock.uptimeMillis()
+        val props = MotionEvent.PointerProperties().apply {
+            id = 0; toolType = MotionEvent.TOOL_TYPE_MOUSE
+        }
+        val coords = MotionEvent.PointerCoords().apply {
+            this.x = x; this.y = y
+            setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll)
+            if (hScroll != 0f) setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll)
+        }
+        try {
+            val event = MotionEvent.obtain(
+                now, now, MotionEvent.ACTION_SCROLL, 1, arrayOf(props), arrayOf(coords),
+                0, 0, 1f, 1f, -1, 0, InputDevice.SOURCE_MOUSE, 0,
+            )
+            setDisplayId(event, displayId)
+            injectInputEventMethod?.invoke(inputManager, event, injectModeAsync)
+            event.recycle()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Scroll inject failed", t)
+        }
+    }
+
+    // Identity stamped on injected KeyEvents. Samsung keeps the historical
+    // deviceId=1 + FLAG_FROM_SYSTEM (proven across v1.x — do not change there).
+    // Stock Android apps that route keys per-device (Kodi) IGNORE arrows from
+    // device 1; the shell `input` tool's VIRTUAL_KEYBOARD identity (deviceId
+    // -1, flags 0) is what they accept. Proven on Pixel 8 Pro 2026-07-25:
+    // `input -d 51 keyevent 20` moved Kodi's focus while our device-1 events
+    // did nothing; BACK worked either way only because activity back-dispatch
+    // ignores device identity.
+    private val samsungKeyIdentity =
+        android.os.Build.MANUFACTURER.equals("samsung", ignoreCase = true)
+    private val injectedKeyDeviceId = if (samsungKeyIdentity) 1 else -1 // -1 = KeyCharacterMap.VIRTUAL_KEYBOARD
+    private val injectedKeyFlags = if (samsungKeyIdentity) KeyEvent.FLAG_FROM_SYSTEM else 0
+
+    override fun injectKey(keyCode: Int, action: Int, metaState: Int, displayId: Int, deviceId: Int) {
+        if (reflectionBroken) return
+        val now = SystemClock.uptimeMillis()
+        val event = KeyEvent(
+            now, now, action, keyCode, 0, metaState,
+            if (deviceId >= 0) deviceId else injectedKeyDeviceId, 0,
+            injectedKeyFlags, InputDevice.SOURCE_KEYBOARD,
+        )
+        try {
+            setDisplayId(event, displayId)
+            injectInputEventMethod?.invoke(inputManager, event, injectModeAsync)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Key inject failed", t)
+        }
+    }
+
+    override fun injectKeyPress(keyCode: Int, displayId: Int) {
+        injectKeyPressInternal(keyCode, displayId, InputDevice.SOURCE_KEYBOARD)
+    }
+
+    override fun injectGamepadKeyPress(keyCode: Int, displayId: Int) {
+        // Tag as gamepad — for the program keys (BUTTON_1..4), this matches
+        // what a real gamepad would send and gives key-mapping apps the best
+        // chance of capturing the event via their gamepad input pipeline.
+        injectKeyPressInternal(
+            keyCode,
+            displayId,
+            InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK,
+        )
+    }
+
+    private fun injectKeyPressInternal(keyCode: Int, displayId: Int, source: Int) {
+        if (reflectionBroken) return
+        // Real wall-clock gap (12ms) between DOWN and UP. This is the same
+        // pattern as injectTap below and is necessary for InputDispatcher on
+        // an external display to reliably accept the pair as one press.
+        //
+        // History: v0.17.71 removed the sleep to eliminate a "trail" bug
+        // (rapid taps queued up). The sleep itself wasn't the trail cause —
+        // a client-side blocking call was. Without ANY real gap, the
+        // dispatcher silently drops occasional presses, especially under
+        // rapid sequences. We're back on the SERVER side here, in a Shizuku
+        // worker thread; sleeping here doesn't block our client keyExecutor
+        // (it's a different process), so it costs nothing client-side. Net:
+        // reliable delivery, no client thread blocked.
+        val downTime = SystemClock.uptimeMillis()
+        val down = KeyEvent(
+            downTime, downTime, KeyEvent.ACTION_DOWN, keyCode, 0, 0,
+            injectedKeyDeviceId, 0, injectedKeyFlags, source,
+        )
+        try {
+            setDisplayId(down, displayId)
+            // KEYDIAG: per-press target trace. `readback` uses the event's own
+            // getDisplayId so a failed stamp shows up as -1 (INVALID) even
+            // when the setter reference is non-null but its invoke throws.
+            Log.w(
+                TAG,
+                "KEYDIAG key=$keyCode wantDisp=$displayId stamped=${setKeyDisplayId != null} " +
+                    "readback=${
+                        runCatching {
+                            InputEvent::class.java.getMethod("getDisplayId").invoke(down)
+                        }.getOrDefault(-999)
+                    } dev=$injectedKeyDeviceId flags=$injectedKeyFlags src=$source",
+            )
+            injectInputEventMethod?.invoke(inputManager, down, injectModeAsync)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Key DOWN inject failed", t)
+            return
+        }
+        try { Thread.sleep(12) } catch (_: InterruptedException) {}
+        val upTime = SystemClock.uptimeMillis()
+        val up = KeyEvent(
+            downTime, upTime, KeyEvent.ACTION_UP, keyCode, 0, 0,
+            injectedKeyDeviceId, 0, injectedKeyFlags, source,
+        )
+        try {
+            setDisplayId(up, displayId)
+            injectInputEventMethod?.invoke(inputManager, up, injectModeAsync)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Key UP inject failed", t)
+        }
+    }
+
+    private fun execShellInputTap(displayId: Int, x: Float, y: Float): Boolean = runCatching {
+        val flag = if (displayId > 0) "-d $displayId " else ""
+        val proc = ProcessBuilder("sh", "-c", "input ${flag}tap ${x.toInt()} ${y.toInt()}")
+            .redirectErrorStream(true)
+            .start()
+        val exit = proc.waitFor()
+        if (exit != 0) {
+            val out = proc.inputStream.bufferedReader().readText().trim()
+            Log.w(TAG, "shell input tap failed exit=$exit disp=$displayId out='$out'")
+        }
+        exit == 0
+    }.getOrDefault(false)
+
+    private fun execShellInputLongPress(
+        displayId: Int, x: Float, y: Float, durationMs: Long,
+    ): Boolean = runCatching {
+        val flag = if (displayId > 0) "-d $displayId " else ""
+        val ix = x.toInt(); val iy = y.toInt()
+        val proc = ProcessBuilder("sh", "-c", "input ${flag}swipe $ix $iy $ix $iy $durationMs")
+            .redirectErrorStream(true)
+            .start()
+        proc.waitFor() == 0
+    }.getOrDefault(false)
+
+    override fun injectTap(displayId: Int, x: Float, y: Float): Boolean {
+        if (reflectionBroken) return execShellInputTap(displayId, x, y)
+        // Tier 1: Verified SOURCE_TOUCHSCREEN tap with WAIT_FOR_RESULT (mode 1) and
+        // non-zero virtual/physical deviceId (Pixel Android 17 InputDispatcher can reject
+        // deviceId=0 or drop unverified async DOWN/UP pairs).
+        val now = SystemClock.uptimeMillis()
+        val touchDown = injectInternal(
+            action = MotionEvent.ACTION_DOWN,
+            x = x, y = y, displayId = displayId,
+            downTime = now, eventTime = now,
+            source = InputDevice.SOURCE_TOUCHSCREEN,
+            buttonState = 0,
+            mode = injectModeWaitForResult,
+        )
+        try { Thread.sleep(40) } catch (_: InterruptedException) {}
+        val touchUp = if (touchDown) {
+            injectInternal(
+                action = MotionEvent.ACTION_UP,
+                x = x, y = y, displayId = displayId,
+                downTime = now, eventTime = SystemClock.uptimeMillis(),
+                source = InputDevice.SOURCE_TOUCHSCREEN,
+                buttonState = 0,
+                mode = injectModeWaitForResult,
+            )
+        } else false
+        if (touchDown && touchUp) return true
+
+        // Tier 2: Full SOURCE_MOUSE sequence (ACTION_DOWN + BUTTON_PRIMARY ->
+        // ACTION_BUTTON_PRESS -> ACTION_BUTTON_RELEASE -> ACTION_UP) verified with WAIT_FOR_RESULT.
+        Log.w(TAG, "injectTap touch rejected disp=$displayId ($x,$y) down=$touchDown up=$touchUp; trying mouse")
+        val mNow = SystemClock.uptimeMillis()
+        val mDown = injectInternal(
+            action = MotionEvent.ACTION_DOWN,
+            x = x, y = y, displayId = displayId,
+            downTime = mNow, eventTime = mNow,
+            source = InputDevice.SOURCE_MOUSE,
+            buttonState = MotionEvent.BUTTON_PRIMARY,
+            mode = injectModeWaitForResult,
+            actionButton = MotionEvent.BUTTON_PRIMARY,
+        )
+        if (mDown) {
+            injectInternal(
+                action = MotionEvent.ACTION_BUTTON_PRESS,
+                x = x, y = y, displayId = displayId,
+                downTime = mNow, eventTime = mNow,
+                source = InputDevice.SOURCE_MOUSE,
+                buttonState = MotionEvent.BUTTON_PRIMARY,
+                mode = injectModeWaitForResult,
+                actionButton = MotionEvent.BUTTON_PRIMARY,
+            )
+            try { Thread.sleep(35) } catch (_: InterruptedException) {}
+            val mRel = SystemClock.uptimeMillis()
+            injectInternal(
+                action = MotionEvent.ACTION_BUTTON_RELEASE,
+                x = x, y = y, displayId = displayId,
+                downTime = mNow, eventTime = mRel,
+                source = InputDevice.SOURCE_MOUSE,
+                buttonState = 0,
+                mode = injectModeWaitForResult,
+                actionButton = MotionEvent.BUTTON_PRIMARY,
+            )
+            val mUp = injectInternal(
+                action = MotionEvent.ACTION_UP,
+                x = x, y = y, displayId = displayId,
+                downTime = mNow, eventTime = mRel,
+                source = InputDevice.SOURCE_MOUSE,
+                buttonState = 0,
+                mode = injectModeWaitForResult,
+                actionButton = MotionEvent.BUTTON_PRIMARY,
+            )
+            if (mUp) return true
+        }
+
+        // Tier 3: Direct shell `input [-d displayId] tap x y` inside shell UID 2000.
+        Log.w(TAG, "injectTap mouse also rejected disp=$displayId ($x,$y); falling back to shell input tap")
+        return execShellInputTap(displayId, x, y)
+    }
+
+    override fun injectLongPress(displayId: Int, x: Float, y: Float, durationMs: Long): Boolean {
+        if (reflectionBroken) return execShellInputLongPress(displayId, x, y, durationMs)
+        val now = SystemClock.uptimeMillis()
+        val downOk = injectInternal(
+            action = MotionEvent.ACTION_DOWN,
+            x = x, y = y, displayId = displayId,
+            downTime = now, eventTime = now,
+            source = InputDevice.SOURCE_TOUCHSCREEN,
+            buttonState = 0,
+            mode = injectModeWaitForResult,
+        )
+        if (!downOk) {
+            return execShellInputLongPress(displayId, x, y, durationMs)
+        }
+        var elapsed = 0L
+        while (elapsed < durationMs) {
+            try { Thread.sleep(50); elapsed += 50 } catch (_: InterruptedException) { break }
+            injectInternal(
+                action = MotionEvent.ACTION_MOVE,
+                x = x, y = y, displayId = displayId,
+                downTime = now, eventTime = now + elapsed,
+                source = InputDevice.SOURCE_TOUCHSCREEN,
+                buttonState = 0,
+                mode = injectModeAsync,
+            )
+        }
+        val upOk = injectInternal(
+            action = MotionEvent.ACTION_UP,
+            x = x, y = y, displayId = displayId,
+            downTime = now, eventTime = now + durationMs,
+            source = InputDevice.SOURCE_TOUCHSCREEN,
+            buttonState = 0,
+            mode = injectModeWaitForResult,
+        )
+        return downOk && upOk
+    }
+
+    override fun injectSwipe(displayId: Int, sx: Float, sy: Float, ex: Float, ey: Float, durationMs: Long) {
+        if (reflectionBroken) return
+        val now = SystemClock.uptimeMillis()
+        injectInternal(MotionEvent.ACTION_DOWN, sx, sy, displayId, now, now, InputDevice.SOURCE_TOUCHSCREEN, 0)
+        val steps = (durationMs / 16L).coerceAtLeast(2L)
+        for (i in 1..steps) {
+            val t = i.toFloat() / steps.toFloat()
+            val mx = sx + (ex - sx) * t; val my = sy + (ey - sy) * t
+            val tEvt = now + (durationMs * i / steps)
+            injectInternal(MotionEvent.ACTION_MOVE, mx, my, displayId, now, tEvt, InputDevice.SOURCE_TOUCHSCREEN, 0)
+            try { Thread.sleep(durationMs / steps) } catch (_: InterruptedException) { break }
+        }
+        injectInternal(MotionEvent.ACTION_UP, ex, ey, displayId, now, now + durationMs, InputDevice.SOURCE_TOUCHSCREEN, 0)
+    }
+
+    override fun injectPinch(
+        displayId: Int, cx: Float, cy: Float, startSpan: Float, endSpan: Float, durationMs: Long,
+    ) {
+        if (reflectionBroken) return
+        val now = SystemClock.uptimeMillis()
+        val src = InputDevice.SOURCE_TOUCHSCREEN
+        val props = arrayOf(
+            MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_FINGER },
+            MotionEvent.PointerProperties().apply { id = 1; toolType = MotionEvent.TOOL_TYPE_FINGER },
+        )
+        fun coordsFor(span: Float): Array<MotionEvent.PointerCoords> {
+            val half = span / 2f
+            return arrayOf(
+                MotionEvent.PointerCoords().apply { x = cx - half; y = cy; pressure = 1f; size = 1f },
+                MotionEvent.PointerCoords().apply { x = cx + half; y = cy; pressure = 1f; size = 1f },
+            )
+        }
+        fun send(action: Int, pointerCount: Int, eventTime: Long, c: Array<MotionEvent.PointerCoords>) {
+            try {
+                val ev = MotionEvent.obtain(
+                    now, eventTime, action, pointerCount,
+                    props.copyOfRange(0, pointerCount), c.copyOfRange(0, pointerCount),
+                    0, 0, 1f, 1f, 0, 0, src, 0,
+                )
+                setDisplayId(ev, displayId)
+                injectInputEventMethod?.invoke(inputManager, ev, injectModeAsync)
+                ev.recycle()
+            } catch (t: Throwable) {
+                Log.e(TAG, "injectPinch send failed (action=$action)", t)
+            }
+        }
+        val startC = coordsFor(startSpan)
+        // First pointer down, then the second (ACTION_POINTER_DOWN carries the
+        // new pointer's index in the high bits).
+        send(MotionEvent.ACTION_DOWN, 1, now, startC)
+        send(
+            MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2, now, startC,
+        )
+        val steps = (durationMs / 16L).coerceAtLeast(2L)
+        for (i in 1..steps) {
+            val t = i.toFloat() / steps.toFloat()
+            val span = startSpan + (endSpan - startSpan) * t
+            try { Thread.sleep(durationMs / steps) } catch (_: InterruptedException) { break }
+            send(MotionEvent.ACTION_MOVE, 2, now + (durationMs * i / steps), coordsFor(span))
+        }
+        val endC = coordsFor(endSpan)
+        send(
+            MotionEvent.ACTION_POINTER_UP or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2, now + durationMs, endC,
+        )
+        send(MotionEvent.ACTION_UP, 1, now + durationMs, endC)
+    }
+
+    // ─── Continuous pinch (stateful: gesture held open across calls) ─────────
+    private val pinchLock = Any()
+    @Volatile private var pinchActive = false
+    @Volatile private var pinchDeadline = 0L
+    @Volatile private var pinchLastSpan = 0f
+    private var pinchDownTime = 0L
+    private var pinchDisplayId = 0
+    private var pinchCx = 0f
+    private var pinchCy = 0f
+    private val pinchWatchdogMs = 500L
+    private val pinchWatchdogRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val pinchProps = arrayOf(
+        MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_FINGER },
+        MotionEvent.PointerProperties().apply { id = 1; toolType = MotionEvent.TOOL_TYPE_FINGER },
+    )
+
+    private fun pinchInject(action: Int, pointerCount: Int, eventTime: Long, span: Float) {
+        try {
+            val half = span / 2f
+            val coords = arrayOf(
+                MotionEvent.PointerCoords().apply { x = pinchCx - half; y = pinchCy; pressure = 1f; size = 1f },
+                MotionEvent.PointerCoords().apply { x = pinchCx + half; y = pinchCy; pressure = 1f; size = 1f },
+            )
+            val ev = MotionEvent.obtain(
+                pinchDownTime, eventTime, action, pointerCount,
+                pinchProps.copyOfRange(0, pointerCount), coords.copyOfRange(0, pointerCount),
+                0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0,
+            )
+            setDisplayId(ev, pinchDisplayId)
+            injectInputEventMethod?.invoke(inputManager, ev, injectModeAsync)
+            ev.recycle()
+        } catch (t: Throwable) {
+            Log.e(TAG, "pinchInject failed (action=$action)", t)
+        }
+    }
+
+    // Lift both pointers at the last known span. Caller must hold pinchLock.
+    private fun pinchReleaseLocked() {
+        if (!pinchActive) return
+        val t = SystemClock.uptimeMillis()
+        pinchInject(
+            MotionEvent.ACTION_POINTER_UP or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2, t, pinchLastSpan,
+        )
+        pinchInject(MotionEvent.ACTION_UP, 1, t, pinchLastSpan)
+        pinchActive = false
+    }
+
+    override fun pinchBegin(displayId: Int, cx: Float, cy: Float, span: Float) {
+        if (reflectionBroken) return
+        synchronized(pinchLock) {
+            // Close any stale session first so we never stack two gestures.
+            pinchReleaseLocked()
+            pinchDownTime = SystemClock.uptimeMillis()
+            pinchDisplayId = displayId
+            pinchCx = cx; pinchCy = cy
+            pinchLastSpan = span
+            pinchActive = true
+            pinchDeadline = pinchDownTime + pinchWatchdogMs
+            pinchInject(MotionEvent.ACTION_DOWN, 1, pinchDownTime, span)
+            pinchInject(
+                MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                2, pinchDownTime, span,
+            )
+        }
+        startPinchWatchdog()
+    }
+
+    override fun pinchMove(span: Float) {
+        synchronized(pinchLock) {
+            if (!pinchActive) return
+            pinchLastSpan = span
+            pinchDeadline = SystemClock.uptimeMillis() + pinchWatchdogMs
+            pinchInject(MotionEvent.ACTION_MOVE, 2, SystemClock.uptimeMillis(), span)
+        }
+    }
+
+    override fun pinchEnd(span: Float) {
+        synchronized(pinchLock) {
+            if (!pinchActive) return
+            pinchLastSpan = span
+            pinchReleaseLocked()
+        }
+    }
+
+    // Auto-release if the client stops streaming (dropped IPC / lost focus), so a
+    // held-open gesture can never become a stuck phantom touch on the display.
+    private fun startPinchWatchdog() {
+        if (!pinchWatchdogRunning.compareAndSet(false, true)) return
+        Thread {
+            try {
+                while (pinchActive) {
+                    Thread.sleep(40)
+                    if (pinchActive && SystemClock.uptimeMillis() > pinchDeadline) {
+                        Log.w(TAG, "pinch watchdog: no update in ${pinchWatchdogMs}ms — force-releasing")
+                        synchronized(pinchLock) { pinchReleaseLocked() }
+                        break
+                    }
+                }
+            } catch (_: InterruptedException) {
+            } finally {
+                pinchWatchdogRunning.set(false)
+            }
+        }.apply { isDaemon = true; name = "pinch-watchdog" }.start()
+    }
+
+    private fun setDisplayId(event: InputEvent, displayId: Int) {
+        // displayId 0 must be set EXPLICITLY: an unset event defaults to
+        // INVALID_DISPLAY (-1) = "the focused display", which is exactly wrong
+        // when the caller is trying to pull focus BACK to the phone (full log
+        // 2026-07-17 21:06:47.099: our display-0 key landed as d=-1 on the
+        // focused external display). Only negative means "leave default".
+        if (displayId < 0) return
+        try {
+            when (event) {
+                is MotionEvent -> setMotionDisplayId?.invoke(event, displayId)
+                is KeyEvent -> setKeyDisplayId?.invoke(event, displayId)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    // ─── IME policy ─────────────────────────────────────────────────────
+
+    override fun setDisplayImePolicy(displayId: Int, policy: Int): Boolean {
+        return try {
+            val wm = getWindowManagerService() ?: return false
+            val m = wm.javaClass.methods.firstOrNull {
+                it.name == "setDisplayImePolicy" && it.parameterCount == 2
+            }
+            m?.invoke(wm, displayId, policy)
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "setDisplayImePolicy failed", t); false
+        }
+    }
+
+    private fun getWindowManagerService(): Any? = try {
+        val sm = Class.forName("android.os.ServiceManager")
+        val binder = sm.getMethod("getService", String::class.java).invoke(null, "window") as? IBinder
+        val stub = Class.forName("android.view.IWindowManager\$Stub")
+        binder?.let { stub.getMethod("asInterface", IBinder::class.java).invoke(null, it) }
+    } catch (t: Throwable) { null }
+
+    private fun getInputMethodManagerService(): Any? = try {
+        val sm = Class.forName("android.os.ServiceManager")
+        val binder = sm.getMethod("getService", String::class.java)
+            .invoke(null, "input_method") as? IBinder
+        val stub = Class.forName("com.android.internal.view.IInputMethodManager\$Stub")
+        binder?.let { stub.getMethod("asInterface", IBinder::class.java).invoke(null, it) }
+    } catch (t: Throwable) {
+        Log.w(TAG, "getInputMethodManagerService failed", t); null
+    }
+
+    /**
+     * Force the soft keyboard to show on the currently focused editor. Used in
+     * phone-as-keyboard mode: routing now resolves the IME to display 0, but the
+     * focused field may not auto-raise it (we saw STATE_ALWAYS_HIDDEN). This asks
+     * the system to show it explicitly.
+     *
+     * Reachability is genuinely uncertain: showSoftInput is normally restricted to
+     * the focused client/IME, and its signature varies a lot across Android
+     * versions. We grab the focused window token from IWindowManager, then try the
+     * known showSoftInput shapes on IInputMethodManager, logging the available
+     * signatures so an on-device run reveals the exact one. Returns true only if a
+     * call completed without throwing.
+     */
+    override fun showImeOnFocusedEditor(): Boolean {
+        return try {
+            val imm = getInputMethodManagerService() ?: run {
+                Log.w(TAG, "showIme: no IInputMethodManager"); return false
+            }
+            // Best-effort: focused window token (some One UI builds expose this).
+            val wm = getWindowManagerService()
+            val windowToken: IBinder? = wm?.let { svc ->
+                listOf("getFocusedWindowToken", "getFocusedWindowTokenFromWindow").firstNotNullOfOrNull { name ->
+                    runCatching {
+                        svc.javaClass.methods.firstOrNull { it.name == name && it.parameterCount == 0 }
+                            ?.invoke(svc) as? IBinder
+                    }.getOrNull()
+                }
+            }
+            Log.d(TAG, "showIme: windowToken=${if (windowToken != null) "present" else "null"}")
+
+            val showMethods = imm.javaClass.methods.filter { it.name == "showSoftInput" }
+            if (showMethods.isEmpty()) {
+                Log.w(TAG, "showIme: no showSoftInput method on IInputMethodManager. Methods: " +
+                    imm.javaClass.methods.filter { it.name.contains("show", true) || it.name.contains("Input") }
+                        .joinToString { it.name + "(" + it.parameterTypes.joinToString { p -> p.simpleName } + ")" })
+                return false
+            }
+            for (m in showMethods) {
+                val types = m.parameterTypes
+                Log.d(TAG, "showIme: trying showSoftInput(${types.joinToString { it.simpleName }})")
+                val args = arrayOfNulls<Any?>(types.size)
+                for (i in types.indices) {
+                    val t = types[i]
+                    args[i] = when {
+                        t == IBinder::class.java -> windowToken          // windowToken slot(s)
+                        t == Int::class.javaPrimitiveType -> 0           // flags / toolType / reason
+                        else -> null                                     // client, statsToken, resultReceiver
+                    }
+                }
+                val ok = runCatching { m.invoke(imm, *args) }.fold(
+                    onSuccess = { true },
+                    onFailure = { Log.w(TAG, "showIme: invoke failed", it); false },
+                )
+                if (ok) { Log.i(TAG, "showIme: showSoftInput call completed"); return true }
+            }
+            false
+        } catch (t: Throwable) {
+            Log.w(TAG, "showImeOnFocusedEditor failed", t); false
+        }
+    }
+
+    /**
+     * Hide the currently shown IME from InputMethodManagerService itself.
+     *
+     * Direct mode's editor belongs to the external app while the IME is drawn on
+     * display 0. TrackpadActivity therefore has no served View/window token, so
+     * both of its public client-side hide APIs are rejected with
+     * PHASE_CLIENT_VIEW_SERVED. Android 16 exposes this zero-argument server-side
+     * test API specifically without a client token. The shell identity used by
+     * Shizuku/root has TEST_INPUT_METHOD on the target device (verified
+     * 2026-07-20). Invoke it once only for the user's explicit Back/hide action.
+     */
+    override fun hideImeFromServer(): Boolean {
+        return try {
+            val imm = getInputMethodManagerService() ?: run {
+                Log.w(TAG, "hideImeFromServer: no IInputMethodManager")
+                return false
+            }
+            val method = imm.javaClass.methods.firstOrNull {
+                it.name == "hideSoftInputFromServerForTest" && it.parameterCount == 0
+            } ?: run {
+                Log.w(TAG, "hideImeFromServer: method unavailable")
+                return false
+            }
+            runCatching { method.invoke(imm) }.fold(
+                onSuccess = {
+                    Log.i(TAG, "DIAG-NATIVEKB server-side IME hide invoked")
+                    true
+                },
+                onFailure = {
+                    Log.w(TAG, "hideImeFromServer invocation failed", it)
+                    false
+                },
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "hideImeFromServer failed", t)
+            false
+        }
+    }
+
+    /**
+     * True when a soft keyboard is currently showing. Used by the native-keyboard
+     * path to decide whether the phone keyboard actually came up for an
+     * external-display field, or whether we must fall back to the relay page.
+     *
+     * EVIDENCE: showImeOnFocusedEditor's failure log on this ROM (SM-S921U,
+     * One UI / Android 16) dumped IInputMethodManager's methods — there is NO
+     * showSoftInput (which is why forcing a show never worked here), but there
+     * IS isInputMethodShown(). That makes VERIFICATION possible even where
+     * FORCING isn't, which is exactly what the native path needs: the field tap
+     * itself raises the keyboard (proven in a clean capture 2026-07-19), we only
+     * need to know whether it did.
+     *
+     * Best-effort: returns false if the method is absent or the call throws, and
+     * the caller treats false as "fall back to the relay" — so a wrong answer
+     * costs a relay page, never a dead keyboard.
+     */
+    override fun isImeShown(): Boolean {
+        return try {
+            val imm = getInputMethodManagerService() ?: run {
+                Log.w(TAG, "isImeShown: no IInputMethodManager"); return false
+            }
+            val m = imm.javaClass.methods.firstOrNull {
+                it.name == "isInputMethodShown" && it.parameterCount == 0
+            }
+            if (m == null) {
+                Log.w(
+                    TAG,
+                    "isImeShown: no isInputMethodShown() on IInputMethodManager. Methods: " +
+                        imm.javaClass.methods.filter { it.name.contains("shown", true) || it.name.contains("visible", true) }
+                            .joinToString { it.name + "(" + it.parameterTypes.joinToString { p -> p.simpleName } + ")" },
+                )
+                return false
+            }
+            val shown = runCatching { m.invoke(imm) as? Boolean }.getOrNull() ?: false
+            Log.d(TAG, "isImeShown -> $shown")
+            shown
+        } catch (t: Throwable) {
+            Log.w(TAG, "isImeShown failed", t); false
+        }
+    }
+
+    // ─── Display system-decoration promotion (experimental) ─────────────
+
+    /**
+     * Enable system decorations (home/IME/wallpaper) + cross-app launching on
+     * [displayId]. For the experimental app-owned VD path: the app creates a
+     * plain (non-trusted) VirtualDisplay in its own process, then asks us —
+     * the privileged process — to promote it once. Unlike a TRUSTED flag (set
+     * only at creation, requires shell uid), system decorations can be toggled
+     * on an existing display via IWindowManager.setShouldShowSystemDecors,
+     * which needs INTERNAL_SYSTEM_WINDOW (i.e. this shell/system process).
+     */
+    override fun setShouldShowSystemDecors(displayId: Int, shouldShow: Boolean): Boolean {
+        return try {
+            val wm = getWindowManagerService() ?: return false
+            val m = wm.javaClass.methods.firstOrNull {
+                it.name == "setShouldShowSystemDecors" && it.parameterCount == 2
+            }
+            m?.invoke(wm, displayId, shouldShow)
+            Log.d(TAG, "setShouldShowSystemDecors($displayId, $shouldShow) ok=${m != null}")
+            m != null
+        } catch (t: Throwable) {
+            Log.w(TAG, "setShouldShowSystemDecors failed", t); false
+        }
+    }
+
+    // ─── Virtual display lifecycle ──────────────────────────────────────
+
+    /**
+     * Lazily obtain a system-uid context using ActivityThread reflection.
+     *
+     * Background: when our user service calls
+     * `DisplayManager.createVirtualDisplay()` using the "app" context
+     * (`Service.getApplicationContext()`), the framework rejects it with
+     *   `SecurityException: packageName must match the calling uid`
+     * because the app context's packageName is "com.portalpad.app" (which
+     * is owned by our app's uid), but the call arrives at the framework
+     * from shell uid (2000). The framework's safety check fails the
+     * mismatch.
+     *
+     * the reference implementation works around this by obtaining a **system context** through
+     * ActivityThread reflection. The system context's packageName is
+     * "android" which the framework accepts for any privileged uid (root,
+     * shell, system). With it, createVirtualDisplay passes the uid check.
+     *
+     * Two ActivityThread methods can give us this:
+     *   1. `ActivityThread.currentActivityThread()` — returns the cached
+     *      thread instance for the current process. Cheap. Does NOT create
+     *      any Handler internally, so it works from any thread, including
+     *      Binder threads without a Looper. This is the path we prefer.
+     *   2. `ActivityThread.systemMain()` — creates a new ActivityThread
+     *      and a Handler bound to the current thread's Looper. If the
+     *      thread has no Looper (most Binder threads), this throws
+     *      `Can't create handler inside thread ... that has not called
+     *      Looper.prepare()`. We only fall back to this if (1) fails,
+     *      and we do it via the main looper.
+     */
+    @Volatile private var systemCtx: Context? = null
+    private fun obtainSystemContext(): Context? {
+        systemCtx?.let { return it }
+
+        // Path 1: currentActivityThread — works on any thread, no Looper needed.
+        runCatching {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val current = atClass.getMethod("currentActivityThread").invoke(null)
+            if (current != null) {
+                val ctx = atClass.getMethod("getSystemContext").invoke(current) as? Context
+                if (ctx != null) {
+                    systemCtx = ctx
+                    Log.d(TAG, "obtained system context via ActivityThread.currentActivityThread()")
+                    return ctx
+                }
+            }
+        }.onFailure {
+            Log.w(TAG, "currentActivityThread path failed: ${it.javaClass.simpleName}: ${it.message}")
+        }
+
+        // Path 2: systemMain — must be called on a thread with a Looper.
+        // Use the main Looper. Block briefly to receive the result.
+        runCatching {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val mainLooper = android.os.Looper.getMainLooper()
+            val handler = android.os.Handler(mainLooper)
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val result = AtomicReference<Context?>(null)
+            val error = AtomicReference<Throwable?>(null)
+            handler.post {
+                try {
+                    val thread = atClass.getMethod("systemMain").invoke(null)
+                    if (thread != null) {
+                        val ctx = atClass.getMethod("getSystemContext").invoke(thread) as? Context
+                        result.set(ctx)
+                    }
+                } catch (t: Throwable) {
+                    error.set(t)
+                } finally {
+                    latch.countDown()
+                }
+            }
+            if (latch.await(2, java.util.concurrent.TimeUnit.SECONDS)) {
+                error.get()?.let { throw it }
+                result.get()?.let {
+                    systemCtx = it
+                    Log.d(TAG, "obtained system context via ActivityThread.systemMain() on main looper")
+                    return it
+                }
+            } else {
+                Log.w(TAG, "systemMain path: main-looper post timed out after 2s")
+            }
+        }.onFailure {
+            Log.e(TAG, "systemMain path failed", it)
+        }
+
+        return null
+    }
+
+    // Experimental high-refresh VD toggle. true = try the VirtualDisplayConfig
+    // path (which can request the panel's max refresh) FIRST; false = original
+    // behaviour only. Flip to false to instantly revert if the trusted-VD wrap
+    // regresses (IME on display, volume rocker, SmartTube, recording).
+    private val REQUEST_HIGH_REFRESH_VD = false
+
+    /**
+     * EXPERIMENTAL high-refresh VD path. Same shell-uid context and same [flags] as
+     * [tryCreateVirtualDisplaySystemContext], but constructs the VD via
+     * VirtualDisplayConfig so it can call setRequestedRefreshRate(). The app-owned
+     * VD is otherwise created fixed at 60 Hz (dumpsys: "PortalPad Session" fps=60.0,
+     * supportedRefreshRates []), which caps the whole chain — the external panel can
+     * only present what the 60 Hz VD produces, so no amount of panel-side coaxing
+     * gets past 60. Requesting the panel's max rate (120 on the One Pro) lets the VD
+     * feed 120 frames so the panel's 120 mode can actually engage.
+     *
+     * Returns -1 on ANY failure, OR when the display exposes no mode above 60 at this
+     * resolution — so the caller falls through to the proven 6-arg path and existing
+     * behaviour is the guaranteed fallback. The VirtualDisplayConfig path MAY treat
+     * flags differently from the 6-arg API (the documented reason it isn't already
+     * the default), so the wrap must be regression-tested before this is trusted.
+     */
+    private fun tryCreateVirtualDisplayHighRefresh(
+        name: String, width: Int, height: Int, densityDpi: Int, flags: Int, surface: Surface?,
+    ): Int {
+        if (!REQUEST_HIGH_REFRESH_VD) return -1
+        if (surface == null) return -1
+        return try {
+            val sysCtx = obtainSystemContext() ?: return -1
+            val shellCtx = createContextForCallingUid(sysCtx) ?: return -1
+            val dm = shellCtx.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager ?: return -1
+            // Highest refresh the external panel offers at THIS resolution. The
+            // internal panel is a different resolution so it won't match; a 60-only
+            // link (or SBS canvas with no >60 mode) yields nothing and we fall through.
+            val target = dm.displays
+                .flatMap { it.supportedModes.asList() }
+                .filter { it.physicalWidth == width && it.physicalHeight == height }
+                .maxOfOrNull { it.refreshRate } ?: 0f
+            if (target <= 60.5f) {
+                Log.d(TAG, "HighRefresh: no >60 mode at ${width}x$height; falling through to proven path")
+                return -1
+            }
+            val config = android.hardware.display.VirtualDisplayConfig.Builder(name, width, height, densityDpi)
+                .setFlags(flags)
+                .setSurface(surface)
+                .setRequestedRefreshRate(target)
+                .build()
+            val vd = dm.createVirtualDisplay(config) ?: run {
+                Log.w(TAG, "HighRefresh: createVirtualDisplay(config) returned null; falling through")
+                return -1
+            }
+            val vdId = vd.display.displayId
+            virtualDisplays[vdId] = vd
+            Log.d(TAG, "createVirtualDisplay [path=HighRefresh pkg=${shellCtx.opPackageName}] '$name' " +
+                "id=$vdId flags=0x${flags.toString(16)} requestedRefreshRate=${"%.1f".format(target)}")
+            vdId
+        } catch (t: Throwable) {
+            val cause = t.cause ?: t
+            Log.w(TAG, "HighRefresh threw (falling through to proven path): ${cause.javaClass.simpleName}: ${cause.message}")
+            -1
+        }
+    }
+
+    override fun createVirtualDisplay(
+        name: String, width: Int, height: Int, densityDpi: Int, flags: Int, surface: Surface?,
+    ): Int {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            // Multi-tier strategy. Order updated v0.17.42 — try the reference implementation's
+            // exact path FIRST. Their reference behavior shows they:
+            //
+            //   1. Get systemContext via ActivityThread (we have helper)
+            //   2. Call createContextForCallingUid(systemContext) — a
+            //      private helper that does `context.createPackageContext(
+            //      pm.getPackagesForUid(Process.myUid())[0], 0x2)` with
+            //      0x2 = Context.CONTEXT_IGNORE_SECURITY. The resulting
+            //      Context's getOpPackageName() reports "com.android.shell"
+            //      authoritatively (not just a wrapper claiming it).
+            //   3. Call ctx.getSystemService("display") on THAT context to
+            //      get a DisplayManager bound to shell uid context.
+            //   4. Call dm.createVirtualDisplay(name, w, h, dpi, surface,
+            //      flags) — the PUBLIC 6-arg API. No reflection.
+            //
+            // This is simpler and might behave differently from the
+            // DisplayManagerGlobal reflection path because the resulting
+            // VD is registered through the standard public API path with
+            // proper context binding — closer to how a real shell-uid
+            // app would create a display.
+            // Tier 0 (experimental, gated by REQUEST_HIGH_REFRESH_VD): build the VD
+            // via VirtualDisplayConfig so we can request the panel's max refresh —
+            // the app-owned VD is otherwise pinned at 60 Hz, capping the whole chain.
+            // Returns -1 (falls through) on any failure or a 60-only display.
+            val rHi = tryCreateVirtualDisplayHighRefresh(name, width, height, densityDpi, flags, surface)
+            if (rHi >= 0) return rHi
+
+            val r0 = tryCreateVirtualDisplaySystemContext(name, width, height, densityDpi, flags, surface)
+            if (r0 >= 0) return r0
+
+            // Try #1 & #2: hidden DMG paths with shell packageName
+            val r1 = tryCreateVirtualDisplayViaDMG(name, width, height, densityDpi, flags, surface)
+            if (r1 >= 0) return r1
+
+            val sysCtx = obtainSystemContext()
+            val appCtx = context
+
+            // Try #3: public DisplayManager via system context
+            sysCtx?.let { ctx ->
+                val r = tryCreateVirtualDisplay(ctx, "system", name, width, height, densityDpi, flags, surface)
+                if (r >= 0) return r
+            }
+
+            // Try #4: public DisplayManager via app context
+            appCtx?.let { ctx ->
+                val r = tryCreateVirtualDisplay(ctx, "app", name, width, height, densityDpi, flags, surface)
+                if (r >= 0) return r
+            }
+
+            -1
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    /**
+     * system-context direct VD creation. Derived from reference behavior
+     * `ShellUserService.createVirtualDisplay` (line 8298 onward).
+     *
+     * Approach:
+     *   1. systemCtx = ActivityThread.currentActivityThread().getSystemContext()
+     *   2. shellCtx = createContextForCallingUid(systemCtx)
+     *        — uses Context.createPackageContext with the FIRST package
+     *          owned by Process.myUid() (shell uid 2000 → "com.android.shell"),
+     *          flags = Context.CONTEXT_IGNORE_SECURITY (0x2).
+     *   3. dm = shellCtx.getSystemService("display") as DisplayManager
+     *   4. dm.createVirtualDisplay(name, w, h, dpi, surface, flags)
+     *
+     * Difference from `tryCreateVirtualDisplayViaDMG`: that method
+     * reflects into DisplayManagerGlobal and constructs a VirtualDisplayConfig
+     * with a packageName string. This method goes through the standard
+     * PUBLIC API path with a context whose packageName resolves to
+     * com.android.shell naturally — no manual packageName-passing. The
+     * VirtualDisplayConfig path may silently transform flags or drop fields
+     * the public API path preserves.
+     */
+    private fun tryCreateVirtualDisplaySystemContext(
+        name: String, width: Int, height: Int, densityDpi: Int, flags: Int, surface: Surface?,
+    ): Int {
+        return try {
+            val sysCtx = obtainSystemContext() ?: run {
+                Log.d(TAG, "SystemContext: no system context")
+                return -1
+            }
+            val shellCtx = createContextForCallingUid(sysCtx) ?: run {
+                Log.d(TAG, "SystemContext: createContextForCallingUid returned null")
+                return -1
+            }
+            val dm = shellCtx.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager ?: run {
+                Log.d(TAG, "SystemContext: getSystemService(display) didn't return DisplayManager")
+                return -1
+            }
+            val vd = dm.createVirtualDisplay(name, width, height, densityDpi, surface, flags)
+                ?: run {
+                    Log.w(TAG, "SystemContext: createVirtualDisplay returned null")
+                    return -1
+                }
+            val vdId = vd.display.displayId
+            virtualDisplays[vdId] = vd
+            Log.d(TAG, "createVirtualDisplay [path=SystemContext pkg=${shellCtx.opPackageName}] '$name' id=$vdId flags=0x${flags.toString(16)}")
+            vdId
+        } catch (t: Throwable) {
+            val cause = t.cause ?: t
+            Log.w(TAG, "SystemContext threw: ${cause.javaClass.simpleName}: ${cause.message}")
+            -1
+        }
+    }
+
+    /**
+     * a system-context `createContextForCallingUid(Context)` approach in Kotlin.
+     * Returns a context bound to the actual package(s) owned by
+     * Process.myUid() — for shell uid (2000), that's `com.android.shell`.
+     *
+     *   pm.getPackagesForUid(Process.myUid()) → ["com.android.shell", ...]
+     *   for pkg in packages:
+     *     try return context.createPackageContext(pkg, CONTEXT_IGNORE_SECURITY)
+     *   return null
+     */
+    private fun createContextForCallingUid(context: Context): Context? {
+        return try {
+            val pm = context.packageManager ?: return null
+            val myUid = Process.myUid()
+            val pkgs = pm.getPackagesForUid(myUid) ?: return null
+            if (pkgs.isEmpty()) return null
+            for (pkg in pkgs) {
+                try {
+                    return context.createPackageContext(pkg, Context.CONTEXT_IGNORE_SECURITY)
+                } catch (_: Throwable) {
+                    // try next package
+                }
+            }
+            null
+        } catch (t: Throwable) {
+            Log.w(TAG, "createContextForCallingUid failed: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * Reflectively call `DisplayManagerGlobal.createVirtualDisplay(...)`
+     * with `packageName = "com.android.shell"`. This is the only way to
+     * create a VirtualDisplay from shell uid that the system accepts —
+     * passing the package the calling uid actually owns.
+     *
+     * Tries the Android 14+ signature first (Context, MediaProjection,
+     * VirtualDisplayConfig, Callback, Handler), then falls back to older
+     * signatures.
+     *
+     * Heavy reflection but matches scrcpy's well-tested approach.
+     */
+    private fun tryCreateVirtualDisplayViaDMG(
+        name: String, width: Int, height: Int, densityDpi: Int, flags: Int, surface: Surface?,
+    ): Int {
+        val shellPkg = "com.android.shell"
+        return try {
+            val dmgClass = Class.forName("android.hardware.display.DisplayManagerGlobal")
+            val dmg = dmgClass.getMethod("getInstance").invoke(null)
+                ?: run {
+                    Log.w(TAG, "DMG getInstance returned null")
+                    return -1
+                }
+
+            // Diagnostic: log every createVirtualDisplay method this DMG
+            // class exposes so we can see the actual signature on this
+            // device. Samsung One UI 7 / Android 16 may have a custom
+            // overload that doesn't match any AOSP version we know about.
+            dmgClass.declaredMethods
+                .filter { it.name == "createVirtualDisplay" }
+                .forEachIndexed { i, m ->
+                    val params = m.parameterTypes.joinToString(",") { it.simpleName }
+                    Log.d(TAG, "DMG.createVirtualDisplay[$i] signature: ($params) -> ${m.returnType.simpleName}")
+                }
+
+            // Build the VirtualDisplayConfig via its Builder (modern API).
+            val builderClass = Class.forName("android.hardware.display.VirtualDisplayConfig\$Builder")
+            val builderCtor = builderClass.getConstructor(
+                String::class.java, Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
+            )
+            val builder = builderCtor.newInstance(name, width, height, densityDpi)
+            builderClass.getMethod("setFlags", Int::class.javaPrimitiveType)
+                .invoke(builder, flags)
+            if (surface != null) {
+                builderClass.getMethod("setSurface", Surface::class.java)
+                    .invoke(builder, surface)
+            }
+            val configClass = Class.forName("android.hardware.display.VirtualDisplayConfig")
+            val config = builderClass.getMethod("build").invoke(builder)
+
+            val ctx = obtainSystemContext() ?: context
+            if (ctx == null) {
+                Log.w(TAG, "DMG path: no context available")
+                return -1
+            }
+
+            val callbackClass = Class.forName("android.hardware.display.VirtualDisplay\$Callback")
+            val mediaProjectionClass = Class.forName("android.media.projection.MediaProjection")
+            val handlerClass = Class.forName("android.os.Handler")
+
+            // Generic adapter: find ANY createVirtualDisplay method that takes
+            // VirtualDisplayConfig as one of its args, then build the arg list
+            // dynamically based on its parameter types.
+            //
+            // Common parameter shapes we know how to satisfy:
+            //   - Context → ctx (or shellCtx if it's the only string-relevant arg)
+            //   - MediaProjection → null
+            //   - VirtualDisplayConfig → config
+            //   - VirtualDisplay.Callback → null
+            //   - Handler → null
+            //   - String (last position) → shellPkg
+            //   - int (uid hint, rare) → Process.myUid()
+            val shellCtx = runCatching { ctx.createPackageContext(shellPkg, 0) }
+                .onFailure { Log.w(TAG, "createPackageContext('$shellPkg') failed: ${it.message}") }
+                .getOrNull() ?: ctx
+
+            val candidates = dmgClass.declaredMethods.filter {
+                it.name == "createVirtualDisplay" &&
+                    it.parameterTypes.any { p -> p == configClass }
+            }
+            for (m in candidates) {
+                val args = m.parameterTypes.map { p ->
+                    when (p) {
+                        Context::class.java -> shellCtx
+                        mediaProjectionClass -> null
+                        configClass -> config
+                        callbackClass -> null
+                        handlerClass -> null
+                        String::class.java -> shellPkg
+                        Int::class.javaPrimitiveType -> Process.myUid()
+                        else -> {
+                            Log.w(TAG, "DMG: unknown param type ${p.simpleName} for createVirtualDisplay; passing null")
+                            null
+                        }
+                    }
+                }
+                val sigStr = m.parameterTypes.joinToString(",") { it.simpleName }
+                try {
+                    m.isAccessible = true
+                    val vd = m.invoke(dmg, *args.toTypedArray()) as? VirtualDisplay
+                    if (vd != null) {
+                        val vdId = vd.display.displayId
+                        virtualDisplays[vdId] = vd
+                        Log.d(TAG, "createVirtualDisplay [path=DMG sig=($sigStr) pkg=$shellPkg] '$name' id=$vdId")
+                        return vdId
+                    }
+                    Log.w(TAG, "DMG sig=($sigStr) returned null for '$name'")
+                } catch (t: Throwable) {
+                    val cause = t.cause ?: t
+                    Log.w(TAG, "DMG sig=($sigStr) threw: ${cause.javaClass.simpleName}: ${cause.message}")
+                }
+            }
+            if (candidates.isEmpty()) {
+                Log.w(TAG, "DMG: no createVirtualDisplay method takes VirtualDisplayConfig — check signature dump above")
+            }
+
+            -1
+        } catch (t: Throwable) {
+            Log.e(TAG, "tryCreateVirtualDisplayViaDMG threw at top level", t)
+            -1
+        }
+    }
+
+    private fun tryCreateVirtualDisplay(
+        ctx: Context, ctxLabel: String,
+        name: String, width: Int, height: Int, densityDpi: Int, flags: Int, surface: Surface?,
+    ): Int {
+        return try {
+            val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+            val vd = dm.createVirtualDisplay(name, width, height, densityDpi, surface, flags)
+            if (vd == null) {
+                Log.w(TAG, "createVirtualDisplay [ctx=$ctxLabel] '$name' returned null (no exception)")
+                return -1
+            }
+            val vdId = vd.display.displayId
+            virtualDisplays[vdId] = vd
+            Log.d(TAG, "createVirtualDisplay [ctx=$ctxLabel] '$name' id=$vdId ${width}x$height dpi=$densityDpi flags=0x${flags.toString(16)}")
+            vdId
+        } catch (t: Throwable) {
+            Log.e(TAG, "createVirtualDisplay [ctx=$ctxLabel] '$name' threw: ${t.javaClass.simpleName}: ${t.message}", t)
+            -1
+        }
+    }
+
+    override fun resizeVirtualDisplay(virtualDisplayId: Int, width: Int, height: Int, densityDpi: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val vd = virtualDisplays[virtualDisplayId] ?: return false
+            vd.resize(width, height, densityDpi); true
+        } catch (t: Throwable) {
+            Log.e(TAG, "resizeVirtualDisplay failed: id=$virtualDisplayId", t); false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun setVirtualDisplaySurface(virtualDisplayId: Int, surface: Surface?): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val vd = virtualDisplays[virtualDisplayId] ?: return false
+            vd.surface = surface; true
+        } catch (t: Throwable) {
+            Log.e(TAG, "setVirtualDisplaySurface failed: id=$virtualDisplayId", t); false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun releaseVirtualDisplay(virtualDisplayId: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            virtualDisplays.remove(virtualDisplayId)?.let { it.release(); return true }
+            false
+        } catch (t: Throwable) {
+            Log.e(TAG, "releaseVirtualDisplay failed: id=$virtualDisplayId", t); false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    // ─── EXPERIMENTAL: per-display color transform (color spike) ────────
+    override fun setDisplayColorTransform(displayId: Int, matrix: FloatArray?): String {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            if (matrix == null || matrix.size != 16) {
+                return "FAIL: matrix must be 16 floats (got ${matrix?.size})"
+            }
+            // Resolve the display's SurfaceControl token. SurfaceControl has a
+            // hidden getPhysicalDisplayToken(long physicalDisplayId) and an
+            // older getBuiltInDisplay/getInternalDisplayToken; physical display
+            // ids map from the logical displayId via DisplayManager → but the
+            // simplest reachable path is SurfaceControl.getPhysicalDisplayIds()
+            // then getPhysicalDisplayToken(). We try a few signatures.
+            val sc = Class.forName("android.view.SurfaceControl")
+            val log = StringBuilder()
+
+            // Find the EXTERNAL display token (never the internal panel — see
+            // resolvePanelToken; grabbing internal here would tint/disturb the
+            // phone's own screen when the glasses are absent).
+            val token: android.os.IBinder = resolvePanelToken(sc, log)
+                ?: return "FAIL: no display token. [$log]"
+
+            // Apply the color matrix. The exact API varies by Android version,
+            // so try several known shapes and, if none work, dump the available
+            // SurfaceControl method names so we can see what this build exposes.
+            var applied = false
+
+            // Attempt 1: static SurfaceControl.setDisplayColorTransform(IBinder, float[])
+            if (!applied) runCatching {
+                sc.getMethod("setDisplayColorTransform", android.os.IBinder::class.java, FloatArray::class.java)
+                    .invoke(null, token, matrix)
+                applied = true; log.append("path=static-token; ")
+            }.onFailure { log.append("a1:${it.javaClass.simpleName}; ") }
+
+            // Attempt 2: SurfaceControl.Transaction().setDisplayColorTransform(IBinder, float[]).apply()
+            if (!applied) runCatching {
+                val txClass = Class.forName("android.view.SurfaceControl\$Transaction")
+                val tx = txClass.getConstructor().newInstance()
+                val m = txClass.getMethod("setDisplayColorTransform", android.os.IBinder::class.java, FloatArray::class.java)
+                m.invoke(tx, token, matrix)
+                txClass.getMethod("apply").invoke(tx)
+                applied = true; log.append("path=tx-token; ")
+            }.onFailure { log.append("a2:${it.javaClass.simpleName}; ") }
+
+            // Attempt 3: DisplayTransformManager.setColorMatrix(level, float[]) — GLOBAL.
+            // Only used as a last resort; flagged clearly because it tints the
+            // whole device, not just the glasses.
+            if (!applied) runCatching {
+                val dtmClass = Class.forName("com.android.server.display.color.DisplayTransformManager")
+                // DTM is a system-server local service; not reachable from our
+                // process. This will almost certainly fail — we attempt it only
+                // to record the exception for the log.
+                val inst = Class.forName("com.android.server.LocalServices")
+                    .getMethod("getService", Class::class.java).invoke(null, dtmClass)
+                if (inst != null) {
+                    dtmClass.getMethod("setColorMatrix", Int::class.javaPrimitiveType, FloatArray::class.java)
+                        .invoke(inst, 300, matrix)
+                    applied = true; log.append("path=dtm-GLOBAL; ")
+                } else {
+                    log.append("a3:dtm-null; ")
+                }
+            }.onFailure { log.append("a3:${it.javaClass.simpleName}; ") }
+
+            // If still nothing, dump the SurfaceControl method names that mention
+            // "color" or "transform" so we can see what THIS build actually has.
+            if (!applied) {
+                val names = sc.declaredMethods
+                    .map { it.name }
+                    .filter { it.contains("olor", true) || it.contains("ransform", true) }
+                    .distinct()
+                log.append("scMethods=$names; ")
+                val txNames = runCatching {
+                    Class.forName("android.view.SurfaceControl\$Transaction").declaredMethods
+                        .map { it.name }
+                        .filter { it.contains("olor", true) || it.contains("ransform", true) }
+                        .distinct()
+                }.getOrDefault(emptyList())
+                log.append("txMethods=$txNames; ")
+            }
+
+            if (applied) "OK: color transform applied. [$log]"
+            else "FAIL: could not apply per-display transform. [$log]"
+        } catch (t: Throwable) {
+            "EXCEPTION: ${t.javaClass.simpleName}: ${t.message}"
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    // ─── Color mode probe + setter (per-display, real panel modes) ──────
+    override fun getDisplayColorModes(displayId: Int): String {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val ctx = obtainSystemContext() ?: context
+                ?: return "FAIL: no context"
+            val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+            val display = dm.getDisplay(displayId)
+                ?: return "FAIL: no display id=$displayId"
+            val log = StringBuilder()
+            // Display.getSupportedColorModes(): int[] (public since API 26).
+            val supported = runCatching {
+                (display.javaClass.getMethod("getSupportedColorModes").invoke(display) as? IntArray)
+            }.getOrNull()
+            val active = runCatching {
+                display.javaClass.getMethod("getColorMode").invoke(display) as? Int
+            }.getOrNull()
+            log.append("supported=${supported?.toList()}; active=$active; ")
+            // Also dump physical display tokens so the setter can target the panel.
+            val phys = runCatching {
+                Class.forName("android.view.SurfaceControl")
+                    .getMethod("getPhysicalDisplayIds").invoke(null) as? LongArray
+            }.getOrNull()
+            log.append("physicalIds=${phys?.toList()}; ")
+            val count = supported?.size ?: 0
+            if (count > 1) "OK: $count color modes available. [$log]"
+            else "ONLY-ONE: display reports $count color mode(s) — no switchable color. [$log]"
+        } catch (t: Throwable) {
+            "EXCEPTION: ${t.javaClass.simpleName}: ${t.message}"
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun setDisplayColorMode(displayId: Int, colorMode: Int): String {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val log = StringBuilder()
+            var applied = false
+            // Path 1: WindowManager hidden setActiveColorMode hooks are not in
+            // our process; the reachable path is SurfaceControl static
+            // setDisplayColorMode/setActiveColorMode(IBinder token, int mode).
+            val sc = Class.forName("android.view.SurfaceControl")
+            // External display token only (never the internal panel).
+            val token: android.os.IBinder? = resolvePanelToken(sc, log)
+            if (token != null) {
+                for (name in listOf("setDisplayColorMode", "setActiveColorMode")) {
+                    if (applied) break
+                    runCatching {
+                        sc.getMethod(name, android.os.IBinder::class.java, Int::class.javaPrimitiveType)
+                            .invoke(null, token, colorMode)
+                        applied = true; log.append("path=$name; ")
+                    }.onFailure { log.append("$name:${it.javaClass.simpleName}; ") }
+                }
+            } else {
+                log.append("no-token; ")
+            }
+            if (applied) "OK: color mode set to $colorMode. [$log]"
+            else "FAIL: could not set color mode. [$log]"
+        } catch (t: Throwable) {
+            "EXCEPTION: ${t.javaClass.simpleName}: ${t.message}"
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    // ─── SPIKE #3: privileged-process layer color transform ─────────────
+    override fun setLayerColorTransform(layer: android.view.SurfaceControl?, matrix12: FloatArray?): String {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            if (layer == null) return "FAIL: null layer (parcel didn't carry the SurfaceControl)"
+            if (matrix12 == null || matrix12.size != 12) return "FAIL: matrix must be 12 floats (got ${matrix12?.size})"
+            if (!layer.isValid) return "FAIL: layer invalid in privileged process (valid=${layer.isValid})"
+            val m3 = floatArrayOf(
+                matrix12[0], matrix12[1], matrix12[2],
+                matrix12[3], matrix12[4], matrix12[5],
+                matrix12[6], matrix12[7], matrix12[8],
+            )
+            val v3 = floatArrayOf(matrix12[9], matrix12[10], matrix12[11])
+            val log = StringBuilder()
+            log.append("valid=${layer.isValid}; ")
+            val tx = android.view.SurfaceControl.Transaction()
+            var applied = false
+            runCatching {
+                android.view.SurfaceControl.Transaction::class.java.getMethod(
+                    "setColorTransform",
+                    android.view.SurfaceControl::class.java,
+                    FloatArray::class.java, FloatArray::class.java,
+                ).invoke(tx, layer, m3, v3)
+                applied = true; log.append("setColorTransform-ok; ")
+            }.onFailure { log.append("setColorTransform:${it.javaClass.simpleName}; ") }
+            if (applied) {
+                tx.apply()
+                "OK(priv): applied from privileged process. [$log]"
+            } else {
+                tx.close()
+                "FAIL(priv): transform not applied. [$log]"
+            }
+        } catch (t: Throwable) {
+            "EXCEPTION(priv): ${t.javaClass.simpleName}: ${t.message}"
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    // ─── Surface mirror: glasses → our Surface ──────────────────────────
+
+    override fun startSurfaceMirror(physicalDisplayId: Int, surface: Surface?): Boolean {
+        if (surface == null) return false
+        val identity = Binder.clearCallingIdentity()
+        try {
+            val info = getDisplayInfo(physicalDisplayId) ?: return false
+            val w = info.width
+            val h = info.height
+            releaseOtherSurfaceMirrors(physicalDisplayId)
+
+            mirrorVirtualDisplays[physicalDisplayId]?.let { existing ->
+                existing.surface = surface
+                Log.d(TAG, "startSurfaceMirror: updated surface for displayId=$physicalDisplayId")
+                return true
+            }
+
+            // Path A: DisplayManager.createVirtualDisplay with the physical
+            // display id passed in — Android internally treats this as a
+            // mirror. the reference's preferred path.
+            val mirrorMethod = getDisplayManagerMirrorMethod()
+            if (mirrorMethod != null) {
+                try {
+                    val result = mirrorMethod.invoke(
+                        null, "PortalPadMirror", w, h, physicalDisplayId, surface,
+                    ) as? VirtualDisplay
+                    if (result != null) {
+                        mirrorVirtualDisplays[physicalDisplayId] = result
+                        surfaceMirrorTokens.remove(physicalDisplayId)?.let { destroySurfaceControlDisplay(it) }
+                        Log.d(TAG, "startSurfaceMirror: DisplayManager path ok displayId=$physicalDisplayId")
+                        return true
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "DisplayManager mirror threw, trying SurfaceControl", t)
+                }
+            }
+
+            // Path B: SurfaceControl reflection fallback
+            Log.w(TAG, "DisplayManager mirror not available; SurfaceControl fallback displayId=$physicalDisplayId")
+            var token = surfaceMirrorTokens[physicalDisplayId]
+            if (token == null) token = createSurfaceControlDisplay()
+            if (token != null) {
+                val srcRect = Rect(0, 0, w, h); val dstRect = Rect(0, 0, w, h)
+                try {
+                    openSurfaceControlTransaction()
+                    try {
+                        setSurfaceControlDisplaySurface(token, surface)
+                        setSurfaceControlDisplayProjection(token, 0, srcRect, dstRect)
+                        setSurfaceControlDisplayLayerStack(token, info.layerStack)
+                    } finally { closeSurfaceControlTransaction() }
+                    surfaceMirrorTokens[physicalDisplayId] = token
+                    Log.d(TAG, "startSurfaceMirror: SurfaceControl path ok displayId=$physicalDisplayId")
+                    return true
+                } catch (t: Throwable) {
+                    Log.w(TAG, "SurfaceControl apply failed displayId=$physicalDisplayId", t)
+                    surfaceMirrorTokens.remove(physicalDisplayId)?.let { destroySurfaceControlDisplay(it) }
+                }
+            } else {
+                Log.w(TAG, "SurfaceControl display not created; mirror failed displayId=$physicalDisplayId")
+            }
+            return false
+        } catch (t: Throwable) {
+            Log.e(TAG, "startSurfaceMirror failed: displayId=$physicalDisplayId", t)
+            return false
+        } finally {
+            Binder.restoreCallingIdentity(identity)
+        }
+    }
+
+    override fun stopSurfaceMirror(physicalDisplayId: Int) {
+        val id = Binder.clearCallingIdentity()
+        try {
+            mirrorVirtualDisplays.remove(physicalDisplayId)?.runCatching { release() }
+            stopSurfaceMirrorInternal(physicalDisplayId)
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    private fun stopSurfaceMirrorInternal(physicalDisplayId: Int) {
+        surfaceMirrorTokens.remove(physicalDisplayId)?.let { token ->
+            runCatching { destroySurfaceControlDisplay(token) }
+        }
+    }
+
+    private fun releaseOtherSurfaceMirrors(keepId: Int) {
+        val toRelease = mirrorVirtualDisplays.keys.filter { it != keepId }
+        for (key in toRelease) mirrorVirtualDisplays.remove(key)?.runCatching { release() }
+        val tokensToRelease = surfaceMirrorTokens.keys.filter { it != keepId }
+        for (key in tokensToRelease) stopSurfaceMirrorInternal(key)
+    }
+
+    // ─── DisplayManager + SurfaceControl reflection ─────────────────────
+
+    private fun getDisplayManagerMirrorMethod(): Method? {
+        dmCreateMirrorMethod?.let { return it }
+        return try {
+            // 5-arg overload: (String, int, int, int, Surface) — name,w,h,sourceDisplayId,sinkSurface
+            val m = DisplayManager::class.java.getMethod(
+                "createVirtualDisplay",
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Surface::class.java,
+            )
+            dmCreateMirrorMethod = m; m
+        } catch (_: Throwable) { null }
+    }
+
+    private data class DisplayInfo(val width: Int, val height: Int, val rotation: Int, val layerStack: Int)
+
+    private fun getDisplayInfo(displayId: Int): DisplayInfo? {
+        return try {
+            val dmg = getDisplayManagerGlobal() ?: return null
+            val m = getDisplayInfoMethod
+                ?: dmg.javaClass.getMethod("getDisplayInfo", Int::class.javaPrimitiveType)
+                    .also { getDisplayInfoMethod = it }
+            val info = m.invoke(dmg, displayId) ?: return null
+            val cls = info.javaClass
+            DisplayInfo(
+                cls.getDeclaredField("logicalWidth").getInt(info),
+                cls.getDeclaredField("logicalHeight").getInt(info),
+                cls.getDeclaredField("rotation").getInt(info),
+                cls.getDeclaredField("layerStack").getInt(info),
+            )
+        } catch (t: Throwable) {
+            Log.e(TAG, "getDisplayInfo failed: id=$displayId", t); null
+        }
+    }
+
+    private fun getDisplayManagerGlobal(): Any? {
+        displayManagerGlobal?.let { return it }
+        return try {
+            val c = Class.forName("android.hardware.display.DisplayManagerGlobal")
+            val obj = c.getDeclaredMethod("getInstance").invoke(null)
+            displayManagerGlobal = obj; obj
+        } catch (t: Throwable) {
+            Log.e(TAG, "getDisplayManagerGlobal failed", t); null
+        }
+    }
+
+    private fun getSurfaceControlClass(): Class<*>? {
+        scClass?.let { return it }
+        return try {
+            val c = Class.forName("android.view.SurfaceControl")
+            scClass = c; c
+        } catch (t: Throwable) {
+            Log.e(TAG, "SurfaceControl class not found", t); null
+        }
+    }
+
+    private fun createSurfaceControlDisplay(): IBinder? {
+        val sc = getSurfaceControlClass() ?: return null
+        val secure = false
+        val methods = (sc.methods.filter {
+            it.name == "createDisplay" && it.parameterTypes.firstOrNull() == String::class.java
+        } + sc.declaredMethods.filter {
+            it.name == "createDisplay" && it.parameterTypes.firstOrNull() == String::class.java
+        }).distinct()
+        for (m in methods) {
+            try { m.isAccessible = true } catch (_: Throwable) {}
+            val args: Array<Any?> = buildArgsForCreateDisplay(m.parameterTypes, "PortalPadMirror", secure)
+                ?: continue
+            try {
+                val result = m.invoke(null, *args) as? IBinder
+                if (result != null) {
+                    scCreateDisplay = m
+                    Log.d(TAG, "SurfaceControl.createDisplay ok signature=${m.parameterTypes.joinToString(",") { it.simpleName }}")
+                    return result
+                }
+            } catch (t: Throwable) {
+                Log.d(TAG, "createDisplay overload threw: ${t.javaClass.simpleName}")
+            }
+        }
+        Log.w(TAG, "SurfaceControl.createDisplay: no working overload")
+        return null
+    }
+
+    private fun buildArgsForCreateDisplay(paramTypes: Array<Class<*>>, name: String, secure: Boolean): Array<Any?>? {
+        val args = arrayOfNulls<Any>(paramTypes.size)
+        var boolSet = false
+        for (i in paramTypes.indices) {
+            val pt = paramTypes[i]
+            args[i] = when {
+                pt == String::class.java -> name
+                pt == Boolean::class.javaPrimitiveType || pt == Boolean::class.java -> {
+                    if (!boolSet) { boolSet = true; secure } else false
+                }
+                pt == Int::class.javaPrimitiveType || pt == Int::class.java -> 0
+                pt == Long::class.javaPrimitiveType || pt == Long::class.java -> 0L
+                pt == Float::class.javaPrimitiveType || pt == Float::class.java -> 0f
+                pt.isPrimitive -> return null
+                else -> null
+            }
+        }
+        return args
+    }
+
+    private fun openSurfaceControlTransaction() {
+        val sc = getSurfaceControlClass() ?: return
+        val m = scOpenTransaction ?: sc.getMethod("openTransaction").also { scOpenTransaction = it }
+        m.invoke(null)
+    }
+    private fun closeSurfaceControlTransaction() {
+        val sc = getSurfaceControlClass() ?: return
+        val m = scCloseTransaction ?: sc.getMethod("closeTransaction").also { scCloseTransaction = it }
+        m.invoke(null)
+    }
+    private fun destroySurfaceControlDisplay(token: IBinder) {
+        val sc = getSurfaceControlClass() ?: return
+        val m = scDestroyDisplay ?: sc.getMethod("destroyDisplay", IBinder::class.java).also { scDestroyDisplay = it }
+        m.invoke(null, token)
+    }
+    private fun setSurfaceControlDisplaySurface(token: IBinder, surface: Surface) {
+        val sc = getSurfaceControlClass() ?: return
+        val m = scSetDisplaySurface ?: sc.getMethod("setDisplaySurface", IBinder::class.java, Surface::class.java).also { scSetDisplaySurface = it }
+        m.invoke(null, token, surface)
+    }
+    private fun setSurfaceControlDisplayProjection(token: IBinder, orientation: Int, src: Rect, dst: Rect) {
+        val sc = getSurfaceControlClass() ?: return
+        val m = scSetDisplayProjection ?: sc.getMethod(
+            "setDisplayProjection",
+            IBinder::class.java, Int::class.javaPrimitiveType, Rect::class.java, Rect::class.java,
+        ).also { scSetDisplayProjection = it }
+        m.invoke(null, token, orientation, src, dst)
+    }
+    private fun setSurfaceControlDisplayLayerStack(token: IBinder, layerStack: Int) {
+        val sc = getSurfaceControlClass() ?: return
+        val m = scSetDisplayLayerStack ?: sc.getMethod(
+            "setDisplayLayerStack", IBinder::class.java, Int::class.javaPrimitiveType,
+        ).also { scSetDisplayLayerStack = it }
+        m.invoke(null, token, layerStack)
+    }
+
+    /**
+     * EXPERIMENT (permfix / AirBeam parity): passively report whether the
+     * SurfaceControl display-mirror primitives are reachable on this ROM. Does
+     * NOT retarget or disturb any live display — it only resolves the physical
+     * token, creates + immediately destroys a throwaway SF display, and checks
+     * which primitives resolve. Every step is logged; the return value is a
+     * compact summary. This is the go/no-go for an overlay-free system mirror.
+     */
+    // Original panel layerStack per glasses logical id, captured at mirror
+    // start so stop can restore it exactly.
+    private val mirrorOriginalLayerStack = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+
+    /** Resolve the physical glasses panel token (same heuristic as the color
+     *  transform: prefer the last-enumerated physical id, which is the external
+     *  display). */
+    private fun resolvePanelToken(sc: Class<*>, log: StringBuilder): IBinder? {
+        var token: IBinder? = null
+        runCatching {
+            val ids = sc.getMethod("getPhysicalDisplayIds").invoke(null) as? LongArray
+            // CRITICAL: only resolve a token when a REAL external panel is
+            // present. With the glasses unplugged (or mid-flap), this returns
+            // just the internal panel — and the old code grabbed it, retargeting
+            // the PHONE'S OWN screen to the VD layerStack, which freezes the
+            // phone until a screen off/on resets the compositor. Confirmed via a
+            // frozen-state SurfaceFlinger dump (internal display bound to a dead
+            // VD layerStack). So: require >=2 physical displays, and never pick
+            // the primary/internal id (enumerates first).
+            if (ids == null || ids.size < 2) {
+                log.append("noExternalPanel(n=${ids?.size ?: 0}); ")
+                return@runCatching
+            }
+            val internalPid = ids.first()
+            val getToken = sc.getMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType)
+            for (pid in ids.reversed()) {
+                if (pid == internalPid) continue // never retarget the phone's panel
+                val t = getToken.invoke(null, pid) as? IBinder
+                if (t != null) { token = t; log.append("panelPid=$pid; "); break }
+            }
+        }.onFailure { log.append("tokenLookup:${it.javaClass.simpleName}; ") }
+        return token
+    }
+
+    /** Read a logical display's current layerStack via DisplayManagerGlobal +
+     *  DisplayInfo reflection (system context sees all displays). */
+    private fun readLayerStack(logicalDisplayId: Int): Int? = runCatching {
+        val dmg = Class.forName("android.hardware.display.DisplayManagerGlobal")
+            .getMethod("getInstance").invoke(null)
+        val info = dmg.javaClass.getMethod("getDisplayInfo", Int::class.javaPrimitiveType)
+            .invoke(dmg, logicalDisplayId)
+        info?.javaClass?.getField("layerStack")?.getInt(info)
+    }.getOrNull()
+
+    /** Apply setDisplayLayerStack(token, layerStack) via the Transaction form
+     *  (the static form was removed on this ROM — probe confirmed it lives on
+     *  SurfaceControl.Transaction). */
+    private fun txSetDisplayLayerStack(token: IBinder, layerStack: Int) {
+        val txClass = Class.forName("android.view.SurfaceControl\$Transaction")
+        val tx = txClass.getConstructor().newInstance()
+        txClass.getMethod("setDisplayLayerStack", IBinder::class.java, Int::class.javaPrimitiveType)
+            .invoke(tx, token, layerStack)
+        txClass.getMethod("apply").invoke(tx)
+        runCatching { txClass.getMethod("close").invoke(tx) }
+    }
+
+    /** Transaction-wrapped setDisplayProjection - the same primitive screenrecord
+     *  uses to map a layer stack into a destination rect on a display. Sibling of
+     *  [txSetDisplayLayerStack]; orientation is always 0 (the VD already matches
+     *  the panel's orientation). */
+    private fun txSetDisplayProjection(token: IBinder, src: Rect, dst: Rect) {
+        val txClass = Class.forName("android.view.SurfaceControl\$Transaction")
+        val tx = txClass.getConstructor().newInstance()
+        txClass.getMethod(
+            "setDisplayProjection",
+            IBinder::class.java, Int::class.javaPrimitiveType, Rect::class.java, Rect::class.java,
+        ).invoke(tx, token, 0, src, dst)
+        txClass.getMethod("apply").invoke(tx)
+        runCatching { txClass.getMethod("close").invoke(tx) }
+    }
+
+    /** Last non-identity projection src per glasses display, so stop can restore
+     *  the identity projection without the app passing sizes at teardown. */
+    private val mirrorProjectionSrc =
+        java.util.concurrent.ConcurrentHashMap<Int, Rect>()
+
+    /** Screen size / Side Mode under system mirror (spike 2026-07-23): scale and
+     *  position the mirrored picture INSIDE the compositor, so DRM keeps playing -
+     *  the frames never reach an app-owned surface. Full-rect dst = identity. */
+    override fun setMirrorProjection(
+        glassesDisplayId: Int, srcW: Int, srcH: Int,
+        dstLeft: Int, dstTop: Int, dstRight: Int, dstBottom: Int,
+    ): String {
+        val id = Binder.clearCallingIdentity()
+        val log = StringBuilder()
+        return try {
+            val sc = getSurfaceControlClass() ?: return "FAIL: no SurfaceControl"
+            val token = resolvePanelToken(sc, log) ?: return "FAIL: no panel token. [$log]"
+            val src = Rect(0, 0, srcW, srcH)
+            val dst = Rect(dstLeft, dstTop, dstRight, dstBottom)
+            txSetDisplayProjection(token, src, dst)
+            if (dst.left == 0 && dst.top == 0 && dst.right == srcW && dst.bottom == srcH) {
+                mirrorProjectionSrc.remove(glassesDisplayId)
+            } else {
+                mirrorProjectionSrc[glassesDisplayId] = src
+            }
+            val msg = "OK: projection src=${srcW}x$srcH dst=$dst. [$log]"
+            Log.w(TAG, "DIAG-PROJECTION: $msg")
+            msg
+        } catch (t: Throwable) {
+            val s = "EXCEPTION: ${t.javaClass.simpleName}: ${t.message} [$log]"
+            Log.w(TAG, "DIAG-PROJECTION: $s"); s
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun startLayerStackMirror(glassesDisplayId: Int, vdDisplayId: Int): String {
+        val id = Binder.clearCallingIdentity()
+        val log = StringBuilder()
+        return try {
+            val sc = getSurfaceControlClass() ?: return "FAIL: no SurfaceControl"
+            val token = resolvePanelToken(sc, log) ?: return "FAIL: no panel token. [$log]"
+            val vdLayerStack = readLayerStack(vdDisplayId)
+                ?: return "FAIL: no VD layerStack for disp=$vdDisplayId. [$log]"
+            val panelLayerStack = readLayerStack(glassesDisplayId)
+            if (panelLayerStack != null) {
+                // putIfAbsent: keep the FIRST-saved (true native) layerStack so
+                // repeated retargets (e.g. the staggered wake re-apply) don't
+                // overwrite it with the VD's stack — otherwise stop() would
+                // "restore" the panel to the VD's dead stack.
+                val prior = mirrorOriginalLayerStack.putIfAbsent(glassesDisplayId, panelLayerStack)
+                log.append("savedPanelLS=${prior ?: panelLayerStack}; ")
+            } else {
+                log.append("panelLS=unknown; ")
+            }
+            log.append("vdLS=$vdLayerStack; ")
+            txSetDisplayLayerStack(token, vdLayerStack)
+            val msg = "OK: retargeted panel→vdLayerStack=$vdLayerStack. [$log]"
+            Log.w(TAG, "LAYERSTACK-MIRROR start: $msg")
+            msg
+        } catch (t: Throwable) {
+            val s = "EXCEPTION: ${t.javaClass.simpleName}: ${t.message} [$log]"
+            Log.w(TAG, "LAYERSTACK-MIRROR start: $s"); s
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun stopLayerStackMirror(glassesDisplayId: Int): String {
+        val id = Binder.clearCallingIdentity()
+        val log = StringBuilder()
+        return try {
+            val original = mirrorOriginalLayerStack.remove(glassesDisplayId)
+                ?: return "SKIP: no saved layerStack for disp=$glassesDisplayId"
+            val sc = getSurfaceControlClass() ?: return "FAIL: no SurfaceControl"
+            val token = resolvePanelToken(sc, log) ?: return "FAIL: no panel token. [$log]"
+            // A projection outlives the layerStack retarget on the physical token,
+            // so a shrunken mirror would leave the RESTORED panel shrunken too.
+            // Reset to identity before handing the panel back.
+            mirrorProjectionSrc.remove(glassesDisplayId)?.let { src ->
+                runCatching { txSetDisplayProjection(token, src, Rect(src)) }
+                log.append("projectionReset; ")
+            }
+            txSetDisplayLayerStack(token, original)
+            val msg = "OK: restored panel layerStack=$original. [$log]"
+            Log.w(TAG, "LAYERSTACK-MIRROR stop: $msg")
+            msg
+        } catch (t: Throwable) {
+            val s = "EXCEPTION: ${t.javaClass.simpleName}: ${t.message} [$log]"
+            Log.w(TAG, "LAYERSTACK-MIRROR stop: $s"); s
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    /**
+     * Best-effort delivered-fps from SurfaceFlinger's per-layer latency stats.
+     * `dumpsys SurfaceFlinger --latency <layer>` prints, after a refresh-period
+     * header line, rows of "desiredPresent actualPresent frameReady" timestamps
+     * (ns). We pick a busy app layer, count distinct recent present timestamps,
+     * and derive fps from their span. Fully defensive: any parse failure / no
+     * layer → -1f, so the HUD shows no fps rather than a wrong number.
+     */
+    override fun sampleDisplayFps(displayId: Int): Float {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val list = runCommand("dumpsys SurfaceFlinger --list")
+            val lines0 = list.lines().map { it.trim() }.filter { it.isNotEmpty() }
+            // --list on newer Android returns verbose RequestedLayerState{...
+            // name="X"#id ...} descriptors, NOT plain names — passing the whole
+            // line to --latency matched nothing (field: every candidate
+            // latencyLines=0 under mirror). Extract the real name (and #id).
+            // Lines with no name="" are CONTAINERS (ActivityRecord / WindowToken /
+            // Display) that hold no buffer — skip them.
+            val named = lines0.mapNotNull { line ->
+                val nm = Regex("name=\"([^\"]*)\"").find(line)?.groupValues?.get(1)
+                    ?: return@mapNotNull null
+                if (nm.contains("Wallpaper", true) || nm.contains("Toast", true) ||
+                    nm.contains("StatusBar", true) || nm.startsWith("Dim ")
+                ) return@mapNotNull null
+                val lid = Regex("name=\"[^\"]*\"#(\\d+)").find(line)?.groupValues?.get(1)
+                nm to lid
+            }
+            // Priority: an animating app surface (package/activity, "pkg/..."),
+            // then our VD layer, then any named surface. Under mirror a static
+            // scene has no frames → -1 is the truthful "— fps".
+            val ordered = buildList {
+                named.firstOrNull { it.first.contains("/") && !it.first.contains("PortalPad", true) }?.let { add(it) }
+                named.firstOrNull { it.first.contains("PortalPad Session") }?.let { add(it) }
+                named.firstOrNull { it.first.contains("/") }?.let { add(it) }
+                named.firstOrNull()?.let { add(it) }
+            }.distinct()
+            if (ordered.isEmpty()) return -1f
+            for ((nm, lid) in ordered) {
+                // --latency arg format varies by version; try name#id then bare name.
+                val args = listOfNotNull(lid?.let { "$nm#$it" }, nm).distinct()
+                for (arg in args) {
+                    val out = runCommand("dumpsys SurfaceFlinger --latency \"$arg\"")
+                    val lines = out.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                    if (lines.size < 3) {
+                        android.util.Log.d("PortalPadHud",
+                            "DIAG-HUDFPS arg='$arg' latencyLines=${lines.size} → skip (no data)")
+                        continue
+                    }
+                    val present = lines.drop(1).mapNotNull { row ->
+                        val cols = row.split(Regex("\\s+"))
+                        if (cols.size >= 2) cols[1].toLongOrNull() else null
+                    }.filter { it > 0L }.distinct().sorted()
+                    if (present.size < 2) {
+                        android.util.Log.d("PortalPadHud",
+                            "DIAG-HUDFPS arg='$arg' presentStamps=${present.size} → skip (stale)")
+                        continue
+                    }
+                    val spanNs = (present.last() - present.first()).toDouble()
+                    if (spanNs <= 0.0) continue
+                    val fps = (present.size - 1) * 1e9 / spanNs
+                    val result = if (fps.isFinite() && fps in 1.0..240.0) fps.toFloat() else -1f
+                    android.util.Log.d("PortalPadHud",
+                        "DIAG-HUDFPS arg='$arg' stamps=${present.size} → ${"%.1f".format(result)}")
+                    if (result > 0f) return result
+                }
+            }
+            android.util.Log.d("PortalPadHud", "DIAG-HUDFPS no candidate had frame data → -1")
+            -1f
+        } catch (t: Throwable) {
+            android.util.Log.w("PortalPadHud", "DIAG-HUDFPS threw", t)
+            -1f
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun probeMirrorCapability(physicalDisplayHint: Int): String {
+        val id = Binder.clearCallingIdentity()
+        val log = StringBuilder()
+        return try {
+            val sc = getSurfaceControlClass() ?: return "FAIL: no SurfaceControl class"
+
+            // 1) Physical panel token (same resolution setDisplayColorTransform uses).
+            var token: IBinder? = null
+            runCatching {
+                val ids = sc.getMethod("getPhysicalDisplayIds").invoke(null) as? LongArray
+                log.append("physicalIds=${ids?.toList()}; ")
+                if (ids != null && ids.isNotEmpty()) {
+                    val getToken = sc.getMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType)
+                    for (pid in ids.reversed()) {
+                        val t = getToken.invoke(null, pid) as? IBinder
+                        if (t != null) { token = t; log.append("panelToken=ok(pid=$pid); "); break }
+                    }
+                }
+            }.onFailure { log.append("tokenLookup:${it.javaClass.simpleName}; ") }
+            if (token == null) log.append("panelToken=NULL; ")
+
+            // 2) createDisplay round-trip (create → destroy). This is the API
+            //    most likely to be blocked on One UI 16; if it returns a token,
+            //    the AirBeam-style SF mirror is probably reachable.
+            runCatching {
+                val d = createSurfaceControlDisplay()
+                if (d != null) {
+                    log.append("createDisplay=OK; ")
+                    runCatching { destroySurfaceControlDisplay(d) }
+                        .onSuccess { log.append("destroyDisplay=OK; ") }
+                        .onFailure { log.append("destroyDisplay:${it.javaClass.simpleName}; ") }
+                } else {
+                    log.append("createDisplay=NULL; ")
+                }
+            }.onFailure { log.append("createDisplay:${it.javaClass.simpleName}; ") }
+
+            // 3) Are the retarget primitives even present (method resolution only —
+            //    NOT invoked, so the live panel is untouched)?
+            for (mName in listOf("setDisplayLayerStack", "setDisplaySurface", "setDisplayProjection")) {
+                val present = runCatching {
+                    sc.declaredMethods.any { it.name == mName } || sc.methods.any { it.name == mName }
+                }.getOrDefault(false)
+                log.append("$mName=${if (present) "present" else "MISSING"}; ")
+            }
+            // Same on Transaction, the modern home for these. Dump FULL
+            // signatures (name + param types) for the mirror family so the real
+            // build targets exact overloads instead of guessing.
+            runCatching {
+                val txClass = Class.forName("android.view.SurfaceControl\$Transaction")
+                val wanted = txClass.declaredMethods
+                    .filter {
+                        val n = it.name
+                        n.contains("LayerStack") || n.contains("mirror", true) ||
+                            n == "setDisplaySurface" || n == "setDisplayProjection" ||
+                            n == "reparent" || n.contains("Mirror")
+                    }
+                    .map { "${it.name}(${it.parameterTypes.joinToString(",") { p -> p.simpleName }})" }
+                    .distinct()
+                log.append("txSigs=$wanted; ")
+            }.onFailure { log.append("txScan:${it.javaClass.simpleName}; ") }
+
+            // SurfaceControl.mirrorSurface(SurfaceControl) — the likely AirBeam
+            // mechanism (a mirror is a COPY of a layer tree, which explains its
+            // separate layerStacks). Report its exact signature if present.
+            runCatching {
+                val ms = sc.methods.filter { it.name == "mirrorSurface" }
+                    .map { "mirrorSurface(${it.parameterTypes.joinToString(",") { p -> p.simpleName }})" }
+                log.append("scMirror=$ms; ")
+            }.onFailure { log.append("scMirrorScan:${it.javaClass.simpleName}; ") }
+
+            // createDisplay replacement moved to android.view.DisplayControl on
+            // newer builds. Check whether it (and its methods) are reachable.
+            runCatching {
+                val dc = Class.forName("android.view.DisplayControl")
+                val names = dc.declaredMethods.map { it.name }.distinct()
+                log.append("DisplayControl=present methods=$names; ")
+            }.onFailure { log.append("DisplayControl=${it.javaClass.simpleName}; ") }
+
+            // How do we get a SurfaceControl handle for the VD's root layer to
+            // mirror? Check DisplayManagerGlobal / SurfaceControl for a
+            // display-token→SurfaceControl bridge.
+            runCatching {
+                val scMethods = sc.methods
+                    .filter { it.name.contains("isplay", false) && it.returnType.simpleName == "SurfaceControl" }
+                    .map { "${it.name}(${it.parameterTypes.joinToString(",") { p -> p.simpleName }})" }
+                    .distinct()
+                log.append("scDisplay→SC=$scMethods; ")
+            }.onFailure {}
+
+            val summary = "MIRROR-PROBE: [$log]"
+            Log.w(TAG, summary)
+            summary
+        } catch (t: Throwable) {
+            val s = "MIRROR-PROBE EXCEPTION: ${t.javaClass.simpleName}: ${t.message} [$log]"
+            Log.w(TAG, s); s
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    // ─── Task management ────────────────────────────────────────────────
+
+    // Cached ActivityTaskManager.resizeTask handle — resolved once; a miss is
+    // remembered so we don't re-reflect per drag step.
+    @Volatile private var resizeTaskMethod: java.lang.reflect.Method? = null
+    @Volatile private var resizeTaskResolved = false
+    // 1 = RESIZE_MODE_USER (unanimated); demoted to 0 = SYSTEM if rejected.
+    @Volatile private var resizeModeValue = 1
+    @Volatile private var resizeFastLogged = false
+
+    override fun resizeTaskFast(taskId: Int, left: Int, top: Int, right: Int, bottom: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null) ?: return false
+            if (!resizeTaskResolved) {
+                resizeTaskResolved = true
+                // Same version-tolerant pattern as moveTaskToDisplay: the
+                // signature has been (int, Rect, int resizeMode) throughout
+                // recent releases; keep the lookup list-shaped for safety.
+                resizeTaskMethod = runCatching {
+                    atm.javaClass.getMethod(
+                        "resizeTask",
+                        Int::class.javaPrimitiveType,
+                        android.graphics.Rect::class.java,
+                        Int::class.javaPrimitiveType,
+                    )
+                }.getOrNull()
+                Log.i(TAG, "resizeTaskFast: reflection ${if (resizeTaskMethod != null) "RESOLVED" else "MISSED"}")
+            }
+            val m = resizeTaskMethod ?: return false
+            // Prefer 1 = RESIZE_MODE_USER (interactive resize, typically
+            // UNANIMATED): with SYSTEM mode, every 30ms drag step restarted a
+            // small bounds animation and the pile-up read as springy/"bouncy"
+            // window motion (field). If USER is rejected on this ROM, fall
+            // back permanently to 0 = RESIZE_MODE_SYSTEM (what `am task
+            // resize` passes) — worst case is exactly the old feel.
+            val rect = android.graphics.Rect(left, top, right, bottom)
+            try {
+                m.invoke(atm, taskId, rect, resizeModeValue)
+            } catch (t: Throwable) {
+                if (resizeModeValue == 1) {
+                    Log.w(TAG, "resizeTaskFast: RESIZE_MODE_USER rejected — falling back to SYSTEM", t)
+                    resizeModeValue = 0
+                    m.invoke(atm, taskId, rect, 0)
+                } else {
+                    throw t
+                }
+            }
+            if (!resizeFastLogged) {
+                resizeFastLogged = true
+                Log.i(TAG, "resizeTaskFast: first call ok (task=$taskId)")
+            }
+            true
+        } catch (t: Throwable) {
+            if (!resizeFastLogged) {
+                resizeFastLogged = true
+                Log.w(TAG, "resizeTaskFast failed — callers will use the shell path", t)
+            }
+            false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    /** Direct window-focus grab for a KNOWN task — no enumeration.
+     *  refocusTopTaskOnDisplay's task discovery fails SILENTLY on this ROM
+     *  (zero log lines across an entire failing session, 2026-07-17), so
+     *  this variant takes the taskId from the caller (an Activity knows its
+     *  own) and logs EVERY method attempt including the exception class —
+     *  the next capture is decisive about which spelling this ROM honors.
+     *  focusTopTask first: proven working here by the ROM's own launcher
+     *  (19:41:01.792, IActivityTaskManager$Stub.onTransact → focusTopTask). */
+    override fun focusTask(taskId: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null)
+            if (atm == null) {
+                Log.w(TAG, "focusTask($taskId): ATM service null")
+                return false
+            }
+            for (methodName in listOf("focusTopTask", "setFocusedTask", "setFocusedRootTask")) {
+                try {
+                    val m = atm.javaClass.getMethod(methodName, Int::class.javaPrimitiveType)
+                    m.invoke(atm, taskId)
+                    Log.i(TAG, "focusTask($taskId): $methodName OK")
+                    return true
+                } catch (t: Throwable) {
+                    val cause = t.cause ?: t
+                    Log.w(TAG, "focusTask($taskId): $methodName failed: ${cause.javaClass.simpleName}: ${cause.message}")
+                }
+            }
+            false
+        } catch (t: Throwable) {
+            Log.e(TAG, "focusTask($taskId) failed", t)
+            false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    // Cached IActivityTaskManager.removeTask handle — same resolve-once
+    // pattern as resizeTaskFast. removeTask finishes the task AND deletes its
+    // Recents record (the binder behind swiping a card away in Recents, and
+    // what DeX's caption X effectively achieves). MANAGE_ACTIVITY_TASKS is
+    // held by shell, so this works from the Shizuku/root process.
+    @Volatile private var removeTaskMethod: java.lang.reflect.Method? = null
+    @Volatile private var removeTaskResolved = false
+
+    override fun removeTask(taskId: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null) ?: return false
+            if (!removeTaskResolved) {
+                removeTaskResolved = true
+                removeTaskMethod = runCatching {
+                    atm.javaClass.getMethod("removeTask", Int::class.javaPrimitiveType)
+                }.getOrNull()
+                Log.i(TAG, "removeTask: reflection ${if (removeTaskMethod != null) "RESOLVED" else "MISSED"}")
+            }
+            val m = removeTaskMethod ?: return false
+            val ok = m.invoke(atm, taskId) as? Boolean ?: false
+            Log.i(TAG, "removeTask($taskId) → $ok")
+            ok
+        } catch (t: Throwable) {
+            Log.w(TAG, "removeTask($taskId) failed — caller will use the shell path", t)
+            false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun moveTaskToDisplay(taskId: Int, displayId: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null) ?: return false
+            for (methodName in listOf("moveRootTaskToDisplay", "moveStackToDisplay", "moveTaskToDisplay")) {
+                runCatching {
+                    val m = atm.javaClass.getMethod(methodName, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    m.invoke(atm, taskId, displayId)
+                    Log.d(TAG, "moveTaskToDisplay: $methodName ok task=$taskId display=$displayId")
+                    return@moveTaskToDisplay true
+                }
+            }
+            Log.w(TAG, "moveTaskToDisplay: no working method for task=$taskId display=$displayId")
+            false
+        } catch (t: Throwable) {
+            Log.e(TAG, "moveTaskToDisplay failed task=$taskId display=$displayId", t); false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun moveFocusedTaskToDisplay(displayId: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null) ?: return false
+            val focusedTask = getFocusedTaskInfo(atm) ?: return false
+            val taskId = readIntField(focusedTask, "rootTaskId")
+                ?: readIntField(focusedTask, "taskId")
+                ?: readIntField(focusedTask, "stackId")
+                ?: return false
+
+            for (methodName in listOf("moveRootTaskToDisplay", "moveStackToDisplay", "moveTaskToDisplay")) {
+                runCatching {
+                    val m = atm.javaClass.getMethod(methodName, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    m.invoke(atm, taskId, displayId)
+                    Log.d(TAG, "moveFocusedTaskToDisplay: $methodName ok task=$taskId display=$displayId")
+                    return@moveFocusedTaskToDisplay true
+                }
+            }
+            false
+        } catch (t: Throwable) {
+            Log.e(TAG, "moveFocusedTaskToDisplay failed", t); false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    private fun getFocusedTaskInfo(atm: Any): Any? = try {
+        runCatching { atm.javaClass.getMethod("getFocusedRootTaskInfo").invoke(atm) }.getOrNull()
+            ?: runCatching { atm.javaClass.getMethod("getFocusedStackInfo").invoke(atm) }.getOrNull()
+    } catch (_: Throwable) { null }
+
+    override fun getFocusedTaskDisplayId(): Int {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null) ?: return -1
+            val focusedTask = getFocusedTaskInfo(atm) ?: return -1
+            readIntField(focusedTask, "displayId") ?: -1
+        } catch (t: Throwable) {
+            Log.w(TAG, "getFocusedTaskDisplayId failed", t); -1
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    /**
+     * Re-assert input focus on [displayId] by bringing its current top task to
+     * front — without relaunching anything. Finds the task whose displayId
+     * matches and calls a moveTask/RootTask-to-front ATM method. Returns false
+     * if no task is found on that display (caller may then fall back to
+     * launching a backdrop).
+     */
+    override fun refocusTopTaskOnDisplay(displayId: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null) ?: return false
+            // Enumerate tasks; pick the first (top-most) whose displayId matches.
+            val tasks: List<*> = runCatching {
+                @Suppress("UNCHECKED_CAST")
+                (atm.javaClass.getMethod("getAllRootTaskInfos").invoke(atm) as? List<*>)
+            }.getOrNull()
+                ?: runCatching {
+                    @Suppress("UNCHECKED_CAST")
+                    (atm.javaClass.getMethod("getAllStackInfos").invoke(atm) as? List<*>)
+                }.getOrNull()
+                ?: return false
+
+            val match = tasks.firstOrNull { t ->
+                t != null && readIntField(t, "displayId") == displayId
+            } ?: return false
+
+            val taskId = readIntField(match, "rootTaskId")
+                ?: readIntField(match, "taskId")
+                ?: readIntField(match, "stackId")
+                ?: return false
+
+            // focusTopTask FIRST: proven present AND working on this ROM by
+            // the ROM's own launcher (full log 2026-07-17 19:41:01.792:
+            // ActivityTaskManagerService.focusTopTask ← IActivityTaskManager
+            // $Stub.onTransact successfully changed window focus). The
+            // move-to-front spellings are known-absent on this ROM (long-
+            // standing constraint) — kept only for other builds.
+            for (methodName in listOf(
+                "focusTopTask", "setFocusedTask", "setFocusedRootTask",
+                "moveRootTaskToFront", "moveTaskToFront", "moveStackToFront",
+            )) {
+                runCatching {
+                    val m = atm.javaClass.getMethod(methodName, Int::class.javaPrimitiveType)
+                    m.invoke(atm, taskId)
+                    Log.d(TAG, "refocusTopTaskOnDisplay: $methodName ok task=$taskId display=$displayId")
+                    return@refocusTopTaskOnDisplay true
+                }
+            }
+            Log.w(TAG, "refocusTopTaskOnDisplay: found task=$taskId on display=$displayId but no move-to-front method worked")
+            false
+        } catch (t: Throwable) {
+            Log.e(TAG, "refocusTopTaskOnDisplay failed", t); false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    private fun readIntField(obj: Any, fieldName: String): Int? = try {
+        val f = obj.javaClass.getDeclaredField(fieldName)
+        f.isAccessible = true
+        f.getInt(obj)
+    } catch (_: Throwable) { null }
+
+    // ─── runCommand ─────────────────────────────────────────────────────
+
+    override fun runCommand(command: String): String {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val p = Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
+            val sb = StringBuilder()
+            BufferedReader(InputStreamReader(p.inputStream)).use { reader ->
+                var line = reader.readLine()
+                while (line != null) { sb.append(line).append('\n'); line = reader.readLine() }
+            }
+            sb.toString()
+        } catch (t: Throwable) {
+            Log.e(TAG, "runCommand failed: $command", t); ""
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    // ─── EXPERIMENTAL: privileged-process overlay probe ────────────────
+    override fun probeOverlayWindow(displayId: Int, windowType: Int, holdMs: Long): String {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val ctx = obtainSystemContext() ?: context
+                ?: return "PROBE FAIL: no context in privileged process"
+
+            val result = AtomicReference<String>("(no result)")
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val touchSeen = java.util.concurrent.atomic.AtomicBoolean(false)
+            val touchLog = StringBuilder()
+
+            // Window + view ops must run on a thread with a Looper. Use a
+            // dedicated HandlerThread so we don't depend on the main looper.
+            val ht = android.os.HandlerThread("portalpad-probe").apply { start() }
+            val handler = android.os.Handler(ht.looper)
+            handler.post {
+                var view: android.view.View? = null
+                var wm: android.view.WindowManager? = null
+                try {
+                    // Target the requested display.
+                    val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                    val display = dm.getDisplay(displayId)
+                        ?: run {
+                            result.set("PROBE FAIL: no display id=$displayId")
+                            latch.countDown(); return@post
+                        }
+                    val displayCtx = ctx.createDisplayContext(display)
+                    wm = displayCtx.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+
+                    // A small, visible, TOUCHABLE box so you can see it and tap it.
+                    view = android.view.View(displayCtx).apply {
+                        setBackgroundColor(0xAAFF0000.toInt()) // semi-transparent red
+                        setOnTouchListener { _, ev ->
+                            runCatching {
+                                touchSeen.set(true)
+                                touchLog.append("touch action=${ev.actionMasked} @(${ev.x.toInt()},${ev.y.toInt()}); ")
+                                Log.d(TAG, "PROBE touch: action=${ev.actionMasked} pos=(${ev.x},${ev.y})")
+                            }
+                            true
+                        }
+                    }
+
+                    val lp = android.view.WindowManager.LayoutParams(
+                        300, 300,
+                        windowType,
+                        // Focusable + touchable (NO not-touchable / not-focusable flags)
+                        // so we can actually test whether touches land on it.
+                        0,
+                        android.graphics.PixelFormat.TRANSLUCENT,
+                    ).apply {
+                        gravity = android.view.Gravity.CENTER
+                    }
+
+                    wm.addView(view, lp)
+                    Log.d(TAG, "PROBE: addView OK type=$windowType disp=$displayId")
+                    result.set("PROBE ADD OK: type=$windowType disp=$displayId — box shown ${holdMs}ms; TAP IT NOW")
+
+                    // Hold so the user can see + tap, then remove.
+                    val capturedView = view
+                    val capturedWm = wm
+                    handler.postDelayed({
+                        try {
+                            runCatching { capturedWm?.removeView(capturedView) }
+                            result.set(
+                                "PROBE type=$windowType disp=$displayId: ADD=OK, " +
+                                    "touchReceived=${touchSeen.get()} [${touchLog}]",
+                            )
+                        } catch (t: Throwable) {
+                            result.set("PROBE type=$windowType: removal error ${t.javaClass.simpleName}: ${t.message}; touchReceived=${touchSeen.get()}")
+                        } finally {
+                            latch.countDown()
+                        }
+                    }, holdMs)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "PROBE addView FAILED type=$windowType: ${t.javaClass.simpleName}: ${t.message}")
+                    result.set("PROBE ADD FAIL: type=$windowType disp=$displayId — ${t.javaClass.simpleName}: ${t.message}")
+                    runCatching { if (view != null) wm?.removeView(view) }
+                    latch.countDown()
+                }
+            }
+
+            // Wait for the hold + result (cap a bit beyond holdMs).
+            latch.await(holdMs + 3000, java.util.concurrent.TimeUnit.MILLISECONDS)
+            runCatching { ht.quitSafely() }
+            result.get()
+        } catch (t: Throwable) {
+            "PROBE EXCEPTION: ${t.javaClass.simpleName}: ${t.message}"
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun amStart(component: String, displayId: Int): String {
+        // reference pattern (from derived ShellUserService.startFocusedActivityOnDisplay):
+        //   First try `am start -n <component>/<activity> --display N`. If
+        //   that fails (Error/Exception), fall back to launching by package:
+        //   `am start -a MAIN -c LAUNCHER -p <package> --display N`. The
+        //   first form preserves which activity opens; the fallback opens
+        //   the package's default launcher activity.
+        Log.d(TAG, "amStart component='$component' displayId=$displayId")
+        val cmdPrimary = if ("/" in component) {
+            "am start -n '$component' --display $displayId"
+        } else {
+            "am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p $component --display $displayId"
+        }
+        val out1 = runCommand(cmdPrimary).trim()
+        Log.d(TAG, "amStart primary out: $out1")
+        val failed = out1.contains("Error", ignoreCase = true) ||
+            out1.contains("Exception", ignoreCase = true) ||
+            out1.contains("does not exist", ignoreCase = true)
+        if (!failed) return out1
+
+        // Fallback: extract package (before '/') and try LAUNCHER form
+        if ("/" in component) {
+            val pkg = component.substringBefore('/')
+            val cmdFallback =
+                "am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p $pkg --display $displayId"
+            val out2 = runCommand(cmdFallback).trim()
+            Log.d(TAG, "amStart fallback out: $out2")
+            return "PRIMARY:\n$out1\n\nFALLBACK:\n$out2"
+        }
+        return out1
+    }
+
+    // ─── Diagnostics ────────────────────────────────────────────────────
+
+    override fun dumpDisplays(): String {
+        val ctx = context ?: return "<no context>"
+        return try {
+            val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+            val sb = StringBuilder()
+            for (d in dm.displays) {
+                val p = android.graphics.Point().also { d.getRealSize(it) }
+                sb.append("id=${d.displayId} name='${d.name}' ${p.x}x${p.y} flags=0x${d.flags.toString(16)} state=${d.state}\n")
+            }
+            sb.toString()
+        } catch (t: Throwable) { "dump failed: $t" }
+    }
+
+    /**
+     * Reads Android's per-physical-display reconnect preference without baking
+     * in either a Binder transaction number or a device-specific unique id.
+     *
+     * Pixel Android 16 exposes get/setConnectionPreference; newer AOSP names
+     * the same pair get/setExternalDisplayConnectionPreference. Resolve both
+     * spellings by signature so an OTA can move the transaction without
+     * breaking PortalPad.
+     */
+    override fun isDisplayMirroringDefault(displayId: Int): Boolean {
+        if (displayId <= 0) return false
+        val extInfo = getDisplayInfo(displayId)
+        val defInfo = getDisplayInfo(0)
+        if (extInfo != null && defInfo != null && extInfo.layerStack == defInfo.layerStack) {
+            return true
+        }
+        return runCatching {
+            val pref = getExternalDisplayConnectionPreference()
+            pref == BoundShellBackend.DISPLAY_PREF_MIRROR
+        }.getOrDefault(false)
+    }
+
+    override fun getExternalDisplayConnectionPreference(): Int {
+        val target = currentPhysicalExternalDisplayTarget()
+            ?: return BoundShellBackend.DISPLAY_PREF_NO_DISPLAY
+        return readExternalDisplayConnectionPreference(target)
+    }
+
+    override fun setExternalDisplayConnectionPreference(preference: Int): Boolean {
+        if (preference != BoundShellBackend.DISPLAY_PREF_ASK &&
+            preference != BoundShellBackend.DISPLAY_PREF_SEPARATE
+        ) {
+            Log.w(TAG, "DISPLAY-PREF rejected unsafe value=$preference")
+            return false
+        }
+        val target = currentPhysicalExternalDisplayTarget() ?: return false
+        val manager = displayManagerBinderInterface() ?: return false
+        val method = findConnectionPreferenceMethod(manager, setter = true) ?: return false
+        return runCatching {
+            invokeConnectionPreference(method, manager, target, setter = true, preference = preference)
+            val confirmed = readExternalDisplayConnectionPreference(target)
+            val ok = confirmed == preference
+            Log.w(
+                TAG,
+                "DISPLAY-PREF set uniqueId=${target.uniqueId} displayId=${target.displayId} " +
+                    "requested=$preference confirmed=$confirmed ok=$ok",
+            )
+            ok
+        }.onFailure {
+            Log.e(
+                TAG,
+                "DISPLAY-PREF set failed uniqueId=${target.uniqueId} displayId=${target.displayId} value=$preference",
+                it,
+            )
+        }.getOrDefault(false)
+    }
+
+    private data class PhysicalDisplayTarget(
+        val displayId: Int,
+        val uniqueId: String,
+        val userId: Int,
+    )
+
+    private fun readExternalDisplayConnectionPreference(target: PhysicalDisplayTarget): Int {
+        val manager = displayManagerBinderInterface()
+            ?: return BoundShellBackend.DISPLAY_PREF_UNSUPPORTED
+        val method = findConnectionPreferenceMethod(manager, setter = false)
+            ?: return BoundShellBackend.DISPLAY_PREF_UNSUPPORTED
+        return runCatching {
+            (invokeConnectionPreference(method, manager, target, setter = false, preference = 0) as? Number)?.toInt()
+                ?: BoundShellBackend.DISPLAY_PREF_UNSUPPORTED
+        }.onSuccess {
+            Log.d(TAG, "DISPLAY-PREF read uniqueId=${target.uniqueId} displayId=${target.displayId} value=$it")
+        }.onFailure {
+            Log.e(TAG, "DISPLAY-PREF read failed uniqueId=${target.uniqueId}", it)
+        }.getOrDefault(BoundShellBackend.DISPLAY_PREF_UNSUPPORTED)
+    }
+
+    private fun invokeConnectionPreference(
+        method: Method,
+        manager: Any,
+        target: PhysicalDisplayTarget,
+        setter: Boolean,
+        preference: Int,
+    ): Any? {
+        val params = method.parameterTypes
+        val firstIsString = params.firstOrNull() == String::class.java
+        return when {
+            !setter && params.size == 1 && firstIsString ->
+                method.invoke(manager, target.uniqueId)
+            !setter && params.size == 1 && params[0] == Int::class.javaPrimitiveType ->
+                method.invoke(manager, target.displayId)
+            !setter && params.size == 2 && firstIsString ->
+                method.invoke(manager, target.uniqueId, target.userId)
+            !setter && params.size == 2 ->
+                method.invoke(manager, target.displayId, target.userId)
+            setter && params.size == 2 && firstIsString ->
+                method.invoke(manager, target.uniqueId, preference)
+            setter && params.size == 2 ->
+                method.invoke(manager, target.displayId, preference)
+            setter && params.size == 3 && firstIsString ->
+                method.invoke(manager, target.uniqueId, preference, target.userId)
+            setter && params.size == 3 ->
+                method.invoke(manager, target.displayId, preference, target.userId)
+            else -> throw IllegalStateException("Unexpected DISPLAY-PREF params: ${params.toList()}")
+        }
+    }
+
+    private fun currentPhysicalExternalDisplayTarget(): PhysicalDisplayTarget? {
+        val ctx = context ?: obtainSystemContext() ?: return null
+        val display = runCatching {
+            (ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
+                .displays
+                .firstOrNull(DisplayUtil::isRealExternalDisplay)
+        }.getOrNull() ?: return null
+
+        val userId = runCatching {
+            val uh = android.os.Process.myUserHandle()
+            val getId = uh.javaClass.methods.firstOrNull { it.name == "getIdentifier" && it.parameterCount == 0 }
+            (getId?.invoke(uh) as? Number)?.toInt() ?: 0
+        }.getOrDefault(0)
+
+        val uniqueId = runCatching {
+            val method = (display.javaClass.methods + display.javaClass.declaredMethods)
+                .first { it.name == "getUniqueId" && it.parameterCount == 0 }
+            method.isAccessible = true
+            method.invoke(display) as? String
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: runCatching {
+            val dmg = getDisplayManagerGlobal() ?: return@runCatching null
+            val method = getDisplayInfoMethod
+                ?: dmg.javaClass.getMethod("getDisplayInfo", Int::class.javaPrimitiveType)
+                    .also { getDisplayInfoMethod = it }
+            val info = method.invoke(dmg, display.displayId) ?: return@runCatching null
+            val field = info.javaClass.getDeclaredField("uniqueId")
+            field.isAccessible = true
+            field.get(info) as? String
+        }.onFailure {
+            Log.e(TAG, "DISPLAY-PREF could not resolve display unique id", it)
+        }.getOrNull().orEmpty()
+
+        return PhysicalDisplayTarget(
+            displayId = display.displayId,
+            uniqueId = uniqueId,
+            userId = userId,
+        )
+    }
+
+    private fun displayManagerBinderInterface(): Any? = runCatching {
+        val serviceManager = Class.forName("android.os.ServiceManager")
+        val binder = serviceManager
+            .getMethod("getService", String::class.java)
+            .invoke(null, Context.DISPLAY_SERVICE) as? IBinder
+            ?: return@runCatching null
+        val stub = Class.forName("android.hardware.display.IDisplayManager\$Stub")
+        stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder)
+    }.onFailure {
+        Log.e(TAG, "DISPLAY-PREF could not obtain IDisplayManager", it)
+    }.getOrNull()
+
+    private fun findConnectionPreferenceMethod(manager: Any, setter: Boolean): Method? {
+        val names = if (setter) {
+            setOf("setConnectionPreference", "setExternalDisplayConnectionPreference")
+        } else {
+            setOf("getConnectionPreference", "getExternalDisplayConnectionPreference")
+        }
+        val candidates = (
+            manager.javaClass.methods.asList() +
+                manager.javaClass.interfaces.flatMap { it.methods.asList() }
+            ).distinctBy { it.name to it.parameterTypes.toList() }
+        return candidates.firstOrNull { method ->
+            if (method.name !in names) return@firstOrNull false
+            val p = method.parameterTypes
+            val intType = Int::class.javaPrimitiveType
+            val firstOk = p.firstOrNull() == String::class.java || p.firstOrNull() == intType
+            if (!firstOk) return@firstOrNull false
+            val countOk = if (setter) {
+                (p.size == 2 && p[1] == intType) ||
+                    (p.size == 3 && p[1] == intType && p[2] == intType)
+            } else {
+                p.size == 1 || (p.size == 2 && p[1] == intType)
+            }
+            countOk
+        }?.also { runCatching { it.isAccessible = true } }
+            ?: run {
+                Log.w(
+                    TAG,
+                    "DISPLAY-PREF ${if (setter) "setter" else "getter"} unavailable; " +
+                        "methods=${candidates.map { it.name }.distinct().sorted()}",
+                )
+                null
+            }
+    }
+
+    override fun ping(message: String): String = "pong: $message; uid=${Process.myUid()}"
+
+    override fun shutdownUserService() {
+        Log.d(TAG, "shutdown: ${virtualDisplays.size} VDs, ${mirrorVirtualDisplays.size} mirrors")
+        virtualDisplays.values.forEach { runCatching { it.release() } }
+        mirrorVirtualDisplays.values.forEach { runCatching { it.release() } }
+        surfaceMirrorTokens.values.forEach { runCatching { destroySurfaceControlDisplay(it) } }
+        virtualDisplays.clear(); mirrorVirtualDisplays.clear(); surfaceMirrorTokens.clear()
+        stopLogcatStream()
+        runCatching { Process.killProcess(Process.myPid()) }
+    }
+
+    // ─── Logcat streaming ──────────────────────────────────────────────
+    // Use fully-qualified java.lang.Process for the OS subprocess to avoid
+    // colliding with android.os.Process (which is also imported in this
+    // file and is what bare `Process` resolves to here).
+    @Volatile private var logcatProcess: java.lang.Process? = null
+    @Volatile private var logcatThread: Thread? = null
+
+    /**
+     * Pipes filtered logcat into a ParcelFileDescriptor. Runs in this
+     * (shell-UID) process where logcat read permission is granted. The
+     * caller reads from the returned FD until [stopLogcatStream] is
+     * invoked (or the process exits).
+     *
+     * Filter spec defaults to a strict PortalPad-only allowlist so we
+     * never leak other apps' logs to the user. The "*:S" suffix silences
+     * everything else.
+     */
+    override fun streamLogcat(filterSpec: String?): android.os.ParcelFileDescriptor {
+        stopLogcatStream()  // ensure no leak from a previous session
+        val safe = filterSpec ?: DEFAULT_LOGCAT_FILTER
+        val pipe = android.os.ParcelFileDescriptor.createPipe()
+        val readSide = pipe[0]
+        val writeSide = pipe[1]
+
+        // Build argv. Splitting on spaces is fine because the filter
+        // tokens never contain spaces individually.
+        // -T 1: start from NOW (well, the single most recent line), never the
+        // device's retained ring buffer — a bare logcat re-dumps the ENTIRE
+        // ring at spawn, so every stream (re)start re-imported thousands of
+        // historical lines (field: "Stop & clear didn't clear", "paused log
+        // grew" — it was the next start's history dump, not background
+        // capture). The device ring itself is left untouched so adb captures
+        // keep working.
+        val argv = mutableListOf("logcat", "-v", "threadtime", "-T", "1")
+        argv += safe.split(' ').filter { it.isNotBlank() }
+
+        val proc = try {
+            ProcessBuilder(argv).redirectErrorStream(true).start()
+        } catch (t: Throwable) {
+            Log.e(TAG, "logcat spawn failed", t)
+            try { writeSide.close() } catch (_: Throwable) {}
+            return readSide
+        }
+        logcatProcess = proc
+
+        // Pump stdout → FD write side on a worker thread.
+        val outFd = android.os.ParcelFileDescriptor.AutoCloseOutputStream(writeSide)
+        logcatThread = Thread({
+            try {
+                val buf = ByteArray(4096)
+                val inStream = proc.inputStream
+                while (true) {
+                    val n = inStream.read(buf)
+                    if (n <= 0) break
+                    try { outFd.write(buf, 0, n); outFd.flush() }
+                    catch (_: Throwable) { break }   // reader closed; abort
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "logcat pump ended", t)
+            } finally {
+                runCatching { outFd.close() }
+            }
+        }, "TD-LogcatPump").apply { isDaemon = true; start() }
+
+        return readSide
+    }
+
+    override fun stopLogcatStream() {
+        runCatching { logcatProcess?.destroy() }
+        logcatProcess = null
+        runCatching { logcatThread?.interrupt() }
+        logcatThread = null
+    }
+
+    // ─── Physical mouse capture (Phase 1) ───────────────────────────────
+    @Volatile private var mouseFd: Int = -1
+    @Volatile private var mouseWriteFd: Int = -1
+    @Volatile private var mouseThread: Thread? = null
+    /** Reader threads for the captured device's SIBLING nodes (extra buttons /
+     *  keyboard half). Joined on stop - see stopMouseCapture. */
+    @Volatile private var mouseSibThreads: List<Thread> = emptyList()
+
+    override fun startMouseCapture(
+        grab: Boolean,
+        nativeLibDir: String?,
+        preferName: String?,
+        writeEnd: ParcelFileDescriptor?,
+    ): String {
+        // One session at a time — tear down any prior capture first.
+        stopMouseCapture()
+        if (writeEnd == null) return "ERR no-pipe"
+        if (!NativeMouse.ensureLoaded(nativeLibDir)) {
+            runCatching { writeEnd.close() }
+            return "ERR native-lib-not-loaded: ${NativeMouse.loadError}"
+        }
+        val dev = findMouseEventPath(preferName)
+        if (dev == null) {
+            runCatching { writeEnd.close() }
+            return "ERR no-mouse-found"
+        }
+        val path = dev.path
+        val fd = NativeMouse.nativeOpen(path)
+        if (fd < 0) {
+            runCatching { writeEnd.close() }
+            return "ERR open device=$path errno=${-fd}"
+        }
+        val grabResult = if (grab) NativeMouse.nativeGrab(fd) else 0
+        // Take ownership of the write fd so it outlives this binder call.
+        val wfd = writeEnd.detachFd()
+        mouseFd = fd
+        mouseWriteFd = wfd
+
+        // SIBLING NODES (SH): grab the rest of the same physical device so its
+        // extra buttons reach the app instead of Android. Grab-only: observing
+        // a sibling WITHOUT the grab would double every button (we act AND
+        // Android acts), so a node that refuses the grab is skipped entirely.
+        // Only when the primary grab is on, for the same reason.
+        // All loops share ONE pipe: single 24-byte records are below PIPE_BUF,
+        // so concurrent writers never interleave a record. The LAST loop to
+        // end closes the write fd - closing it while a sibling still writes
+        // would hand a recycled fd number a stranger's data.
+        val sibFds = mutableListOf<Pair<Int, String>>()
+        if (grab && grabResult == 0) {
+            for (sib in findSiblingNodes(path)) {
+                val sfd = NativeMouse.nativeOpen(sib.path)
+                if (sfd < 0) {
+                    Log.w(TAG, "sibling open failed ${sib.path} errno=${-sfd}")
+                    continue
+                }
+                if (NativeMouse.nativeGrab(sfd) != 0) {
+                    Log.w(TAG, "sibling grab refused ${sib.path} (${sib.name}) — skipped")
+                    runCatching { NativeMouse.nativeUngrabClose(sfd) }
+                    continue
+                }
+                sibFds += sfd to sib.path
+                Log.i(TAG, "sibling grabbed ${sib.path} (${sib.name})")
+            }
+        }
+        val activeLoops = java.util.concurrent.atomic.AtomicInteger(1 + sibFds.size)
+        fun loopEnded() {
+            if (activeLoops.decrementAndGet() == 0) {
+                runCatching { android.os.ParcelFileDescriptor.adoptFd(wfd).close() }
+            }
+        }
+
+        val t = Thread({
+            val reason = runCatching { NativeMouse.nativeRunLoop(fd, wfd) }.getOrDefault(-1)
+            Log.i(TAG, "mouse read loop ended reason=$reason")
+            runCatching { NativeMouse.nativeUngrabClose(fd) }
+            loopEnded()
+            if (mouseFd == fd) { mouseFd = -1; mouseWriteFd = -1; mouseThread = null }
+        }, "PortalPadMouseLoop")
+        t.isDaemon = true
+        mouseThread = t
+        t.start()
+        mouseSibThreads = sibFds.map { (sfd, spath) ->
+            Thread({
+                val reason = runCatching { NativeMouse.nativeRunLoop(sfd, wfd) }.getOrDefault(-1)
+                Log.i(TAG, "sibling loop ended $spath reason=$reason")
+                runCatching { NativeMouse.nativeUngrabClose(sfd) }
+                loopEnded()
+            }, "PortalPadMouseSib").apply { isDaemon = true; start() }
+        }
+
+        val grabStr = when {
+            !grab -> "skipped"
+            grabResult == 0 -> "OK"
+            else -> "FAILED(errno=${-grabResult})"
+        }
+        // The NAME is what the UI shows; the path stays for the log, where it
+        // is the useful identifier. Deliberately not shown to the user: eventN
+        // changes across reboots and re-pairings, so presenting it invites
+        // treating an unstable number as the device's identity.
+        val status = "OK device=$path name=${dev.name} grab=$grabStr"
+        Log.i(TAG, "startMouseCapture → $status (nodes=${1 + sibFds.size})")
+        return status
+    }
+
+    override fun stopMouseCapture() {
+        if (mouseFd == -1 && mouseThread == null && mouseSibThreads.isEmpty()) return
+        runCatching { NativeMouse.nativeStop() }
+        runCatching { mouseThread?.join(500) }
+        // Join the sibling loops too. nativeRunLoop resets the shared stop flag
+        // on ENTRY, so a fast stop->start could otherwise resurrect a sibling
+        // loop mid-poll - it would keep its grab and the new session's grab on
+        // that node would fail, silently losing the extra buttons.
+        mouseSibThreads.forEach { runCatching { it.join(400) } }
+        mouseSibThreads = emptyList()
+        mouseThread = null
+        mouseFd = -1
+        mouseWriteFd = -1
+    }
+
+    /**
+     * Find a connected physical pointer device.
+     *
+     * We parse `getevent -pl` rather than /proc/bus/input/devices because Samsung's
+     * SELinux policy denies the shell domain read access to that proc file (it
+     * returns EACCES), while `getevent` is permitted. A mouse advertises REL_X and
+     * REL_Y; keyboards and touchpads don't, so requiring both cleanly selects the
+     * pointer node of a combo keyboard+mouse device. (The device's OTHER nodes
+     * are no longer left ungrabbed - startMouseCapture grabs the siblings too,
+     * see findSiblingNodes.) The eventN number isn't stable across reboots, so
+     * we always resolve it fresh.
+     *
+     * `getevent -pl` output looks like:
+     *   add device 1: /dev/input/event12
+     *     name:     "X1 keyboard Mouse"
+     *     events:
+     *       KEY (0001): BTN_MOUSE  BTN_RIGHT  BTN_MIDDLE
+     *       REL (0002): REL_X  REL_Y  REL_WHEEL  REL_WHEEL_HI_RES
+     */
+    /** A pointer device: its node, and the name a human would recognise. */
+    private data class PointerDev(
+        val path: String,
+        val name: String,
+        val hasMouseButtons: Boolean = false,
+    )
+
+    private fun listPointers(): Pair<List<PointerDev>, Int> {
+        val out = runCatching {
+            val p = ProcessBuilder("getevent", "-pl")
+                .redirectErrorStream(true)
+                .start()
+            val text = p.inputStream.bufferedReader().readText()
+            runCatching { p.waitFor() }
+            text
+        }.getOrNull() ?: return Pair(emptyList(), 0)
+
+        val found = mutableListOf<PointerDev>()
+        var others = 0
+        var curPath: String? = null
+        var curName = ""
+        var curHasRelX = false
+        var curHasRelY = false
+        var curHasMouseBtn = false
+
+        fun finish() {
+            val path = curPath ?: return
+            if (curHasRelX && curHasRelY) {
+                found += PointerDev(
+                    path,
+                    curName.ifBlank { path.substringAfterLast('/') },
+                    hasMouseButtons = curHasMouseBtn,
+                )
+            } else {
+                others++
+            }
+        }
+
+        for (raw in out.lineSequence()) {
+            val line = raw.trim()
+            val dev = Regex("add device \\d+:\\s*(/dev/input/event\\d+)").find(line)
+            if (dev != null) {
+                finish()
+                curPath = dev.groupValues[1]
+                curName = ""
+                curHasRelX = false
+                curHasRelY = false
+                curHasMouseBtn = false
+                continue
+            }
+            if (curPath == null) continue
+            // name:     "Logitech M720"
+            Regex("^name:\\s*\"(.*)\"$").find(line)?.let { curName = it.groupValues[1] }
+            if (line.startsWith("KEY")) {
+                if (line.contains("BTN_MOUSE") || line.contains("BTN_LEFT")) curHasMouseBtn = true
+            }
+            if (line.startsWith("REL")) {
+                if (line.contains("REL_X")) curHasRelX = true
+                if (line.contains("REL_Y")) curHasRelY = true
+            }
+        }
+        finish()
+        val sorted = found.sortedByDescending { it.hasMouseButtons }
+        return Pair(sorted, others)
+    }
+
+    override fun listPointerDevices(): String {
+        val (devs, others) = listPointers()
+        val sb = StringBuilder()
+        for (d in devs) sb.append(d.path.substringAfterLast('/')).append('\t').append(d.name).append('\n')
+        sb.append("OTHER\t").append(others)
+        return sb.toString()
+    }
+
+    /** The device to capture: [preferName] if it is present, else the first
+     *  pointer found. Falling back rather than failing keeps a mouse working
+     *  when the preferred one is simply switched off. */
+    private fun findMouseEventPath(preferName: String?): PointerDev? {
+        val (devs, _) = listPointers()
+        if (devs.isEmpty()) return null
+        if (!preferName.isNullOrBlank()) {
+            devs.firstOrNull { it.name == preferName }?.let { return it }
+        }
+        return devs.first()
+    }
+
+    // ─── Sibling nodes (whole-device capture, SH 2026-07-24) ────────────────
+    // A physical mouse/trackpad is often SEVERAL /dev/input nodes: the pointer,
+    // plus separate nodes for its extra buttons / keyboard half / consumer
+    // keys. Capturing only the pointer node left those buttons with Android -
+    // SH's "Back" side button backed them out of the settings page instead of
+    // being learnable. Grabbing every node of the same physical device routes
+    // ALL of its input through PortalPad while captured.
+
+    /** One /dev/input node with identity + capability details (getevent -p -i -l). */
+    private data class InputNode(
+        val path: String,
+        val name: String,
+        val location: String, // phys: BT = adapter MAC (shared!), USB = port path
+        val uniq: String,     // BT = the device's own MAC - the real identity
+        val hasKey: Boolean,
+        val hasAbs: Boolean,
+    )
+
+    private fun listInputNodes(): List<InputNode> {
+        val out = runCatching {
+            val p = ProcessBuilder("getevent", "-p", "-i", "-l")
+                .redirectErrorStream(true)
+                .start()
+            val text = p.inputStream.bufferedReader().readText()
+            runCatching { p.waitFor() }
+            text
+        }.getOrNull() ?: return emptyList()
+        val nodes = mutableListOf<InputNode>()
+        var path: String? = null
+        var name = ""
+        var location = ""
+        var uniq = ""
+        var hasKey = false
+        var hasAbs = false
+        fun finish() {
+            val pth = path ?: return
+            nodes += InputNode(
+                pth, name.ifBlank { pth.substringAfterLast('/') },
+                location, uniq, hasKey, hasAbs,
+            )
+        }
+        for (raw in out.lineSequence()) {
+            val line = raw.trim()
+            val dev = Regex("add device \\d+:\\s*(/dev/input/event\\d+)").find(line)
+            if (dev != null) {
+                finish()
+                path = dev.groupValues[1]
+                name = ""; location = ""; uniq = ""
+                hasKey = false; hasAbs = false
+                continue
+            }
+            if (path == null) continue
+            Regex("^name:\\s*\"(.*)\"$").find(line)?.let { name = it.groupValues[1] }
+            Regex("^location:\\s*\"(.*)\"$").find(line)?.let { location = it.groupValues[1] }
+            Regex("^id:\\s*\"(.*)\"$").find(line)?.let { uniq = it.groupValues[1] }
+            if (line.startsWith("KEY")) hasKey = true
+            if (line.startsWith("ABS")) hasAbs = true
+        }
+        finish()
+        return nodes
+    }
+
+    /**
+     * Event paths of [primaryPath]'s sibling nodes worth grabbing.
+     *
+     * Identity: same non-blank uniq (Bluetooth: the device's own MAC). USB
+     * fallback: same location prefix before "/input" (one port, several
+     * interfaces). BT deliberately gets NO location fallback - phys there is
+     * the phone's adapter MAC, shared by every BT device, and matching on it
+     * would grab an unrelated keyboard.
+     *
+     * Filters: must report KEY (a node with no keys has no buttons to give
+     * us) and must NOT report ABS - EVIOCGRAB on the touchscreen leaves the
+     * phone unresponsive, so ABS nodes are structurally off limits here, the
+     * same boundary listPointers() draws.
+     */
+    private fun findSiblingNodes(primaryPath: String): List<InputNode> {
+        val all = listInputNodes()
+        val primary = all.firstOrNull { it.path == primaryPath } ?: return emptyList()
+        val usbPrefix = primary.location.substringBefore("/input").trim()
+        return all.filter { n ->
+            n.path != primaryPath &&
+                n.hasKey && !n.hasAbs &&
+                when {
+                    primary.uniq.isNotBlank() -> n.uniq == primary.uniq
+                    usbPrefix.isNotBlank() && primary.location.contains("/input") ->
+                        n.location.substringBefore("/input").trim() == usbPrefix
+                    else -> false
+                }
+        }
+    }
+
+    companion object {
+        private const val TAG = "ShellUserService"
+
+        /** Process-name suffix Shizuku gives our helper (see
+         *  ShizukuClickBackend's `.processNameSuffix("portalpad_shell")`).
+         *  Used by [reapStaleHelpers] to spot leaked helper processes — keep
+         *  the two in sync. */
+        private const val HELPER_PROCESS_TAG = "portalpad_shell"
+        /**
+         * Strict allowlist — silences everything except PortalPad's own tags.
+         * Built from the shared [com.portalpad.app.diag.LogTags.PORTALPAD_TAGS]
+         * so it can't drift from the root-path filter; AndroidRuntime:E keeps
+         * crash stacks, *:S silences all other apps' logs.
+         */
+        private val DEFAULT_LOGCAT_FILTER =
+            com.portalpad.app.diag.LogTags.PORTALPAD_TAGS + "AndroidRuntime:E *:S"
+    }
+}

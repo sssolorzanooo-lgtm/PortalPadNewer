@@ -1,0 +1,6 @@
+{
+  "name": "PortalPad",
+  "description": "Trackpad, air mouse, and remote control for external displays and AR glasses on Android.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

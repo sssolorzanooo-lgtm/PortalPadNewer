@@ -1,0 +1,770 @@
+package com.portalpad.app.service
+
+import android.media.ImageReader
+import android.os.Handler
+import android.os.HandlerThread
+import android.util.Log
+import android.view.Surface
+import kotlinx.coroutines.flow.first
+
+/**
+ * App-side orchestrator for the AR-glasses virtual-display session.
+ *
+ * Architecture (modeled on a reference session + display-wrap flow):
+ *
+ *  1. Create a trusted VirtualDisplay (owned by shell uid via Shizuku
+ *     UserService). Initially renders to a placeholder ImageReader surface
+ *     so the VD has somewhere to draw before the visible mirror is hooked
+ *     up.
+ *  2. The trackpad app creates a fullscreen system-overlay window on the
+ *     PHYSICAL glasses display that holds a SurfaceView. When that
+ *     SurfaceView's surface becomes available, the caller invokes
+ *     [bindMirrorSurface] which swaps the VD's output to render INTO the
+ *     SurfaceView — so VD content appears on the user's glasses.
+ *  3. Apps (Chrome, etc.) launched via `am start --display <vdId>` run on
+ *     the trusted VD. Injected mouse events targeting the VD's displayId
+ *     are accepted as trusted system input → anchor popups (Chrome's
+ *     address-bar suggestions, etc.) do not dismiss on cursor motion the
+ *     way they did when we injected to the raw untrusted glasses display.
+ *
+ * The ImageReader's onImageAvailable listener drains frames so the
+ * underlying buffer queue doesn't stall when the VD is rendering to it
+ * (before the visible mirror is bound).
+ */
+class AirGlassesSession(private val backendProvider: () -> BoundShellBackend?) {
+
+    /** The currently-active bound backend (root or Shizuku), or null if none. */
+    private val backend: BoundShellBackend? get() = backendProvider()
+
+    private var imageReader: ImageReader? = null
+    private var handlerThread: HandlerThread? = null
+    private var handler: Handler? = null
+
+    /**
+     * EXPERIMENTAL app-owned TRUSTED VirtualDisplay. When the experimental flag
+     * is on, the VD is created here (in PortalPad's own process, via a
+     * Shizuku-wrapped IDisplayManager) instead of inside the Shizuku shell
+     * process — so it survives Shizuku being stopped while staying trusted.
+     * Non-null only while an app-owned session is active; null for the normal
+     * shell-owned path. Its resize/setSurface/release method shapes mirror the
+     * shell path so the call sites below are identical.
+     */
+    private var appVd: AppOwnedTrustedDisplay? = null
+
+    @Volatile var virtualDisplayId: Int = -1
+        private set
+
+    @Volatile var physicalGlassesId: Int = -1
+        private set
+
+    @Volatile var lastWidth: Int = 0
+        private set
+    @Volatile var lastHeight: Int = 0
+        private set
+    @Volatile var lastDpi: Int = 0
+        private set
+
+    /** True when the visible mirror is hooked up — VD output goes to the
+     *  user's physical glasses display rather than the invisible
+     *  ImageReader. */
+    @Volatile var mirrorBound: Boolean = false
+        private set
+
+    /**
+     * True only when the live VD was created with, and verified to retain, an
+     * independent ALWAYS_UNLOCKED display group. The foreground service uses
+     * this capability result—not a manufacturer name—to attach the matching
+     * display-local keep-awake host.
+     */
+    @Volatile var independentUnlockedGroupActive: Boolean = false
+        private set
+
+    val isActive: Boolean get() = virtualDisplayId >= 0
+
+    /**
+     * Start (or resize) the VD session for the given glasses display.
+     * If already active for the same glasses id and same dimensions, no-op.
+     */
+    /**
+     * Adopt a NEW physical glasses id for an already-running session — the
+     * replug half of the disconnect grace period. The VD (and every task on
+     * it, with all in-app state) is untouched; only the tracked physical id
+     * changes, and the same-id path in [start] then performs an in-place
+     * resize if the new panel's resolution differs. Falls through to a fresh
+     * [start] when no session survived.
+     */
+    fun rebind(newGlassesId: Int, width: Int, height: Int, dpi: Int): Int {
+        if (virtualDisplayId < 0) return start(newGlassesId, width, height, dpi)
+        if (physicalGlassesId != newGlassesId) {
+            Log.d(
+                TAG,
+                "rebind: VD=$virtualDisplayId glasses $physicalGlassesId → $newGlassesId " +
+                    "(${width}x$height dpi=$dpi) — tasks preserved",
+            )
+            physicalGlassesId = newGlassesId
+        }
+        return start(newGlassesId, width, height, dpi)
+    }
+
+    /** EXPERIMENT (permfix3) — pin the physical display's CURRENT mode. That
+     *  log proved the external goes black whenever a runtime-permission dialog
+     *  appears ANYWHERE (phone or external): the dialog churns SurfaceFlinger's
+     *  frame-rate votes, the physical display flaps modes (60↔90Hz within 7ms),
+     *  and One UI's deferred display update fades EVERY window on it to
+     *  alpha 0 for the dialog's lifetime. Pinning one mode removes the flap
+     *  trigger entirely. Pin = whatever mode is active now, so a user-chosen
+     *  90Hz stays 90Hz. Cleared in [stop]. */
+    private fun pinPhysicalDisplayMode(glassesId: Int) {
+        runCatching {
+            val dm = com.portalpad.app.PortalPadApp.instance
+                .getSystemService(android.hardware.display.DisplayManager::class.java)
+            val d = dm?.getDisplay(glassesId)
+            if (d == null) {
+                Log.w(TAG, "MODE-PIN: display $glassesId not found; skipping")
+                return
+            }
+            val m = d.mode
+            val rate = Math.round(m.refreshRate)
+            val out = backend?.runCommand(
+                "cmd display set-user-preferred-display-mode -d $glassesId " +
+                    "${m.physicalWidth} ${m.physicalHeight} $rate",
+            ) ?: "no backend"
+            Log.w(
+                TAG,
+                "MODE-PIN: pinned disp=$glassesId to ${m.physicalWidth}x${m.physicalHeight}@$rate" +
+                    " → '${out.trim().take(120)}'",
+            )
+        }.onFailure { Log.w(TAG, "MODE-PIN: pin failed: ${it.message}") }
+    }
+
+    /** Clear the [pinPhysicalDisplayMode] pin on session teardown. */
+    private fun clearPhysicalDisplayModePin(glassesId: Int) {
+        if (glassesId < 0) return
+        runCatching {
+            val out = backend?.runCommand(
+                "cmd display clear-user-preferred-display-mode -d $glassesId",
+            ) ?: "no backend"
+            Log.w(TAG, "MODE-PIN: cleared pin on disp=$glassesId → '${out.trim().take(120)}'")
+        }.onFailure { Log.w(TAG, "MODE-PIN: clear failed: ${it.message}") }
+    }
+
+    /** EXPERIMENT (permfix) — try to grant the app an overlay-hide exemption
+     *  so the VD mirror survives HIDE_NON_SYSTEM_OVERLAY_WINDOWS (the security
+     *  hide that blanks the glasses whenever a USB/permission dialog appears).
+     *  Two candidate permissions, both signature-level; `pm grant` usually
+     *  refuses signature perms, so this logs the EXACT output of each attempt —
+     *  that output is the diagnostic that tells us whether this whole avenue is
+     *  viable on Shizuku-shell (vs. root-only). Runs once per session start. */
+    private fun grantOverlayExemptionPermissions() {
+        val pkg = com.portalpad.app.PortalPadApp.instance.packageName
+        for (perm in arrayOf(
+            "android.permission.SYSTEM_APPLICATION_OVERLAY",
+            "android.permission.INTERNAL_SYSTEM_WINDOW",
+        )) {
+            val out = runCatching { backend?.runCommand("pm grant $pkg $perm") ?: "no backend" }
+                .getOrElse { "threw: ${it.message}" }
+            Log.w(TAG, "OVERLAY-EXEMPT: pm grant $perm → '${out.trim().take(160)}'")
+        }
+        // Report what actually stuck, so we don't rely on the grant's own
+        // (often empty) stdout.
+        val dump = runCatching {
+            backend?.runCommand("dumpsys package $pkg | grep -iE 'SYSTEM_APPLICATION_OVERLAY|INTERNAL_SYSTEM_WINDOW'")
+                ?: ""
+        }.getOrDefault("")
+        Log.w(TAG, "OVERLAY-EXEMPT: post-grant state → ${dump.trim().replace("\n", " | ").take(300)}")
+    }
+
+    /**
+     * EXPERIMENT (permfix / AirBeam parity): drive the glasses via a
+     * SurfaceControl layerStack retarget instead of the overlay + GL-shader
+     * mirror. Retargets the panel to the VD's layerStack (overlay-free), then
+     * applies the user's LINEAR color tuning through the system display color
+     * transform. The non-linear gamma stage is dropped (a display color matrix
+     * can't express it). Returns true only if the retarget reported OK, so the
+     * caller can auto-fall-back to the overlay path when the ROM refuses it.
+     */
+    /** Live-apply a LINEAR color matrix to the system-mirror panel (used by the
+     *  Settings color sliders when the overlay/GL path isn't active). Gamma is
+     *  not expressible in a display matrix, so it's dropped. */
+    fun applySystemMirrorColor(glassesDisplayId: Int, matrix4x4: FloatArray): String {
+        val b = backend ?: return "FAIL: no backend"
+        return runCatching { b.setDisplayColorTransform(glassesDisplayId, matrix4x4) }
+            .getOrElse { "FAIL: ${it.message}" }
+    }
+
+    /** Best-effort delivered-fps for the mirror HUD (SurfaceFlinger stats). */
+    fun sampleDisplayFps(displayId: Int): Float =
+        runCatching { backend?.sampleDisplayFps(displayId) ?: -1f }.getOrDefault(-1f)
+
+    fun startSystemMirror(glassesDisplayId: Int, vdDisplayId: Int): Boolean {
+        val b = backend ?: run { Log.w(TAG, "SYSTEM-MIRROR: no backend"); return false }
+        val res = runCatching { b.startLayerStackMirror(glassesDisplayId, vdDisplayId) }
+            .getOrElse { "threw: ${it.message}" }
+        Log.w(TAG, "SYSTEM-MIRROR start → $res")
+        if (!res.startsWith("OK")) return false
+
+        // Apply the user's persisted LINEAR color tuning via the system display
+        // color transform. Gamma (the non-linear stage) is intentionally not
+        // applied here — it lived only in the GL shader.
+        runCatching {
+            val saved = kotlinx.coroutines.runBlocking {
+                com.portalpad.app.PortalPadApp.instance.prefs.colorTuning.first()
+            }
+            val v = com.portalpad.app.presentation.GlColorRenderer.parseValues(saved)
+            if (!com.portalpad.app.presentation.GlColorRenderer.isDefault(v)) {
+                val matrix = com.portalpad.app.presentation.GlColorRenderer.matrixFromValues(v)
+                val cres = b.setDisplayColorTransform(glassesDisplayId, matrix)
+                Log.w(TAG, "SYSTEM-MIRROR color → $cres")
+            } else {
+                Log.d(TAG, "SYSTEM-MIRROR: tuning is default — no color transform")
+            }
+        }.onFailure { Log.w(TAG, "SYSTEM-MIRROR color failed: ${it.message}") }
+        return true
+    }
+
+    /** Screen size / Side Mode under system mirror: the same numbers the GL quad
+     *  gets in the overlay pipeline, applied as a compositor display projection
+     *  instead (DRM-safe - frames never leave SurfaceFlinger). Returns the
+     *  backend's status string; grep DIAG-PROJECTION. */
+    fun setMirrorProjection(glassesDisplayId: Int, srcW: Int, srcH: Int, dst: android.graphics.Rect): String =
+        runCatching {
+            backend?.setMirrorProjection(
+                glassesDisplayId, srcW, srcH, dst.left, dst.top, dst.right, dst.bottom,
+            ) ?: "FAIL: no backend"
+        }.getOrElse { "threw: ${it.message}" }
+
+    /** Restore the panel's original layerStack (undo [startSystemMirror]). Safe
+     *  to call unconditionally on teardown/toggle-off. */
+    fun stopSystemMirror(glassesDisplayId: Int) {
+        val b = backend ?: return
+        // NB: no color-transform reset here - the display-token color transform is
+        // unreachable on this ROM (setDisplayColorTransform throws NoSuchMethod;
+        // Samsung exposes only a layer-level setColorTransform). So no display
+        // matrix is ever set under mirror, and there's nothing to reset. If a
+        // future ROM gains a working display color transform AND we apply it under
+        // mirror, restore the identity reset here (same lingering-state trap the
+        // projection has - see stopLayerStackMirror's projection reset).
+        val res = runCatching { b.stopLayerStackMirror(glassesDisplayId) }
+            .getOrElse { "threw: ${it.message}" }
+        Log.w(TAG, "SYSTEM-MIRROR stop → $res")
+    }
+
+    fun start(glassesId: Int, width: Int, height: Int, dpi: Int): Int {
+        if (backend?.isReady != true) {
+            Log.w(TAG, "start: bound backend not ready")
+            return -1
+        }
+        val b = backend!!
+        val w = width.coerceAtLeast(1)
+        val h = height.coerceAtLeast(1)
+
+        // Already active for this glasses id — just resize if needed.
+        if (virtualDisplayId >= 0 && physicalGlassesId == glassesId) {
+            if (lastWidth != w || lastHeight != h || lastDpi != dpi) {
+                Log.d(TAG, "resize VD=$virtualDisplayId to ${w}x$h dpi=$dpi")
+                if (appVd != null) {
+                    runCatching { appVd?.resize(w, h, dpi) }
+                    if (!mirrorBound) {
+                        runCatching { appVd?.setSurface(obtainPlaceholderSurface(w, h)) }
+                    }
+                } else {
+                    b.resizeVirtualDisplay(virtualDisplayId, w, h, dpi)
+                    // Replace placeholder Surface so the new size takes effect when
+                    // the visible mirror isn't bound yet.
+                    if (!mirrorBound) {
+                        val newSurface = obtainPlaceholderSurface(w, h)
+                        b.setVirtualDisplaySurface(virtualDisplayId, newSurface)
+                    }
+                }
+                lastWidth = w; lastHeight = h; lastDpi = dpi
+            }
+            // Re-pin on every (re)entry: a rebind arrives here with a NEW
+            // physical id whose mode isn't pinned yet (the old pin died with
+            // the old display).
+            pinPhysicalDisplayMode(glassesId)
+            return virtualDisplayId
+        }
+
+        // Different glasses or first start: tear down then start fresh.
+        if (virtualDisplayId >= 0) stop()
+
+        val placeholder = obtainPlaceholderSurface(w, h)
+        // Flag selection — based on debugging on Samsung One UI Android 16:
+        //
+        //  PUBLIC (1) — visible to other apps so `am start --display N`
+        //    can target it.
+        //  OWN_CONTENT_ONLY (8) — apps on this VD don't mirror back to
+        //    other displays.
+        //  TRUSTED (1024) — Without it Chrome's PopupWindows dismiss
+        //    defensively on cursor motion.
+        //  OWN_DISPLAY_GROUP (2048) — independent focus/IME state so the
+        //    glasses VD doesn't blank the phone when typing.
+        //
+        // v0.17.42 added all of the reference implementation's flag set including PRESENTATION
+        // and DEVICE_DISPLAY_GROUP. Those didn't fix the dropdown bug,
+        // and screenshots showed the VD was rendering Chrome's DESKTOP
+        // tab-strip mode (a tab bar at the top with closeable tabs +
+        // separate omnibox below). Chrome enters desktop mode when the
+        // display reports Configuration.uiMode containing UI_MODE_TYPE_DESK
+        // OR when VirtualDisplay flags suggest presentation/external
+        // monitor semantics. In desktop mode, Chrome's address-bar dropdown
+        // has DIFFERENT dismiss behavior than mobile mode — it dismisses
+        // on cursor-motion-outside whereas mobile waits for an actual tap.
+        //
+        // v0.17.53 — NEW dropdown theory from a breakthrough observation:
+        // taking a SCREENSHOT (which injects ZERO input) ALSO dismisses the
+        // Chrome address-bar dropdown, exactly like cursor motion does.
+        // Since a screenshot touches no input pipeline, the dismiss can't
+        // be caused by our injected events — it must be a FOCUS / window-
+        // state re-evaluation on the display. Anything that "pokes" the
+        // display (screencap, cursor overlay relayout, cursor motion)
+        // triggers a focus recheck, and Chrome's popup dismisses on focus
+        // change.
+        //
+        // OWN_FOCUS makes the VD maintain its own independent focus state.
+        // On Samsung One UI, an independent-focus display may aggressively
+        // re-evaluate its focus owner on any display event — dropping
+        // Chrome's popup. We've tested WITH OWN_FOCUS many times (always
+        // dismisses); we have NEVER tested WITHOUT it. Drop it now. (Do NOT
+        // re-add OWN_FOCUS to fix unrelated issues — it regresses the popup.)
+        //
+        // NOTE: ALWAYS_UNLOCKED was tried for the "SmartTube ends up on the
+        // phone after screen-off" bug and REVERTED — logcat showed the VD is
+        // DESTROYED on screen-off (the Shizuku shell process that owns it is
+        // reaped), not merely locked, so an unlock flag can't help. That bug is
+        // handled by flap-recovery in PortalPadForegroundService instead.
+        //
+        // Match the reference implementation's VD flags byte-for-byte. Captured live from a working
+        // the reference implementation session via `dumpsys display` on this exact hardware:
+        //   mFlags = 56651 = 0xDD4B
+        //   = PUBLIC | PRESENTATION | OWN_CONTENT_ONLY | SCALING_DISABLED
+        //     | ROTATES_WITH_CONTENT | TRUSTED | OWN_DISPLAY_GROUP
+        //     | ALWAYS_UNLOCKED | OWN_FOCUS | DEVICE_DISPLAY_GROUP
+        //
+        // The three survival bits are ALWAYS_UNLOCKED, OWN_FOCUS, and
+        // DEVICE_DISPLAY_GROUP — together they keep the VD alive and
+        // task-hosting through a phone screen-off (SmartTube keeps playing on
+        // the glasses) instead of the system evacuating its tasks to display 0.
+        // ALWAYS_UNLOCKED alone did nothing in an earlier attempt because it
+        // needs OWN_FOCUS + DEVICE_DISPLAY_GROUP as a set. OWN_FOCUS was once
+        // blamed for dismissing Chrome's address-bar popup and removed; the
+        // the reference implementation capture shows OWN_FOCUS set WITH its Chrome popup working, so
+        // that was a misattribution — keeping the full set here.
+        // AOSP POWER-GROUP NEGOTIATION (updated 2026-07-27): stock Android puts a
+        // default-group secondary display behind keyguard when the phone locks.
+        // Activity showWhenLocked cannot solve that for a desktop because AOSP
+        // only evaluates the TOP activity, which is the user's third-party app.
+        //
+        // When ALLOW_LOCKSCREEN is on, every device now gets a capability probe:
+        // request the same ALWAYS_UNLOCKED own-group trio proven on Samsung and
+        // Pixel, then inspect the CREATED Display flags. If Android rejects the
+        // request or strips either required output flag, release that candidate
+        // and retry the established default-group configuration. The result is
+        // cached per firmware fingerprint: an OTA automatically gets reprobed.
+        //
+        // A verified own group gets a display-local FLAG_KEEP_SCREEN_ON overlay
+        // from PortalPadForegroundService, preventing the ~10-15s AOSP power-
+        // group timeout without keeping the phone panel awake.
+        // ALWAYS_UNLOCKED must go with the group bits — it's invalid (throws)
+        // without OWN_DISPLAY_GROUP/DEVICE_DISPLAY_GROUP. OWN_FOCUS is kept on
+        // both paths: it's group-independent and focus separation is
+        // load-bearing.
+        val ownGroupBits = VD_FLAG_OWN_DISPLAY_GROUP or
+            VD_FLAG_ALWAYS_UNLOCKED or
+            VD_FLAG_DEVICE_DISPLAY_GROUP
+        val isSamsungDevice =
+            android.os.Build.MANUFACTURER.equals("samsung", ignoreCase = true)
+        val isPixelDevice =
+            com.portalpad.app.presentation.PixelDesktopGuardOverlay.isPixelDevice()
+        val allowLockscreen = runCatching {
+            kotlinx.coroutines.runBlocking {
+                com.portalpad.app.PortalPadApp.instance.prefs.bool(
+                    com.portalpad.app.data.PreferencesRepository.Keys.ALLOW_LOCKSCREEN,
+                    true,
+                ).first()
+            }
+        }.getOrDefault(true)
+        val baseFlags = VD_FLAG_PUBLIC or
+            VD_FLAG_PRESENTATION or
+            VD_FLAG_OWN_CONTENT_ONLY or
+            VD_FLAG_SCALING_DISABLED or
+            VD_FLAG_ROTATES_WITH_CONTENT or
+            VD_FLAG_TRUSTED or
+            VD_FLAG_OWN_FOCUS
+        val preferredFlags = baseFlags or ownGroupBits
+        val knownGoodProfile = isSamsungDevice || isPixelDevice
+        // Preserve Samsung's established screen-off-survival behavior even if
+        // the phone-control lock-screen preference is off. Other devices use
+        // the stronger display only when the user explicitly permits it.
+        val wantsUnlockedGroup = isSamsungDevice || allowLockscreen
+        val cachedCapability = readUnlockedGroupCapability()
+        val tryPreferred = wantsUnlockedGroup &&
+            (knownGoodProfile || cachedCapability != CAPABILITY_UNSUPPORTED)
+        Log.d(
+            TAG,
+            "VD group policy: samsung=$isSamsungDevice pixel=$isPixelDevice " +
+                "allowLockscreen=$allowLockscreen cached=$cachedCapability " +
+                "tryPreferred=$tryPreferred",
+        )
+
+        var selectedFlags = baseFlags
+        var vdId = -1
+        var preferredRejected = false
+        independentUnlockedGroupActive = false
+
+        if (tryPreferred) {
+            val candidateId = createVdCandidate(b, w, h, dpi, placeholder, preferredFlags)
+            if (candidateId >= 0) {
+                val verification = verifyUnlockedGroup(candidateId)
+                val accept = verification == UnlockVerification.CONFIRMED ||
+                    (knownGoodProfile && verification == UnlockVerification.UNKNOWN)
+                if (accept) {
+                    vdId = candidateId
+                    selectedFlags = preferredFlags
+                    independentUnlockedGroupActive = true
+                    writeUnlockedGroupCapability(CAPABILITY_SUPPORTED)
+                    Log.i(
+                        TAG,
+                        "VD-CAPABILITY accepted independent unlocked group " +
+                            "display=$candidateId verification=$verification",
+                    )
+                } else {
+                    Log.w(
+                        TAG,
+                        "VD-CAPABILITY rejected preferred candidate display=$candidateId " +
+                            "verification=$verification; retrying baseline",
+                    )
+                    releaseVdCandidate(b, candidateId)
+                    preferredRejected = verification == UnlockVerification.MISSING
+                }
+            } else {
+                Log.w(TAG, "VD-CAPABILITY preferred creation failed; retrying baseline")
+                preferredRejected = true
+            }
+        }
+
+        if (vdId < 0) {
+            vdId = createVdCandidate(b, w, h, dpi, placeholder, baseFlags)
+            selectedFlags = baseFlags
+            independentUnlockedGroupActive = false
+            // Cache only after the established baseline succeeds. That
+            // distinguishes a flags/permission incompatibility from a general
+            // transient failure where neither configuration could be created.
+            if (vdId >= 0 && preferredRejected && !knownGoodProfile) {
+                writeUnlockedGroupCapability(CAPABILITY_UNSUPPORTED)
+            }
+        }
+        com.portalpad.app.PortalPadApp.instance.setSessionAppOwned(appVd != null)
+        if (vdId < 0) {
+            Log.e(TAG, "createVirtualDisplay returned -1; aborting")
+            releaseResources()
+            return -1
+        }
+
+        virtualDisplayId = vdId
+        physicalGlassesId = glassesId
+        lastWidth = w; lastHeight = h; lastDpi = dpi
+        mirrorBound = false
+
+        Log.d(
+            TAG,
+            "AirGlassesSession started: vdId=$vdId glasses=$glassesId ${w}x$h " +
+                "flags=0x${selectedFlags.toString(16)} " +
+                "independentUnlocked=$independentUnlockedGroupActive",
+        )
+        grantOverlayExemptionPermissions()
+        pinPhysicalDisplayMode(glassesId)
+        // Passive go/no-go for an AirBeam-style overlay-free system mirror.
+        // Touches nothing live — just reports whether the SC mirror primitives
+        // are reachable on this ROM. Verdict lands in logcat as MIRROR-PROBE.
+        runCatching {
+            val verdict = backend?.probeMirrorCapability(glassesId) ?: "no backend"
+            Log.w(TAG, "MIRROR-PROBE verdict → $verdict")
+        }.onFailure { Log.w(TAG, "MIRROR-PROBE call failed: ${it.message}") }
+        // Passive report of the XREAL's native color modes — informs whether
+        // the panel offers a gamma/EOTF alternative we lost with the shader.
+        runCatching {
+            val modes = backend?.getDisplayColorModes(glassesId) ?: "no backend"
+            Log.w(TAG, "COLOR-MODES disp=$glassesId → ${modes.trim().take(300)}")
+        }.onFailure { Log.w(TAG, "COLOR-MODES probe failed: ${it.message}") }
+        return vdId
+    }
+
+    /**
+     * Redirect the VD's output to the given visible [surface] (typically
+     * from a SurfaceView attached to the physical glasses display). After
+     * this, VD content appears on the user's glasses.
+     */
+    fun bindMirrorSurface(surface: Surface) {
+        val vd = virtualDisplayId
+        if (vd < 0) {
+            Log.w(TAG, "bindMirrorSurface: no active VD; ignoring")
+            return
+        }
+        val ok = if (appVd != null) {
+            runCatching { appVd?.setSurface(surface) }.isSuccess
+        } else {
+            backend?.setVirtualDisplaySurface(vd, surface) ?: false
+        }
+        mirrorBound = ok
+        Log.d(TAG, "bindMirrorSurface vd=$vd ok=$ok appOwned=${appVd != null}")
+    }
+
+    /**
+     * Detach the visible mirror surface and return the VD to rendering
+     * into the invisible placeholder ImageReader. Called when the
+     * SurfaceView is destroyed (e.g. the mirror overlay was dismissed).
+     */
+    fun unbindMirrorSurface() {
+        val vd = virtualDisplayId
+        if (vd < 0) return
+        val placeholder = obtainPlaceholderSurface(lastWidth, lastHeight)
+        if (appVd != null) {
+            runCatching { appVd?.setSurface(placeholder) }
+        } else {
+            backend?.setVirtualDisplaySurface(vd, placeholder)
+        }
+        mirrorBound = false
+        Log.d(TAG, "unbindMirrorSurface vd=$vd → placeholder")
+    }
+
+    fun stop() {
+        val vdId = virtualDisplayId
+        val glassesId = physicalGlassesId
+        clearPhysicalDisplayModePin(glassesId)
+        if (vdId >= 0) {
+            runCatching { backend?.stopSurfaceMirror(glassesId) }
+            if (appVd != null) {
+                Log.i(TAG, "stop(): releasing app-owned VD (vdId=$vdId)")
+                runCatching { appVd?.release() }
+            } else {
+                Log.i(TAG, "stop(): releasing shell VD (vdId=$vdId)")
+                runCatching { backend?.releaseVirtualDisplay(vdId) }
+            }
+        } else {
+            Log.i(TAG, "stop(): no VD to release (vdId=$vdId)")
+        }
+        appVd = null
+        virtualDisplayId = -1
+        physicalGlassesId = -1
+        lastWidth = 0; lastHeight = 0; lastDpi = 0
+        mirrorBound = false
+        independentUnlockedGroupActive = false
+        releaseResources()
+        com.portalpad.app.PortalPadApp.instance.setSessionAppOwned(false)
+        Log.d(TAG, "AirGlassesSession stopped")
+    }
+
+    /**
+     * Create the TRUSTED VirtualDisplay in PortalPad's OWN process via
+     * [AppOwnedTrustedDisplay] (a Shizuku-wrapped IDisplayManager call with an
+     * app-hosted ownership token). Uses the SAME [flags] as the shell path, so
+     * it's trusted — apps launch onto it and the keyboard shows on it — but
+     * ownership lives here, so it survives Shizuku stopping. Shizuku must be
+     * running NOW (it does the privileged creation); afterwards the display
+     * persists without it. Returns the new display id, or -1 (caller falls back
+     * to the shell-owned path).
+     */
+    private fun createAppOwnedVd(w: Int, h: Int, dpi: Int, placeholder: Surface, flags: Int): Int {
+        // Defensive: never overwrite a live app-owned VD handle. If we still hold
+        // one here (e.g. an earlier start threw between creating the VD and
+        // recording its id, leaving virtualDisplayId=-1 but appVd set), release it
+        // first — otherwise that VD leaks for the life of the process with no
+        // handle left to reclaim it, surfacing as a duplicate "PortalPad Session".
+        appVd?.let {
+            Log.w(TAG, "createAppOwnedVd: releasing a still-held app-owned VD before re-create")
+            runCatching { it.release() }
+            appVd = null
+        }
+        val helper = AppOwnedTrustedDisplay()
+        val id = helper.create("PortalPad Session (app-owned)", w, h, dpi, placeholder, flags)
+        if (id < 0) {
+            Log.e(TAG, "app-owned trusted VD creation failed (id=$id)")
+            return -1
+        }
+        appVd = helper
+        return id
+    }
+
+    /**
+     * Try the app-owned VD first, then the established privileged helper path.
+     * The caller may invoke this twice—preferred flags then baseline—so each
+     * attempt owns exactly one releasable candidate.
+     */
+    private fun createVdCandidate(
+        backend: BoundShellBackend,
+        w: Int,
+        h: Int,
+        dpi: Int,
+        placeholder: Surface,
+        flags: Int,
+    ): Int {
+        var id = createAppOwnedVd(w, h, dpi, placeholder, flags)
+        if (id < 0) {
+            Log.d(
+                TAG,
+                "app-owned VD unavailable for flags=0x${flags.toString(16)}; " +
+                    "using shell-owned path",
+            )
+            id = backend.createVirtualDisplay(
+                "PortalPad Session",
+                w,
+                h,
+                dpi,
+                flags,
+                placeholder,
+            )
+        }
+        return id
+    }
+
+    /** Release a not-yet-adopted capability-probe display without disturbing
+     *  the placeholder surface needed by the baseline retry. */
+    private fun releaseVdCandidate(backend: BoundShellBackend, displayId: Int) {
+        if (appVd != null) {
+            runCatching { appVd?.release() }
+            appVd = null
+        } else {
+            runCatching { backend.releaseVirtualDisplay(displayId) }
+        }
+    }
+
+    /**
+     * Verify Android's RESULT, not just the requested VirtualDisplayConfig.
+     * DisplayManagerService may remove incompatible flags without failing the
+     * create call. Display output flags use different bit positions from the
+     * VirtualDisplay request flags, so resolve their hidden constants by name
+     * and retain stable AOSP fallbacks for ROMs that hide those fields.
+     */
+    private fun verifyUnlockedGroup(displayId: Int): UnlockVerification {
+        val dm = com.portalpad.app.PortalPadApp.instance
+            .getSystemService(android.hardware.display.DisplayManager::class.java)
+            ?: return UnlockVerification.UNKNOWN
+        var display: android.view.Display? = null
+        for (attempt in 0 until 8) {
+            display = runCatching { dm.getDisplay(displayId) }.getOrNull()
+            if (display != null) break
+            android.os.SystemClock.sleep(25L)
+        }
+        val d = display ?: return UnlockVerification.UNKNOWN
+        val ownGroupFlag = displayFlag("FLAG_OWN_DISPLAY_GROUP", 1 shl 8)
+        val alwaysUnlockedFlag = displayFlag("FLAG_ALWAYS_UNLOCKED", 1 shl 9)
+        val actual = runCatching { d.flags }.getOrElse {
+            Log.w(TAG, "VD-CAPABILITY could not read Display.flags", it)
+            return UnlockVerification.UNKNOWN
+        }
+        val hasOwnGroup = actual and ownGroupFlag != 0
+        val hasAlwaysUnlocked = actual and alwaysUnlockedFlag != 0
+        Log.i(
+            TAG,
+            "VD-CAPABILITY display=$displayId outputFlags=0x${actual.toString(16)} " +
+                "ownGroup=$hasOwnGroup alwaysUnlocked=$hasAlwaysUnlocked",
+        )
+        return if (hasOwnGroup && hasAlwaysUnlocked) {
+            UnlockVerification.CONFIRMED
+        } else {
+            UnlockVerification.MISSING
+        }
+    }
+
+    private fun displayFlag(name: String, fallback: Int): Int = runCatching {
+        android.view.Display::class.java.getDeclaredField(name).let { field ->
+            field.isAccessible = true
+            field.getInt(null)
+        }
+    }.getOrDefault(fallback)
+
+    /**
+     * Cache only this firmware's structural capability. Build.FINGERPRINT
+     * changes after an OTA, naturally causing a fresh probe.
+     */
+    private fun readUnlockedGroupCapability(): Int =
+        runCatching {
+            val key = capabilityKey()
+            com.portalpad.app.PortalPadApp.instance
+                .getSharedPreferences(CAPABILITY_PREFS, android.content.Context.MODE_PRIVATE)
+                .getInt(key, CAPABILITY_UNKNOWN)
+        }.getOrDefault(CAPABILITY_UNKNOWN)
+
+    private fun writeUnlockedGroupCapability(value: Int) {
+        runCatching {
+            val key = capabilityKey()
+            com.portalpad.app.PortalPadApp.instance
+                .getSharedPreferences(CAPABILITY_PREFS, android.content.Context.MODE_PRIVATE)
+                .edit()
+                .putInt(key, value)
+                .apply()
+        }
+    }
+
+    private fun capabilityKey(): String =
+        "unlocked_group_sdk${android.os.Build.VERSION.SDK_INT}_" +
+            Integer.toHexString(android.os.Build.FINGERPRINT.hashCode()) + "_" +
+            (backend?.javaClass?.simpleName ?: "no_backend")
+
+    private enum class UnlockVerification { CONFIRMED, MISSING, UNKNOWN }
+
+    private fun obtainPlaceholderSurface(width: Int, height: Int): Surface {
+        val w = width.coerceAtLeast(1); val h = height.coerceAtLeast(1)
+        imageReader?.let { existing ->
+            if (existing.width == w && existing.height == h) return existing.surface
+            runCatching { existing.close() }
+        }
+        val ht = handlerThread ?: HandlerThread("PortalPad SessionPlaceholder").also {
+            it.start(); handlerThread = it
+        }
+        val hh = handler ?: Handler(ht.looper).also { handler = it }
+        val reader = ImageReader.newInstance(w, h, android.graphics.PixelFormat.RGBA_8888, 2)
+        // Drain frames so the buffer queue doesn't back up while the VD is
+        // rendering to us instead of the visible mirror.
+        reader.setOnImageAvailableListener({ ir ->
+            runCatching { ir.acquireLatestImage()?.close() }
+        }, hh)
+        imageReader = reader
+        return reader.surface
+    }
+
+    private fun releaseResources() {
+        runCatching { imageReader?.close() }; imageReader = null
+        runCatching { handlerThread?.quitSafely() }
+        handlerThread = null; handler = null
+    }
+
+    companion object {
+        private const val TAG = "AirGlassesSession"
+
+        // VirtualDisplay flag bit positions.
+        //
+        // Updated v0.17.40 — comprehensive set after dump-comparison vs
+        // a reference implementation, whose `ShellUserService.createVirtualDisplay`
+        // assembles a flag word of (PUBLIC|PRESENTATION|OWN_CONTENT_ONLY|
+        // SUPPORTS_TOUCH|DESTROY_CONTENT_ON_REMOVAL|TRUSTED|
+        // OWN_DISPLAY_GROUP|OWN_FOCUS|DEVICE_DISPLAY_GROUP) on Android 14+
+        // (derived reference behavior line 8866 onward). The two we'd been missing
+        // and that seem most relevant to the Chrome dropdown bug are
+        // OWN_FOCUS (decouples popup-focus from cross-display events) and
+        // SUPPORTS_TOUCH (declares the VD as touch-input capable).
+        // Canonical AOSP DisplayManager.VIRTUAL_DISPLAY_FLAG_* bit positions.
+        // (Several of these were previously mislabeled; corrected against AOSP.)
+        const val VD_FLAG_PUBLIC = 1 shl 0                          // 1
+        const val VD_FLAG_PRESENTATION = 1 shl 1                    // 2
+        const val VD_FLAG_SECURE = 1 shl 2                          // 4
+        const val VD_FLAG_OWN_CONTENT_ONLY = 1 shl 3               // 8
+        const val VD_FLAG_AUTO_MIRROR = 1 shl 4                     // 16
+        const val VD_FLAG_SCALING_DISABLED = 1 shl 6               // 64
+        const val VD_FLAG_SUPPORTS_TOUCH = 1 shl 7                 // 128
+        const val VD_FLAG_ROTATES_WITH_CONTENT = 1 shl 8           // 256
+        const val VD_FLAG_DESTROY_CONTENT_ON_REMOVAL = 1 shl 9     // 512
+        const val VD_FLAG_TRUSTED = 1 shl 10                        // 1024
+        const val VD_FLAG_OWN_DISPLAY_GROUP = 1 shl 11             // 2048
+        const val VD_FLAG_ALWAYS_UNLOCKED = 1 shl 12              // 4096
+        const val VD_FLAG_OWN_FOCUS = 1 shl 14                      // 16384
+        const val VD_FLAG_DEVICE_DISPLAY_GROUP = 1 shl 15          // 32768
+        const val VD_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS = 1 shl 16 // 65536
+
+        private const val CAPABILITY_PREFS = "portalpad_display_capabilities"
+        private const val CAPABILITY_UNKNOWN = 0
+        private const val CAPABILITY_SUPPORTED = 1
+        private const val CAPABILITY_UNSUPPORTED = 2
+    }
+}
