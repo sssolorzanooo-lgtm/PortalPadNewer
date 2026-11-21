@@ -59,6 +59,16 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
+      - name: Deduplicate launcher mipmaps
+        run: |
+          for png in app/src/main/res/mipmap-*/ic_launcher*.png; do
+            [ -f "$png" ] || continue
+            webp="${png%.png}.webp"
+            if [ -f "$webp" ]; then
+              rm -f "$webp"
+            fi
+          done
+
       - name: Build Debug APK
         run: gradle assembleDebug --no-daemon --console=plain --stacktrace
 
