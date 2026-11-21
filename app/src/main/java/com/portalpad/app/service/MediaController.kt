@@ -236,6 +236,66 @@ class MediaController(private val context: Context) {
         }
     }
 
+    /** Packages currently in STATE_PLAYING or STATE_BUFFERING, excluding PortalPad itself. */
+    fun getPlayingPackageNames(): List<String> {
+        if (!hasNotificationAccess) return emptyList()
+        return runCatching {
+            val own = context.packageName
+            mediaSessionManager.getActiveSessions(listenerComponent)
+                .filter { s ->
+                    s.packageName != own && (
+                        s.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING ||
+                            s.playbackState?.state == android.media.session.PlaybackState.STATE_BUFFERING
+                        )
+                }
+                .map { it.packageName }
+                .distinct()
+        }.getOrDefault(emptyList())
+    }
+
+    /** True if [pkg] has an active session in PLAYING or BUFFERING state. */
+    fun isPackagePlaying(pkg: String): Boolean {
+        if (!hasNotificationAccess) return false
+        return runCatching {
+            mediaSessionManager.getActiveSessions(listenerComponent).any { s ->
+                s.packageName == pkg && (
+                    s.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING ||
+                        s.playbackState?.state == android.media.session.PlaybackState.STATE_BUFFERING
+                    )
+            }
+        }.getOrDefault(false)
+    }
+
+    /** Nudge [pkg] (or current session fallback) to keep playing after task forwarding. */
+    fun resumePackagePlayback(pkg: String): Boolean {
+        if (hasNotificationAccess) {
+            val session = runCatching {
+                mediaSessionManager.getActiveSessions(listenerComponent)
+                    .firstOrNull { it.packageName == pkg }
+            }.getOrNull()
+            if (session != null) {
+                val st = session.playbackState?.state
+                if (st == android.media.session.PlaybackState.STATE_PLAYING ||
+                    st == android.media.session.PlaybackState.STATE_BUFFERING
+                ) {
+                    return true
+                }
+                runCatching { session.transportControls.play() }
+                val now = SystemClock.uptimeMillis()
+                runCatching {
+                    session.dispatchMediaButtonEvent(
+                        KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY, 0),
+                    )
+                    session.dispatchMediaButtonEvent(
+                        KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY, 0),
+                    )
+                }
+                return true
+            }
+        }
+        return sendViaBroadcast(KeyEvent.KEYCODE_MEDIA_PLAY)
+    }
+
     /** Seek the active media session to the given absolute position in ms. */
     fun seekTo(positionMs: Long) {
         if (!hasNotificationAccess) return

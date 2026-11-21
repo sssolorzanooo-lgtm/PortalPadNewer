@@ -457,6 +457,15 @@ class TrackpadActivity : PinnedDensityActivity() {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
+                    val app = PortalPadApp.instance
+                    val extConnected = app.physicalExternalDisplayId.value != null ||
+                        app.externalDisplayId.value != null ||
+                        injector.displayId != android.view.Display.DEFAULT_DISPLAY
+                    if (extConnected) {
+                        Log.d(TAG, "BACK: external display connected — forwarding Back click to display=${injector.displayId}")
+                        injector.backGuarded()
+                        return
+                    }
                     if (!isTaskRoot) {
                         // Something of ours is below - let normal Back reach it.
                         // Same step-aside dance as the IME guard.

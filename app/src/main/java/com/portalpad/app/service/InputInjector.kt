@@ -1236,44 +1236,67 @@ class InputInjector(
     }
 
     /**
-     * Dismiss Android's black system mouse pointer across every display where
-     * InputDispatcher / PointerChoreographer may have rendered it (target VD,
-     * physical external display, and default display) after EVIOCGRAB takes over.
-     * Injecting a zero-impact SOURCE_TOUCHSCREEN ACTION_DOWN + ACTION_CANCEL pair
-     * hides the system pointer immediately without clicking any UI element.
+     * Move Android's black system mouse pointer to the bottom-right corner edge
+     * (width - 1, height - 1) and dismiss it across every relevant display (target
+     * VD, physical external display, and default display) so only PortalPad's
+     * custom white cursor remains visible.
      */
     fun dismissSystemPointer() = safe {
         val backend = PortalPadApp.instance.activeBoundBackend ?: return@safe
         if (!backend.isReady) return@safe
-        val (tDisp, tx, ty) = resolveTargetDisplayAndCoords(0f, 0f)
+        refreshDisplayMetrics()
+        val dm = context.getSystemService(Context.DISPLAY_SERVICE) as? android.hardware.display.DisplayManager
+        fun cornerFor(dispId: Int, fallbackW: Int, fallbackH: Int): Pair<Float, Float> {
+            val d = dm?.getDisplay(dispId)
+            if (d != null) {
+                val m = android.util.DisplayMetrics().also { @Suppress("DEPRECATION") d.getRealMetrics(it) }
+                if (m.widthPixels > 1 && m.heightPixels > 1) {
+                    return (m.widthPixels - 1).toFloat() to (m.heightPixels - 1).toFloat()
+                }
+            }
+            return (fallbackW - 1).coerceAtLeast(0).toFloat() to (fallbackH - 1).coerceAtLeast(0).toFloat()
+        }
+
+        val (tDisp, _, _) = resolveTargetDisplayAndCoords(0f, 0f)
         val physId = PortalPadApp.instance.physicalExternalDisplayId.value
         val targets = linkedSetOf<Triple<Int, Float, Float>>().apply {
-            add(Triple(tDisp, tx, ty))
+            val (tw, th) = cornerFor(tDisp, displayWidth, displayHeight)
+            add(Triple(tDisp, tw, th))
             if (physId != null && physId != tDisp) {
-                add(Triple(physId, 0f, 0f))
+                val (pw, ph) = cornerFor(physId, displayWidth, displayHeight)
+                add(Triple(physId, pw, ph))
             }
             if (tDisp != android.view.Display.DEFAULT_DISPLAY &&
                 physId != android.view.Display.DEFAULT_DISPLAY
             ) {
-                add(Triple(android.view.Display.DEFAULT_DISPLAY, 0f, 0f))
+                val (dw, dh) = cornerFor(android.view.Display.DEFAULT_DISPLAY, displayWidth, displayHeight)
+                add(Triple(android.view.Display.DEFAULT_DISPLAY, dw, dh))
             }
         }
+        parkCornerCoords = targets.map { it.second to it.third }
+        lastParkHoverAtMs = SystemClock.uptimeMillis()
         injectExecutor.execute {
             runCatching {
-                for ((disp, x, y) in targets) {
+                lastParkHoverAtMs = SystemClock.uptimeMillis()
+                for ((disp, px, py) in targets) {
+                    backend.parkSystemPointer(disp, px, py)
                     val now = SystemClock.uptimeMillis()
                     backend.pointer(
                         action = MotionEvent.ACTION_DOWN,
-                        x = x, y = y, displayId = disp,
+                        x = 0f, y = 0f, displayId = disp,
                         source = InputDevice.SOURCE_TOUCHSCREEN, buttonState = 0, downTime = now,
                     )
                     backend.pointer(
                         action = MotionEvent.ACTION_CANCEL,
-                        x = x, y = y, displayId = disp,
+                        x = 0f, y = 0f, displayId = disp,
                         source = InputDevice.SOURCE_TOUCHSCREEN, buttonState = 0, downTime = now,
                     )
                 }
-                Log.d(TAG, "dismissSystemPointer -> injected touch cancel on displays=${targets.map { it.first }}")
+                Log.d(
+                    TAG,
+                    "dismissSystemPointer -> parked at bottom-right & dismissed on " +
+                        targets.joinToString { "d=${it.first}(${it.second.toInt()},${it.third.toInt()})" },
+                )
             }
         }
     }
@@ -2329,10 +2352,21 @@ class InputInjector(
     @Volatile private var lastInjectedHoverAtMs: Long = 0L
     @Volatile private var lastInjectedHoverX: Float = -1f
     @Volatile private var lastInjectedHoverY: Float = -1f
+    @Volatile private var lastParkHoverAtMs: Long = 0L
+    @Volatile private var parkCornerCoords: List<Pair<Float, Float>> = emptyList()
     @Volatile private var lastInjectedScrollAtMs: Long = 0L
 
     fun isLikelyOwnInjectedHover(x: Float, y: Float, windowMs: Long = 160L): Boolean {
-        val dt = SystemClock.uptimeMillis() - lastInjectedHoverAtMs
+        val now = SystemClock.uptimeMillis()
+        if (now - lastParkHoverAtMs in 0..600L) {
+            if (parkCornerCoords.any { (px, py) ->
+                    kotlin.math.hypot((x - px).toDouble(), (y - py).toDouble()) <= 24.0
+                }
+            ) {
+                return true
+            }
+        }
+        val dt = now - lastInjectedHoverAtMs
         if (dt !in 0..windowMs) return false
         return kotlin.math.hypot((x - lastInjectedHoverX).toDouble(), (y - lastInjectedHoverY).toDouble()) <= 8.0
     }

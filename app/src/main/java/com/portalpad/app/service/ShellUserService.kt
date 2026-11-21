@@ -231,6 +231,56 @@ class ShellUserService : IShellService.Stub {
         )
     }
 
+    override fun parkSystemPointer(displayId: Int, x: Float, y: Float): Boolean {
+        if (reflectionBroken) return false
+        val now = SystemClock.uptimeMillis()
+        val devIds = linkedSetOf(-1)
+        runCatching {
+            InputDevice.getDeviceIds().forEach { id ->
+                val dev = InputDevice.getDevice(id) ?: return@forEach
+                if (!dev.isVirtual && (dev.sources and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) {
+                    devIds += id
+                }
+            }
+        }
+        var anyOk = false
+        for (devId in devIds) {
+            val enterOk = injectMouseWithDevice(MotionEvent.ACTION_HOVER_ENTER, x, y, displayId, now, devId)
+            val moveOk = injectMouseWithDevice(MotionEvent.ACTION_HOVER_MOVE, x, y, displayId, now + 1L, devId)
+            injectMouseWithDevice(MotionEvent.ACTION_HOVER_EXIT, x, y, displayId, now + 2L, devId)
+            if (enterOk || moveOk) anyOk = true
+        }
+        return anyOk
+    }
+
+    private fun injectMouseWithDevice(
+        action: Int, x: Float, y: Float, displayId: Int, eventTime: Long, devId: Int,
+    ): Boolean {
+        val props = MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = MotionEvent.TOOL_TYPE_MOUSE
+        }
+        val coords = MotionEvent.PointerCoords().apply {
+            this.x = x; this.y = y
+            pressure = 0f
+            size = 1f
+        }
+        return try {
+            val event = MotionEvent.obtain(
+                eventTime, eventTime, action, 1, arrayOf(props), arrayOf(coords),
+                0, 0, 1f, 1f, devId, 0, InputDevice.SOURCE_MOUSE, 0,
+            )
+            setDisplayId(event, displayId)
+            val accepted = (injectInputEventMethod?.invoke(inputManager, event, injectModeAsync) as? Boolean)
+                ?: false
+            event.recycle()
+            accepted
+        } catch (t: Throwable) {
+            Log.w(TAG, "injectMouseWithDevice failed (action=$action disp=$displayId dev=$devId)", t)
+            false
+        }
+    }
+
     private fun injectInternal(
         action: Int, x: Float, y: Float, displayId: Int,
         downTime: Long, eventTime: Long, source: Int, buttonState: Int,
@@ -3209,6 +3259,194 @@ class ShellUserService : IShellService.Stub {
                         n.location.substringBefore("/input").trim() == usbPrefix
                     else -> false
                 }
+        }
+    }
+
+    // ─── System-wide media audio output routing ──────────────────────────
+    @Volatile private var forceUseApplied = false
+
+    private fun resolveMediaStrategies(am: android.media.AudioManager): List<Any> {
+        val strategyClass = runCatching { Class.forName("android.media.audiopolicy.AudioProductStrategy") }
+            .getOrNull() ?: return emptyList()
+        val rawStrategies: List<*> = runCatching {
+            val m = am.javaClass.methods.firstOrNull { it.name == "getAudioProductStrategies" && it.parameterCount == 0 }
+                ?: android.media.AudioManager::class.java.methods.firstOrNull {
+                    it.name == "getAudioProductStrategies" && it.parameterCount == 0
+                }
+            @Suppress("UNCHECKED_CAST")
+            (m?.invoke(if (m != null && java.lang.reflect.Modifier.isStatic(m.modifiers)) null else am) as? List<*>)
+        }.getOrNull().orEmpty()
+        if (rawStrategies.isEmpty()) return emptyList()
+
+        val supportsMethod = runCatching {
+            strategyClass.getMethod("supportsAudioAttributes", android.media.AudioAttributes::class.java)
+        }.getOrNull()
+        val getNameMethod = runCatching { strategyClass.getMethod("getName") }.getOrNull()
+
+        val mediaMusic = android.media.AudioAttributes.Builder()
+            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
+        val mediaMovie = android.media.AudioAttributes.Builder()
+            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MOVIE)
+            .build()
+
+        val matched = rawStrategies.filterNotNull().filter { s ->
+            val supports = runCatching {
+                (supportsMethod?.invoke(s, mediaMusic) as? Boolean == true) ||
+                    (supportsMethod?.invoke(s, mediaMovie) as? Boolean == true)
+            }.getOrDefault(false)
+            val byName = runCatching {
+                val n = (getNameMethod?.invoke(s) as? String).orEmpty()
+                n.contains("MEDIA", ignoreCase = true) || n.contains("MUSIC", ignoreCase = true)
+            }.getOrDefault(false)
+            supports || byName
+        }
+        return if (matched.isNotEmpty()) matched else listOfNotNull(rawStrategies.firstOrNull())
+    }
+
+    override fun setPreferredMediaAudioDevice(deviceType: Int, address: String?): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val ctx = obtainSystemContext() ?: context ?: return false
+            val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                ?: return false
+
+            var resolvedAddr = address.orEmpty()
+            if (resolvedAddr.isBlank()) {
+                val matchingInfo = am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)
+                    .firstOrNull { it.type == deviceType }
+                if (matchingInfo != null) {
+                    resolvedAddr = runCatching { matchingInfo.address }.getOrNull().orEmpty()
+                }
+            }
+
+            if (android.os.Build.VERSION.SDK_INT >= 31) {
+                val strategies = resolveMediaStrategies(am)
+                val strategyClass = runCatching { Class.forName("android.media.audiopolicy.AudioProductStrategy") }
+                    .getOrNull()
+                val devAttrClass = runCatching { Class.forName("android.media.AudioDeviceAttributes") }
+                    .getOrNull()
+                val setMethod = if (strategyClass != null && devAttrClass != null) {
+                    runCatching {
+                        am.javaClass.getMethod("setPreferredDeviceForStrategy", strategyClass, devAttrClass)
+                    }.getOrNull()
+                } else null
+
+                if (setMethod != null && devAttrClass != null && strategies.isNotEmpty()) {
+                    val roleOutput = runCatching { devAttrClass.getField("ROLE_OUTPUT").getInt(null) }
+                        .getOrDefault(2)
+                    val devAttr = runCatching {
+                        devAttrClass.getConstructor(
+                            Int::class.javaPrimitiveType,
+                            Int::class.javaPrimitiveType,
+                            String::class.java,
+                        ).newInstance(roleOutput, deviceType, resolvedAddr)
+                    }.getOrNull()
+                    var anyOk = false
+                    if (devAttr != null) {
+                        for (strategy in strategies) {
+                            val ok = runCatching {
+                                setMethod.invoke(am, strategy, devAttr) as? Boolean ?: false
+                            }.getOrDefault(false)
+                            if (ok) anyOk = true
+                        }
+                    }
+                    Log.i(TAG, "setPreferredMediaAudioDevice(type=$deviceType addr='$resolvedAddr') strategyOk=$anyOk")
+                    if (anyOk) {
+                        if (forceUseApplied) {
+                            runCatching {
+                                Class.forName("android.media.AudioSystem")
+                                    .getMethod("setForceUse", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                                    .invoke(null, 1, 0)
+                            }
+                            forceUseApplied = false
+                        }
+                        return true
+                    }
+                }
+            }
+
+            // Fallback via AudioSystem.setForceUse(FOR_MEDIA=1, config)
+            val displayPortType = runCatching {
+                android.media.AudioDeviceInfo::class.java.getField("TYPE_DISPLAY_PORT").getInt(null)
+            }.getOrNull()
+            val forceConfig = when (deviceType) {
+                android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+                android.media.AudioDeviceInfo.TYPE_BLE_HEADSET,
+                android.media.AudioDeviceInfo.TYPE_BLE_SPEAKER,
+                android.media.AudioDeviceInfo.TYPE_BLE_BROADCAST -> 4 // FORCE_BT_A2DP
+                android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> 1 // FORCE_SPEAKER
+                android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> 2 // FORCE_HEADPHONES
+                android.media.AudioDeviceInfo.TYPE_HDMI,
+                android.media.AudioDeviceInfo.TYPE_HDMI_ARC,
+                android.media.AudioDeviceInfo.TYPE_HDMI_EARC -> 12 // FORCE_HDMI_SYSTEM_AUDIO_ENFORCED
+                else -> if (displayPortType != null && deviceType == displayPortType) {
+                    12 // FORCE_HDMI_SYSTEM_AUDIO_ENFORCED
+                } else {
+                    0 // FORCE_NONE
+                }
+            }
+            val setForceUseOk = runCatching {
+                Class.forName("android.media.AudioSystem")
+                    .getMethod("setForceUse", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    .invoke(null, 1 /* FOR_MEDIA */, forceConfig)
+                forceUseApplied = forceConfig != 0
+                true
+            }.getOrDefault(false)
+            Log.i(TAG, "setPreferredMediaAudioDevice fallback AudioSystem.setForceUse(config=$forceConfig) ok=$setForceUseOk")
+            setForceUseOk
+        } catch (t: Throwable) {
+            Log.w(TAG, "setPreferredMediaAudioDevice failed", t)
+            false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun clearPreferredMediaAudioDevice(): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val ctx = obtainSystemContext() ?: context ?: return false
+            val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                ?: return false
+            var anyOk = false
+            if (android.os.Build.VERSION.SDK_INT >= 31) {
+                val strategies = resolveMediaStrategies(am)
+                val strategyClass = runCatching { Class.forName("android.media.audiopolicy.AudioProductStrategy") }
+                    .getOrNull()
+                val removeMethod = if (strategyClass != null) {
+                    runCatching {
+                        am.javaClass.getMethod("removePreferredDeviceForStrategy", strategyClass)
+                    }.getOrNull()
+                } else null
+                if (removeMethod != null) {
+                    for (strategy in strategies) {
+                        val ok = runCatching {
+                            removeMethod.invoke(am, strategy) as? Boolean ?: false
+                        }.getOrDefault(false)
+                        if (ok) anyOk = true
+                    }
+                }
+            }
+            if (forceUseApplied) {
+                runCatching {
+                    Class.forName("android.media.AudioSystem")
+                        .getMethod("setForceUse", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                        .invoke(null, 1 /* FOR_MEDIA */, 0 /* FORCE_NONE */)
+                    anyOk = true
+                }
+                forceUseApplied = false
+            }
+            Log.i(TAG, "clearPreferredMediaAudioDevice ok=$anyOk")
+            anyOk
+        } catch (t: Throwable) {
+            Log.w(TAG, "clearPreferredMediaAudioDevice failed", t)
+            false
+        } finally {
+            Binder.restoreCallingIdentity(id)
         }
     }
 

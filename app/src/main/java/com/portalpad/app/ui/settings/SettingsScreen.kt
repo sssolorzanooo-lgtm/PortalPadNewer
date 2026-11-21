@@ -83,9 +83,18 @@ import com.portalpad.app.data.findFolder
 import com.portalpad.app.data.allFoldersFlat
 import com.portalpad.app.data.removeRecursive
 import androidx.datastore.preferences.core.edit
+import androidx.compose.material.icons.filled.BluetoothAudio
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.RadioButtonChecked
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import androidx.compose.material.icons.filled.SpeakerPhone
+import androidx.compose.material.icons.filled.Tv
+import com.portalpad.app.data.AudioOutputMode
 import com.portalpad.app.data.InputMode
 import com.portalpad.app.data.MirrorKeepAwakeMode
 import com.portalpad.app.data.PreferencesRepository
+import com.portalpad.app.service.AudioSinkCategory
+import com.portalpad.app.service.AudioStatusSnapshot
 import com.portalpad.app.service.XrealBeamProSettings
 import com.portalpad.app.ui.common.PageScrollChevrons
 import com.portalpad.app.ui.common.PageScrollbar
@@ -7265,6 +7274,7 @@ private fun ToggleRowWithDesc(
     // explains WHY it's disabled.
     enabled: Boolean = true,
     disabledNote: String? = null,
+    testTag: String? = null,
 ) {
     val app = PortalPadApp.instance
     val scope = rememberCoroutineScope()
@@ -7302,6 +7312,7 @@ private fun ToggleRowWithDesc(
         Switch(
             checked = value,
             enabled = enabled,
+            modifier = Modifier.then(if (testTag != null) Modifier.testTag(testTag) else Modifier),
             onCheckedChange = { newVal ->
                 if (confirmMessage != null) pendingValue = newVal
                 else scope.launch { app.prefs.setBool(key, newVal) }
@@ -9128,6 +9139,14 @@ private fun WorkspaceTab(
                 default = true,
                 requirement = Requirement.ROOT_OR_SHIZUKU,
             )
+            ToggleRowWithDesc(
+                label = "Forward playing video on connect",
+                desc = "When an app is actively playing video on the phone right before you connect an external display, PortalPad opens that app first on the external display and keeps playback going. Takes priority over 30-minute Auto-resume.",
+                key = PreferencesRepository.Keys.FORWARD_VIDEO_ON_CONNECT,
+                default = true,
+                requirement = Requirement.ROOT_OR_SHIZUKU,
+                testTag = "workspace_forward_video_toggle",
+            )
             val maxWin by prefs.int(PreferencesRepository.Keys.MAX_WINDOWS, default = 5)
                 .collectAsState(initial = 5)
             Text(
@@ -9226,12 +9245,92 @@ private fun WorkspaceTab(
                 default = true,
             )
         }
+        SectionCard(title = "Audio", tightSpacing = true) {
+            val audioStatus by app.audioRouter.status.collectAsState()
+            val selectedAudioMode by prefs.audioOutputMode.collectAsState(initial = AudioOutputMode.AUTO)
+            LaunchedEffect(Unit) {
+                app.audioRouter.refreshSnapshotOnly()
+            }
+            Text(
+                "Forces the selected media audio output as soon as an external display connects. " +
+                    "In Auto mode, audio plays on Bluetooth if connected (and shifts automatically if Bluetooth connects mid-session), " +
+                    "then External display audio, and falls back to Phone audio last.",
+                color = PhoneOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            WorkspaceAudioStatusCard(status = audioStatus)
+            AudioOutputMode.entries.forEach { mode ->
+                val selected = selectedAudioMode == mode
+                val modeIcon = when (mode) {
+                    AudioOutputMode.AUTO -> Icons.Default.GraphicEq
+                    AudioOutputMode.BLUETOOTH -> Icons.Default.BluetoothAudio
+                    AudioOutputMode.EXTERNAL_DISPLAY -> Icons.Default.Tv
+                    AudioOutputMode.PHONE -> Icons.Default.SpeakerPhone
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(
+                            if (selected) PhonePrimary.copy(alpha = 0.16f) else PhoneSurfaceElevated.copy(alpha = 0.7f),
+                        )
+                        .border(
+                            width = if (selected) 1.5.dp else 1.dp,
+                            color = if (selected) PhonePrimary else PhonePrimaryDim.copy(alpha = 0.45f),
+                            shape = RoundedCornerShape(14.dp),
+                        )
+                        .clickable {
+                            app.injector.buzz(longPress = false)
+                            scope.launch {
+                                prefs.setAudioOutputMode(mode)
+                                if (audioStatus.externalDisplayActive) {
+                                    app.audioRouter.reapplyRouting("ui-pick:${mode.id}")
+                                }
+                            }
+                        }
+                        .testTag("workspace_audio_mode_${mode.id}")
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = modeIcon,
+                        contentDescription = null,
+                        tint = if (selected) PhonePrimaryBright else PhoneOnSurfaceMuted,
+                        modifier = Modifier.size(22.dp),
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            text = mode.title,
+                            color = if (selected) PhoneOnSurface else PhoneOnSurface.copy(alpha = 0.92f),
+                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = mode.description,
+                            color = PhoneOnSurfaceMuted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Icon(
+                        imageVector = if (selected) Icons.Default.RadioButtonChecked else Icons.Default.RadioButtonUnchecked,
+                        contentDescription = if (selected) "Selected" else "Not selected",
+                        tint = if (selected) PhonePrimaryBright else PhoneOnSurfaceDim,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+            RequirementBadge(Requirement.ROOT_OR_SHIZUKU)
+        }
         var showResetConfirm by remember { mutableStateOf(false) }
         ResetToDefaultsButton("Reset Workspace to Defaults") { showResetConfirm = true }
         if (showResetConfirm) {
             ResetConfirmDialog(
                 title = "Reset Workspace to defaults?",
-                message = "This resets the dock layout & style, top bar, folder windows, widget overlay background, app-search, and wallpaper to their defaults. Your dock apps, folders, and widgets are kept.",
+                message = "This resets the dock layout & style, top bar, folder windows, widget overlay background, video forwarding, audio routing, app-search, and wallpaper to their defaults. Your dock apps, folders, and widgets are kept.",
                 onConfirm = {
                     showResetConfirm = false
                     scope.launch {
@@ -9249,6 +9348,8 @@ private fun WorkspaceTab(
                         )
                         prefs.setBool(PreferencesRepository.Keys.DOCK_ENABLED, true)
                         prefs.setBool(PreferencesRepository.Keys.SEARCH_KEYBOARD_ON_PHONE, true)
+                        prefs.setBool(PreferencesRepository.Keys.FORWARD_VIDEO_ON_CONNECT, true)
+                        prefs.setAudioOutputMode(AudioOutputMode.AUTO)
                         prefs.resetHomeWallpapers()
                     }
                 },
@@ -9256,6 +9357,126 @@ private fun WorkspaceTab(
             )
         }
     }
+}
+
+@Composable
+private fun WorkspaceAudioStatusCard(status: AudioStatusSnapshot) {
+    val activeIcon = when (status.activeCategory) {
+        AudioSinkCategory.BLUETOOTH -> Icons.Default.BluetoothAudio
+        AudioSinkCategory.EXTERNAL_DISPLAY -> Icons.Default.Tv
+        AudioSinkCategory.PHONE -> Icons.Default.SpeakerPhone
+        null -> Icons.Default.GraphicEq
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(PhoneSurfaceElevated)
+            .border(1.dp, PhonePrimaryDim.copy(alpha = 0.6f), RoundedCornerShape(14.dp))
+            .testTag("workspace_audio_status_card")
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = activeIcon,
+                contentDescription = "Active audio route",
+                tint = if (status.externalDisplayActive) PhonePrimaryBright else PhoneOnSurfaceMuted,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = if (status.externalDisplayActive) "Active media output" else "Audio route status",
+                    color = PhoneOnSurfaceDim,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+                Text(
+                    text = status.activeRouteLabel,
+                    color = PhoneOnSurface,
+                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (status.forcedByPrivilege) {
+                Text(
+                    text = "Enforced",
+                    color = PhonePrimaryBright,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(PhonePrimary.copy(alpha = 0.22f))
+                        .padding(horizontal = 8.dp, vertical = 3.dp),
+                )
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            AudioSinkChip(
+                label = status.bluetoothName ?: "Bluetooth off",
+                available = status.hasBluetooth,
+                active = status.externalDisplayActive && status.activeCategory == AudioSinkCategory.BLUETOOTH,
+                modifier = Modifier.weight(1f),
+            )
+            AudioSinkChip(
+                label = status.externalDisplayAudioName ?: "Display audio off",
+                available = status.hasExternalDisplayAudio,
+                active = status.externalDisplayActive && status.activeCategory == AudioSinkCategory.EXTERNAL_DISPLAY,
+                modifier = Modifier.weight(1f),
+            )
+            AudioSinkChip(
+                label = status.phoneAudioName ?: "Phone speaker",
+                available = status.hasPhoneAudio,
+                active = status.externalDisplayActive && status.activeCategory == AudioSinkCategory.PHONE,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun AudioSinkChip(
+    label: String,
+    available: Boolean,
+    active: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val bg = when {
+        active -> PhonePrimary.copy(alpha = 0.24f)
+        available -> PhoneSurface
+        else -> PhoneSurface.copy(alpha = 0.55f)
+    }
+    val border = when {
+        active -> PhonePrimary
+        available -> PhonePrimaryDim.copy(alpha = 0.5f)
+        else -> PhoneOnSurfaceDim.copy(alpha = 0.25f)
+    }
+    val fg = when {
+        active -> PhonePrimaryBright
+        available -> PhoneOnSurfaceMuted
+        else -> PhoneOnSurfaceDim
+    }
+    Text(
+        text = label,
+        color = fg,
+        style = MaterialTheme.typography.labelSmall,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        textAlign = TextAlign.Center,
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(bg)
+            .border(1.dp, border, RoundedCornerShape(8.dp))
+            .padding(horizontal = 6.dp, vertical = 4.dp),
+    )
 }
 
 /** Dock Customization sub-page: layout + style, with a pinned bottom Back. */

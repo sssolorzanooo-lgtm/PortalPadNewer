@@ -105,6 +105,8 @@ class RootClickBackend(private val context: Context) : BoundShellBackend {
     override fun gamepadKey(displayId: Int, keyCode: Int): Boolean = svcCall { it.injectGamepadKeyPress(keyCode, displayId); true }
     override fun pointer(action: Int, x: Float, y: Float, displayId: Int, source: Int, buttonState: Int, downTime: Long): Boolean =
         svcCall { it.injectPointer(action, x, y, displayId, source, buttonState, downTime) }
+    override fun parkSystemPointer(displayId: Int, x: Float, y: Float): Boolean =
+        svcCall { it.parkSystemPointer(displayId, x, y) }
     override fun setImePolicy(displayId: Int, policy: Int): Boolean = svcCall { it.setDisplayImePolicy(displayId, policy) }
     override fun showImeOnFocusedEditor(): Boolean = svcCall { it.showImeOnFocusedEditor() }
     override fun hideImeFromServer(): Boolean = svcCall { it.hideImeFromServer() }
@@ -189,6 +191,12 @@ class RootClickBackend(private val context: Context) : BoundShellBackend {
     override fun injectScroll(x: Float, y: Float, vScroll: Float, hScroll: Float, displayId: Int) {
         svcCall { it.injectScroll(x, y, vScroll, hScroll, displayId); true }
     }
+
+    override fun setPreferredMediaAudioDevice(deviceType: Int, address: String?): Boolean =
+        svcCall { it.setPreferredMediaAudioDevice(deviceType, address ?: "") }
+
+    override fun clearPreferredMediaAudioDevice(): Boolean =
+        svcCall { it.clearPreferredMediaAudioDevice() }
 
     // ─── helpers ────────────────────────────────────────────────────
     private inline fun <T> svcCall(default: T, block: (IShellService) -> T): T {

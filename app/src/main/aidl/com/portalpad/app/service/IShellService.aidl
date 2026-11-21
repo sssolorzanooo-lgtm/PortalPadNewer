@@ -20,6 +20,8 @@ interface IShellService {
     // Action: 0=DOWN, 1=UP, 2=MOVE, 7=HOVER_MOVE, 9=HOVER_ENTER, 10=HOVER_EXIT
     // Source: 4098=TOUCHSCREEN|CLASS_POINTER, 8194=MOUSE|CLASS_POINTER
     boolean injectPointer(int action, float x, float y, int displayId, int source, int buttonState, long downTime);
+    /** Park any visible black system mouse pointer at (x, y) on displayId and exit hover. */
+    boolean parkSystemPointer(int displayId, float x, float y);
     // Discrete mouse-wheel scroll (ACTION_SCROLL / AXIS_VSCROLL) at (x,y) on the
     // given display. Unlike a swipe, this does NOT fling — content moves only
     // while the wheel turns. vScroll +1.0 = up, hScroll +1.0 = right (one notch).
@@ -290,4 +292,8 @@ interface IShellService {
      * makes this safe, so the picker must inherit it rather than widen it.
      */
     String listPointerDevices();
+
+    // ─── System-wide media audio output routing ──────────────────────────
+    boolean setPreferredMediaAudioDevice(int deviceType, String address);
+    boolean clearPreferredMediaAudioDevice();
 }

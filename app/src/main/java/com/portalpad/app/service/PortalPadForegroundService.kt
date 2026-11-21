@@ -707,6 +707,7 @@ class PortalPadForegroundService : Service() {
             scope.launch(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching { tdApp.prefs.setLastDisconnectedApp(disconnectSnapshot) }
             }
+            tdApp.audioRouter.onExternalDisplayStateChanged(false)
             lastDisplayRemovedAt = android.os.SystemClock.elapsedRealtime()
             tdApp.setPhysicalExternalDisplayId(null)
             tdApp.flapRecoveryUntilMs = android.os.SystemClock.elapsedRealtime() + 25_000L
@@ -1088,6 +1089,7 @@ class PortalPadForegroundService : Service() {
         (applicationContext as? PortalPadApp)?.btMouse?.maybeAutoArm(delayMs = 1000L)
         startBubbleWatcher()
         (applicationContext as PortalPadApp).signal.start()
+        (applicationContext as PortalPadApp).audioRouter.start()
         startAutoDisableWatcher()
         startUnwrappedDisplayWatchdog()
         startSessionSnapshotter()
@@ -1846,6 +1848,7 @@ class PortalPadForegroundService : Service() {
         // neither of which dies with this service). The Enable pref is
         // untouched, so the next session re-arms via the display/BT hooks.
         runCatching { (applicationContext as PortalPadApp).btMouse.disable() }
+        runCatching { (applicationContext as PortalPadApp).audioRouter.stop() }
         // Widget overlay hardening: tear the layer down and clear its injector
         // flags on service death — a leaked cursorOverWidgetOverlay eats every
         // right-click and leaked edit rects hijack the resize cursor, and this
@@ -2651,6 +2654,14 @@ class PortalPadForegroundService : Service() {
                 this, overlayDisplay, app.injector,
             ).also { it.show() }
             Log.d(TAG, "Cursor recreated on top of overlays")
+            // Park Android's black system cursor at the bottom-right corner edge so
+            // only PortalPad's custom white cursor is visible.
+            app.injector.dismissSystemPointer()
+            if (attempt == 0) {
+                mainHandler.postDelayed({
+                    runCatching { app.injector.dismissSystemPointer() }
+                }, 450L)
+            }
         }.onFailure { Log.w(TAG, "recreateCursorOnTop failed", it) }
         // The add can fail SILENTLY on a fresh VD: the display's a11y token is
         // transiently invalid for the first ~1-2s (log-proven 2026-07-09: two
@@ -2992,10 +3003,13 @@ class PortalPadForegroundService : Service() {
             Log.d(TAG, "$trigger: session already on live trusted VD (vd=${app.virtualDisplayId} " +
                 "ext=${app.externalDisplayId.value}) — skip redundant rebuild")
             app.btMouse.maybeAutoArm(delayMs = 400L)
+            app.audioRouter.reapplyRouting("backend-ready-healthy")
+            app.injector.dismissSystemPointer()
             return
         }
         refreshExternalDisplay(force = true, trigger = trigger)
         app.btMouse.maybeAutoArm(delayMs = 800L)
+        app.audioRouter.reapplyRouting("backend-ready")
     }
 
     private fun refreshExternalDisplay(
@@ -3070,6 +3084,8 @@ class PortalPadForegroundService : Service() {
             app.setExternalDisplayId(null)
             app.setPhysicalExternalDisplayId(null)
             app.setVirtualDisplayId(null)
+            app.audioRouter.onExternalDisplayStateChanged(false)
+            pendingVideoForward = null
             if (lastId != null) {
                 // We had a display; release VD and any overlays now that it's
                 // gone. The VD release can block on a contended system during a
@@ -3093,6 +3109,11 @@ class PortalPadForegroundService : Service() {
         }
 
         val wasNullBefore = app.externalDisplayId.value == null
+        // Snapshot any actively playing phone video BEFORE TrackpadActivity or the
+        // virtual display covers/pauses the foreground player on display 0.
+        if (wasNullBefore && !suppressAutoStartContent && autoLaunchOnFirstAttach) {
+            capturePhoneVideoCandidate(app)
+        }
 
         // Decide whether to wrap the external display in a trusted Virtual
         // Display. Comparable tools don't expose this as a user
@@ -3319,6 +3340,15 @@ class PortalPadForegroundService : Service() {
         mainHandler.postDelayed({
             runCatching { app.injector.updateDisplaySizeForRotation() }
         }, 600L)
+        if (wasNullBefore || vdJustCreated || trigger.startsWith("displayAdded")) {
+            app.injector.dismissSystemPointer()
+            mainHandler.postDelayed({
+                runCatching { app.injector.dismissSystemPointer() }
+            }, 600L)
+        }
+        if (wasNullBefore || vdJustCreated || force || trigger.startsWith("displayAdded")) {
+            app.audioRouter.onExternalDisplayStateChanged(true)
+        }
         app.injector.usingVd = usingVd
         if (usingVd) {
             app.injector.mirrorTargetDisplayZero = false
@@ -5430,6 +5460,215 @@ class PortalPadForegroundService : Service() {
         private const val AUTO_RESUME_WINDOW_MS = 30L * 60L * 1000L
         private val autoStartLock = Any()
 
+        private data class VideoForwardCandidate(
+            val capturedAtElapsedMs: Long,
+            val isMusicActive: Boolean,
+            val hasMovieAudio: Boolean,
+            val playingSessionPackages: List<String>,
+            val foregroundPhonePackage: String?,
+        )
+
+        @Volatile private var pendingVideoForward: VideoForwardCandidate? = null
+
+        private val AUDIO_ONLY_PACKAGES = setOf(
+            "com.spotify.music",
+            "com.google.android.apps.youtube.music",
+            "com.apple.android.music",
+            "com.amazon.mp3",
+            "com.aspiro.tidal",
+            "com.pandora.android",
+            "com.soundcloud.android",
+            "au.com.shiftyjelly.pocketcasts",
+            "com.audible.application",
+            "com.deezer.android.app",
+            "com.sec.android.app.music",
+            "com.miui.player",
+            "com.bambuna.podcastaddict",
+            "com.google.android.apps.podcasts",
+            "tunein.player",
+            "com.sirius",
+        )
+
+        private val KNOWN_VIDEO_OR_BROWSER_PREFIXES = listOf(
+            "com.google.android.youtube",
+            "com.netflix.mediaclient",
+            "com.amazon.avod",
+            "com.disney.disneyplus",
+            "com.hulu.plus",
+            "com.hbo.hbonow",
+            "com.wbd.stream",
+            "com.cbs.app",
+            "com.peacocktv",
+            "com.plexapp.android",
+            "org.jellyfin",
+            "tv.twitch.android",
+            "org.videolan.vlc",
+            "com.mxtech.videoplayer",
+            "org.xbmc.kodi",
+            "com.teamsmart.videomanager.tv",
+            "com.liskovsoft.smarttubetv",
+            "org.schabi.newpipe",
+            "com.stremio",
+            "com.zhiliaoapp.musically",
+            "com.ss.android.ugc.trill",
+            "com.vimeo.android.videoapp",
+            "com.crunchyroll",
+            "com.tubitv",
+            "tv.pluto.android",
+            "com.android.chrome",
+            "com.chrome.",
+            "org.mozilla.firefox",
+            "com.brave.browser",
+            "com.sec.android.app.sbrowser",
+            "com.microsoft.emmx",
+            "com.opera.browser",
+        )
+
+        private fun capturePhoneVideoCandidate(app: PortalPadApp) {
+            val am = runCatching {
+                app.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+            }.getOrNull()
+            val isMusicActive = runCatching { am?.isMusicActive == true }.getOrDefault(false)
+            val hasMovieAudio = runCatching {
+                am?.activePlaybackConfigurations?.any { cfg ->
+                    cfg.audioAttributes.usage == android.media.AudioAttributes.USAGE_MEDIA &&
+                        cfg.audioAttributes.contentType == android.media.AudioAttributes.CONTENT_TYPE_MOVIE
+                } == true
+            }.getOrDefault(false)
+            val playingSessions = runCatching { app.media.getPlayingPackageNames() }
+                .getOrDefault(emptyList())
+            val fgPkg = runCatching {
+                PortalPadAccessibilityService.instance?.rootInActiveWindow?.packageName?.toString()
+            }.getOrNull()
+            if (isMusicActive || hasMovieAudio || playingSessions.isNotEmpty()) {
+                pendingVideoForward = VideoForwardCandidate(
+                    capturedAtElapsedMs = android.os.SystemClock.elapsedRealtime(),
+                    isMusicActive = isMusicActive,
+                    hasMovieAudio = hasMovieAudio,
+                    playingSessionPackages = playingSessions,
+                    foregroundPhonePackage = fgPkg,
+                )
+                Log.d(
+                    TAG,
+                    "capturePhoneVideoCandidate: activeMusic=$isMusicActive movieAudio=$hasMovieAudio " +
+                        "sessions=$playingSessions fg=$fgPkg",
+                )
+            } else {
+                pendingVideoForward = null
+            }
+        }
+
+        private fun isExcludedSystemPackage(pkg: String): Boolean =
+            pkg.startsWith("com.portalpad") ||
+                pkg.contains("launcher", ignoreCase = true) ||
+                pkg.contains("nexuslauncher", ignoreCase = true) ||
+                pkg == "com.android.systemui" ||
+                pkg == "com.android.settings"
+
+        private fun parsePlayingPackagesFromDumpsys(app: PortalPadApp): List<String> {
+            val dump = runCatching { app.access.execShell("dumpsys media_session") }
+                .getOrDefault("")
+            if (dump.isBlank()) return emptyList()
+            val found = linkedSetOf<String>()
+            var currentPkg: String? = null
+            for (line in dump.lineSequence()) {
+                val pkgMatch = Regex("""\bpackage=([a-zA-Z0-9_.]+)""").find(line)
+                if (pkgMatch != null) {
+                    currentPkg = pkgMatch.groupValues[1]
+                    continue
+                }
+                if (currentPkg != null &&
+                    (line.contains("state=PLAYING", ignoreCase = true) ||
+                        line.contains("state=BUFFERING", ignoreCase = true) ||
+                        line.contains("state=3,") ||
+                        line.contains("PlaybackState {state=3"))
+                ) {
+                    if (currentPkg != app.packageName) found += currentPkg
+                }
+            }
+            return found.toList()
+        }
+
+        private fun tryForwardPlayingVideoApp(
+            app: PortalPadApp,
+            snap: VideoForwardCandidate,
+            targetDisplayId: Int,
+        ): String? {
+            if (!app.access.isReady) return null
+            val phoneTasks = runCatching { app.freeform.listTasks(Display.DEFAULT_DISPLAY) }
+                .getOrDefault(emptyList())
+                .filter { !isExcludedSystemPackage(it.packageName) }
+
+            val sessionPkgs = snap.playingSessionPackages.ifEmpty {
+                if (snap.isMusicActive || snap.hasMovieAudio) {
+                    parsePlayingPackagesFromDumpsys(app)
+                } else emptyList()
+            }.filter { pkg ->
+                !isExcludedSystemPackage(pkg) &&
+                    (snap.hasMovieAudio || pkg !in AUDIO_ONLY_PACKAGES)
+            }
+
+            // 1) Prefer an actively playing video session that has a live task on the phone.
+            var targetTask = sessionPkgs.firstNotNullOfOrNull { pkg ->
+                phoneTasks.firstOrNull { it.packageName == pkg && it.packageName == snap.foregroundPhonePackage }
+                    ?: phoneTasks.firstOrNull { it.packageName == pkg }
+            }
+            var targetPkg = targetTask?.packageName ?: sessionPkgs.firstOrNull()
+
+            // 2) Fallback when MediaSession couldn't be queried (no Notification Access and OEM
+            //    stripped dumpsys), yet audio was actively playing at connect time: pick the visible
+            //    foreground video/browser task on the phone.
+            if (targetPkg == null && (snap.isMusicActive || snap.hasMovieAudio)) {
+                val fgCandidate = snap.foregroundPhonePackage
+                    ?.takeIf { !isExcludedSystemPackage(it) && it !in AUDIO_ONLY_PACKAGES }
+                    ?.let { fg -> phoneTasks.firstOrNull { it.packageName == fg } }
+                val visibleTask = fgCandidate ?: phoneTasks.firstOrNull { rt ->
+                    rt.packageName !in AUDIO_ONLY_PACKAGES && (
+                        snap.hasMovieAudio ||
+                            KNOWN_VIDEO_OR_BROWSER_PREFIXES.any { rt.packageName.startsWith(it) } ||
+                            rt.packageName.contains("video", ignoreCase = true) ||
+                            rt.packageName.contains("player", ignoreCase = true)
+                        )
+                }
+                if (visibleTask != null) {
+                    targetTask = visibleTask
+                    targetPkg = visibleTask.packageName
+                }
+            }
+
+            if (targetPkg == null) return null
+
+            // Move the live task directly to the external display to keep video state intact.
+            if (targetTask != null) {
+                val moved = runCatching {
+                    app.freeform.moveTaskToDisplay(targetTask.taskId, targetDisplayId)
+                }.getOrDefault(false)
+                if (moved) {
+                    runCatching { app.activeBoundBackend?.refocusTopTaskOnDisplay(targetDisplayId) }
+                    app.markExternalLaunch()
+                    (targetTask.topActivity ?: targetPkg).let { app.recordExternalApp(it) }
+                    Log.i(TAG, "forwardPlayingVideo: moved task=${targetTask.taskId} ($targetPkg) to display=$targetDisplayId")
+                    return targetPkg
+                }
+            }
+
+            // Fallback: launch component directly onto external display.
+            val component = targetTask?.topActivity?.takeIf { it.isNotBlank() }
+                ?: runCatching {
+                    app.packageManager.getLaunchIntentForPackage(targetPkg)?.component?.flattenToString()
+                }.getOrNull()
+                ?: return null
+            val started = runCatching { app.access.startActivityOnDisplay(component, targetDisplayId) }
+                .getOrDefault(false)
+            if (started) {
+                app.markExternalLaunch()
+                app.recordExternalApp(component)
+                Log.i(TAG, "forwardPlayingVideo: started $component on display=$targetDisplayId")
+                return targetPkg
+            }
+            return null
+        }
+
         fun launchAutoStart() {
             val svc = instance ?: return
             val app = svc.applicationContext as PortalPadApp
@@ -5445,6 +5684,8 @@ class PortalPadForegroundService : Service() {
                 lastAutoStartDisplayId = dedupDisplay
                 lastAutoStartAt = now
             }
+            val videoSnap = pendingVideoForward
+            pendingVideoForward = null
             svc.scope.launch {
                 val displayId = app.externalDisplayId.value ?: app.injector.displayId
 
@@ -5453,6 +5694,42 @@ class PortalPadForegroundService : Service() {
                 // the non-VD path and on re-attach.
                 ensureBackdrop(displayId, "autoLaunchOnStart")
                 if (!app.access.isReady) return@launch
+
+                // Priority 1: If a video app was actively playing on the phone before connect
+                // and Forward-playing-video is enabled, move/open it first and keep it playing
+                // (takes priority over 30-minute Auto-resume and normal Auto-launch).
+                val forwardVideoEnabled = runCatching { app.prefs.forwardVideoOnConnect.first() }
+                    .getOrDefault(true)
+                if (forwardVideoEnabled && videoSnap != null &&
+                    android.os.SystemClock.elapsedRealtime() - videoSnap.capturedAtElapsedMs <= 12_000L
+                ) {
+                    val forwardedPkg = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        tryForwardPlayingVideoApp(app, videoSnap, displayId)
+                    }
+                    if (forwardedPkg != null) {
+                        runCatching { app.prefs.setLastDisconnectedApp(null) }
+                        kotlinx.coroutines.delay(450L)
+                        val stillPlaying = runCatching {
+                            if (app.media.hasNotificationAccess) app.media.isPackagePlaying(forwardedPkg)
+                            else (app.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager)?.isMusicActive == true
+                        }.getOrDefault(false)
+                        if (!stillPlaying) {
+                            runCatching { app.media.resumePackagePlayback(forwardedPkg) }
+                            runCatching { app.injector.pressKey(android.view.KeyEvent.KEYCODE_MEDIA_PLAY, repin = false) }
+                        }
+                        runCatching {
+                            val pm = app.packageManager
+                            val label = runCatching {
+                                pm.getApplicationLabel(pm.getApplicationInfo(forwardedPkg, 0)).toString()
+                            }.getOrDefault(forwardedPkg)
+                            val dm = app.getSystemService(android.hardware.display.DisplayManager::class.java)
+                            dm?.getDisplay(displayId)?.let { d ->
+                                com.portalpad.app.presentation.GlassesToast.show(app, d, "Continued video in $label", 2500L)
+                            }
+                        }
+                        return@launch
+                    }
+                }
 
                 // 30-minute auto-resume: if enabled and the external display reconnected
                 // within 30 minutes of disconnect, reopen the last active app in its

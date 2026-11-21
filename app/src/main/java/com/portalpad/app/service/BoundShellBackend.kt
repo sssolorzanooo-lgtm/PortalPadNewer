@@ -47,6 +47,7 @@ interface BoundShellBackend {
     fun injectKey(keyCode: Int, action: Int, metaState: Int, displayId: Int): Boolean
     fun gamepadKey(displayId: Int, keyCode: Int): Boolean
     fun pointer(action: Int, x: Float, y: Float, displayId: Int, source: Int, buttonState: Int, downTime: Long): Boolean
+    fun parkSystemPointer(displayId: Int, x: Float, y: Float): Boolean = false
 
     // ─── IME policy ─────────────────────────────────────────────────────
     fun setImePolicy(displayId: Int, policy: Int): Boolean
@@ -160,6 +161,10 @@ interface BoundShellBackend {
     /** Pointer devices present, for the device picker. "eventN<TAB>name"
      *  lines plus a trailing "OTHER<TAB>n" count of non-pointer devices. */
     fun listPointerDevices(): String
+
+    // ─── Media audio routing ─────────────────────────────────────────────
+    fun setPreferredMediaAudioDevice(deviceType: Int, address: String?): Boolean = false
+    fun clearPreferredMediaAudioDevice(): Boolean = false
 
     companion object {
         const val DISPLAY_PREF_NO_DISPLAY = -1

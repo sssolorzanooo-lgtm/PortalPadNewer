@@ -47,6 +47,11 @@ class PortalPadApp : Application() {
     /** Phase 1 physical-mouse capture controller (experimental). */
     val btMouse by lazy { com.portalpad.app.service.BluetoothMouseController(injector) }
 
+    /** External display audio output routing controller (Auto: BT -> Display -> Phone). */
+    val audioRouter by lazy {
+        com.portalpad.app.service.AudioRouteController(this, prefs, { activeBoundBackend }, appScope)
+    }
+
     /**
      * Active elevated-access backend for non-click operations (launching apps,
      * sending keys to external display, granting permissions). The user picks

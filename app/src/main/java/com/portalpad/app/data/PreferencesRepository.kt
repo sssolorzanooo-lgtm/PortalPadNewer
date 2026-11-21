@@ -29,6 +29,8 @@ class PreferencesRepository(private val context: Context) {
         val SESSIONS_BY_WIDTH = stringPreferencesKey("sessions_by_width") // JSON SavedSessions (per-resolution layout memory)
         val OFFER_RESTORE_ON_RECONNECT = booleanPreferencesKey("offer_restore_on_reconnect") // auto-popup on trackpad open
         val AUTO_RESUME_LAST_APP_30M = booleanPreferencesKey("auto_resume_last_app_30m")
+        val FORWARD_VIDEO_ON_CONNECT = booleanPreferencesKey("forward_video_on_connect")
+        val AUDIO_OUTPUT_MODE = stringPreferencesKey("audio_output_mode")
         val LAST_DISCONNECTED_APP = stringPreferencesKey("last_disconnected_app")
         val BACK_BUTTON_STYLE = stringPreferencesKey("back_button_style")  // JSON ButtonAppearance
         val HOME_BUTTON_STYLE = stringPreferencesKey("home_button_style")  // JSON ButtonAppearance
@@ -500,6 +502,20 @@ class PreferencesRepository(private val context: Context) {
     val autoResumeLastApp30m: Flow<Boolean> = context.dataStore.data.map { p ->
         p[Keys.AUTO_RESUME_LAST_APP_30M] ?: true
     }.distinctUntilChanged()
+    /** Forward an actively playing phone video app to the external display on connect. */
+    val forwardVideoOnConnect: Flow<Boolean> = context.dataStore.data.map { p ->
+        p[Keys.FORWARD_VIDEO_ON_CONNECT] ?: true
+    }.distinctUntilChanged()
+    suspend fun setForwardVideoOnConnect(enabled: Boolean) = context.dataStore.edit {
+        it[Keys.FORWARD_VIDEO_ON_CONNECT] = enabled
+    }
+    /** Enforced media audio output policy while an external display is connected. */
+    val audioOutputMode: Flow<AudioOutputMode> = context.dataStore.data.map { p ->
+        AudioOutputMode.fromId(p[Keys.AUDIO_OUTPUT_MODE])
+    }.distinctUntilChanged()
+    suspend fun setAudioOutputMode(mode: AudioOutputMode) = context.dataStore.edit {
+        it[Keys.AUDIO_OUTPUT_MODE] = mode.id
+    }
     /** Snapshot of the last active external app + bounds + disconnect wall-clock timestamp. */
     val lastDisconnectedApp: Flow<LastDisconnectedApp?> = context.dataStore.data.map { p ->
         p[Keys.LAST_DISCONNECTED_APP]?.let {
@@ -1174,5 +1190,38 @@ enum class MirrorKeepAwakeMode(
     companion object {
         fun fromId(id: String?): MirrorKeepAwakeMode =
             entries.firstOrNull { it.id == id } ?: OFF
+    }
+}
+
+/** Enforced media audio routing priority once an external display session starts. */
+enum class AudioOutputMode(
+    val id: String,
+    val title: String,
+    val description: String,
+) {
+    AUTO(
+        id = "auto",
+        title = "Auto: Bluetooth → External display → Phone",
+        description = "Uses Bluetooth audio if connected, then External display audio, then Phone audio. Automatically shifts to Bluetooth if it connects mid-session.",
+    ),
+    BLUETOOTH(
+        id = "bluetooth",
+        title = "Bluetooth audio",
+        description = "Forces media audio to a connected Bluetooth audio device while an external display is active.",
+    ),
+    EXTERNAL_DISPLAY(
+        id = "external_display",
+        title = "External display audio",
+        description = "Forces media audio to the external display, glasses, or HDMI/DisplayPort speakers.",
+    ),
+    PHONE(
+        id = "phone",
+        title = "Phone audio",
+        description = "Forces media audio to stay on the phone speaker or wired headphones.",
+    );
+
+    companion object {
+        fun fromId(id: String?): AudioOutputMode =
+            entries.firstOrNull { it.id == id } ?: AUTO
     }
 }
