@@ -124,6 +124,10 @@ data class DockConfig(
      *  Default ~app-icon size so the dock reads as a slim macOS-style bar
      *  (matching the desktop taskbar) rather than a bulky strip. */
     val iconSizeDp: Int = 60,
+    /** Whether to render app/folder titles beneath dock tiles. Turning this
+     *  off removes the title band and compacts the dock height + status chrome
+     *  while preserving [labelSizeSp] for clock/battery sizing. */
+    val showLabels: Boolean = true,
     /** Label text size under each icon, in sp. 0 hides labels. */
     val labelSizeSp: Int = 13,
     /** Overall dock scale percent (50–160) applied on top of icon/label sizes,

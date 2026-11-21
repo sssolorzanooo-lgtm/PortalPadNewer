@@ -1432,11 +1432,165 @@ private fun PermissionsPage(scrollToTopSignal: Int = 0) {
         val pm = context.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
         if (pm.isIgnoringBatteryOptimizations(context.packageName)) PermStatus.GRANTED else PermStatus.DENIED
     }
+    val app = PortalPadApp.instance
+    val scope = rememberCoroutineScope()
+    val shizukuStatus by app.shizuku.status.collectAsState()
+    val accessMode by app.prefs.accessMode.collectAsState(initial = AccessMode.NONE)
+    val privilegeReady = when (accessMode) {
+        AccessMode.SHIZUKU -> shizukuStatus == ShizukuManager.Status.READY
+        AccessMode.ROOT -> app.root.isReady
+        AccessMode.NONE -> shizukuStatus == ShizukuManager.Status.READY || app.root.isReady
+    }
+    var quickGrantBusy by remember { mutableStateOf(false) }
+    var quickGrantNote by remember { mutableStateOf<String?>(null) }
+
     TabBody(scrollToTopSignal = scrollToTopSignal) {
         Text(
             "Every permission PortalPad uses and why. Privileged items are granted through your access source (Shizuku/Root); some are granted automatically and have nothing to toggle.",
             color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
         )
+
+        SectionCard(title = "One-tap Shizuku setup") {
+            Column(Modifier.fillMaxWidth().testTag("permissions_enable_all_shizuku_card")) {
+                Text(
+                    "Enable all required permissions and companion services in one tap via Shizuku or Root instead of checking them one by one. Camera is left untouched.",
+                    color = PhoneOnSurfaceMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = {
+                    val shellAccess = listOf(app.access, app.shizuku, app.root)
+                        .firstOrNull { it.isReady }
+                    if (shellAccess == null) {
+                        quickGrantNote = "Connect Shizuku or Root in Access source first."
+                        return@Button
+                    }
+                    quickGrantBusy = true
+                    quickGrantNote = "Applying required settings via ${if (app.root.isReady && accessMode == AccessMode.ROOT) "Root" else "Shizuku"}..."
+                    scope.launch {
+                        val pkg = context.packageName
+                        val notifComp = "$pkg/${com.portalpad.app.service.PortalPadNotificationListenerService::class.java.name}"
+                        val a11yComp = "$pkg/${com.portalpad.app.service.PortalPadAccessibilityService::class.java.name}"
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            val cmds = mutableListOf(
+                                "appops set $pkg ACCESS_RESTRICTED_SETTINGS allow",
+                                "appops set $pkg SYSTEM_ALERT_WINDOW allow",
+                                "pm grant $pkg android.permission.WRITE_SECURE_SETTINGS",
+                                "pm grant $pkg android.permission.INJECT_EVENTS",
+                                "cmd deviceidle whitelist +$pkg",
+                                "dumpsys deviceidle whitelist +$pkg",
+                                "cmd notification allow_listener $notifComp",
+                                "pm grant $pkg android.permission.RECORD_AUDIO",
+                                "pm grant $pkg android.permission.READ_PHONE_STATE",
+                            )
+                            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                                cmds += "pm grant $pkg android.permission.POST_NOTIFICATIONS"
+                            }
+                            if (android.os.Build.VERSION.SDK_INT >= 31) {
+                                cmds += "pm grant $pkg android.permission.BLUETOOTH_CONNECT"
+                            }
+                            cmds.forEach { cmd -> runCatching { shellAccess.execShell(cmd) } }
+
+                            val curNotif = runCatching {
+                                shellAccess.execShell("settings get secure enabled_notification_listeners").trim()
+                            }.getOrDefault("")
+                            if (!curNotif.split(":").contains(notifComp)) {
+                                val nextNotif = when {
+                                    curNotif.isEmpty() || curNotif == "null" -> notifComp
+                                    else -> "$curNotif:$notifComp"
+                                }
+                                runCatching {
+                                    shellAccess.execShell("settings put secure enabled_notification_listeners $nextNotif")
+                                }
+                            }
+
+                            val curA11y = runCatching {
+                                shellAccess.execShell("settings get secure enabled_accessibility_services").trim()
+                            }.getOrDefault("")
+                            val nextA11y = when {
+                                curA11y.isEmpty() || curA11y == "null" -> a11yComp
+                                curA11y.split(":").contains(a11yComp) -> curA11y
+                                else -> "$curA11y:$a11yComp"
+                            }
+                            runCatching {
+                                shellAccess.execShell("settings put secure enabled_accessibility_services $nextA11y")
+                            }
+                            runCatching {
+                                shellAccess.execShell("settings put secure accessibility_enabled 1")
+                            }
+                        }
+
+                        var notifOk = false
+                        var a11yOk = false
+                        for (i in 0 until 6) {
+                            kotlinx.coroutines.delay(350)
+                            refreshTick++
+                            notifOk = runCatching {
+                                android.provider.Settings.Secure.getString(
+                                    context.contentResolver, "enabled_notification_listeners",
+                                )?.contains(pkg) == true
+                            }.getOrDefault(false)
+                            a11yOk = runCatching {
+                                android.provider.Settings.Secure.getString(
+                                    context.contentResolver,
+                                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                                )?.contains(pkg) == true
+                            }.getOrDefault(false)
+                            if (notifOk && a11yOk) break
+                        }
+                        refreshTick++
+                        val overlayOk = android.provider.Settings.canDrawOverlays(context)
+                        quickGrantNote = if (overlayOk && notifOk && a11yOk) {
+                            "All required permissions & services enabled (Camera untouched)."
+                        } else {
+                            val blocked = buildList {
+                                if (!overlayOk) add("Overlay")
+                                if (!notifOk) add("Notification access")
+                                if (!a11yOk) add("Accessibility")
+                            }.joinToString(", ")
+                            "Applied Shizuku grants (Camera untouched). Still needs OS approval: $blocked (check App info \u2192 Allow restricted settings if blocked)."
+                        }
+                        quickGrantBusy = false
+                    }
+                },
+                enabled = !quickGrantBusy,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = PhonePrimary,
+                    contentColor = PhoneOnSurface,
+                    disabledContainerColor = PhoneSurfaceElevated,
+                    disabledContentColor = PhoneOnSurfaceDim,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("permissions_enable_all_shizuku_button"),
+            ) {
+                if (quickGrantBusy) {
+                    CircularProgressIndicator(
+                        color = PhoneOnSurface,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text("Enabling permissions...")
+                } else {
+                    Text(
+                        if (privilegeReady) "Enable all required settings"
+                        else "Enable all required settings (connect Shizuku)",
+                    )
+                }
+            }
+            quickGrantNote?.let { note ->
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    note,
+                    color = if (note.startsWith("All required")) PhoneAccent else PhoneOnSurfaceMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            }
+        }
 
         SectionCard(title = "Required") {
             PermissionRow("Display over other apps",
@@ -6422,7 +6576,9 @@ private fun ExternalMouseControls() {
     } else {
         ""
     }
-    val isConnected = (mouseOn || autoCapture) && status.startsWith("OK")
+    val externalMouseConnected by app.injector.externalMouseConnected.collectAsState()
+    val unifiedBlackPointer = inputMode == 0 && hasDisplay != null && externalMouseConnected
+    val isConnected = unifiedBlackPointer || ((mouseOn || autoCapture) && status.startsWith("OK"))
 
     // ── Enable | Input mode, two columns ────────────────────────────────
     // The status used to hang under "Enable" as a subtitle, which forced this
@@ -6527,6 +6683,8 @@ private fun ExternalMouseControls() {
     // separates "what is happening" from the controls that choose it. Green when
     // grabbed, muted otherwise, so state reads at a glance.
     val statusText = when {
+        unifiedBlackPointer -> "Unified black pointer active (external mouse + touchpad)"
+        inputMode == 0 && hasDisplay != null -> "White touchpad cursor active (connect a mouse to switch to black pointer)"
         !mouseOn && !autoCapture -> "Off"
         hasDisplay == null -> "Waiting for external display"
         status == "no-display" -> "Waiting for external display"
@@ -6602,7 +6760,7 @@ private fun ExternalMouseControls() {
                 style = MaterialTheme.typography.bodyLarge,
             )
             Text(
-                "Automatically capture USB and Bluetooth mice into PortalPad's cursor so clicks register and the black pointer does not overlap. Default: On",
+                "Automatically hand off to Android's unified black pointer when a USB or Bluetooth mouse connects (or capture in Remote mode). Default: On",
                 color = PhoneOnSurfaceMuted,
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -6628,8 +6786,7 @@ private fun ExternalMouseControls() {
     // — reading order beats keeping the mode-dependent block strictly contiguous.
     Text(
         if (inputMode == 0) {
-            "Drives the cursor on the external display. Hold left and move to drag " +
-                "or resize a window; two-finger swipe left / right scrolls sideways."
+            "Unified pointer mode: when an external mouse connects, PortalPad hides the white cursor so both mouse and touchpad control the single black pointer. Unplugging restores the white cursor."
         } else {
             "Turns the device into a remote. Best for TV-style apps: it does " +
                 "nothing in apps that do not support arrow-key navigation."
@@ -9611,6 +9768,39 @@ private fun DockCustomizationPage(onBack: () -> Unit) {
                     color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
                 )
                 Spacer(Modifier.height(8.dp))
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text(
+                            "Show dock app titles",
+                            color = PhoneOnSurface,
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        Text(
+                            "Turn off to hide titles under dock icons, slimming down the dock height and compacting the clock and status icons for extra screen space.",
+                            color = PhoneOnSurfaceMuted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Switch(
+                        checked = dockCfg.showLabels,
+                        onCheckedChange = { show ->
+                            scope.launch { prefs.setDockConfig(dockCfg.copy(showLabels = show)) }
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedTrackColor = PhonePrimary,
+                            checkedThumbColor = PhonePrimaryBright,
+                            uncheckedTrackColor = PhoneSurfaceElevated,
+                            uncheckedThumbColor = PhoneOnSurfaceDim,
+                        ),
+                        modifier = Modifier.testTag("dock_show_labels_switch"),
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
                 Text("Icon size: ${dockCfg.iconSizeDp} dp", color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium)
                 Slider(
                     value = dockCfg.iconSizeDp.toFloat(),
@@ -9618,14 +9808,20 @@ private fun DockCustomizationPage(onBack: () -> Unit) {
                     valueRange = 48f..120f, colors = sliderColors(),
                 )
                 Text(
-                    if (dockCfg.labelSizeSp == 0) "Labels: hidden" else "Label text size: ${dockCfg.labelSizeSp} sp",
+                    when {
+                        !dockCfg.showLabels -> "App titles: hidden (compact dock & status chrome)"
+                        dockCfg.labelSizeSp == 0 -> "Labels: hidden"
+                        else -> "Label text size: ${dockCfg.labelSizeSp} sp"
+                    },
                     color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
                 )
-                Slider(
-                    value = dockCfg.labelSizeSp.toFloat(),
-                    onValueChange = { n -> scope.launch { prefs.setDockConfig(dockCfg.copy(labelSizeSp = n.toInt())) } },
-                    valueRange = 0f..18f, colors = sliderColors(),
-                )
+                if (dockCfg.showLabels) {
+                    Slider(
+                        value = dockCfg.labelSizeSp.toFloat(),
+                        onValueChange = { n -> scope.launch { prefs.setDockConfig(dockCfg.copy(labelSizeSp = n.toInt())) } },
+                        valueRange = 0f..18f, colors = sliderColors(),
+                    )
+                }
                 Text("Dock width: ${dockCfg.dockWidthPct}% of display", color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium)
                 Slider(
                     value = dockCfg.dockWidthPct.toFloat(),
@@ -9639,6 +9835,7 @@ private fun DockCustomizationPage(onBack: () -> Unit) {
                         scope.launch {
                             prefs.setDockConfig(
                                 dockCfg.copy(
+                                    showLabels = true,
                                     iconSizeDp = 60,
                                     labelSizeSp = 13,
                                     dockWidthPct = 92,

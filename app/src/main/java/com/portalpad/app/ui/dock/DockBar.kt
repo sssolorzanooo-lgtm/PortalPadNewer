@@ -120,6 +120,72 @@ private const val BASELINE_DENSITY = 1.33f
 /** Pixels scrolled per chevron tap on the dock. */
 private const val SCROLL_STEP_PX = 360f
 
+/** Resolved sizing metrics for a rendered dock bar. */
+internal data class DockChromeMetrics(
+    val showTileTitles: Boolean,
+    val iconSizeDp: Float,
+    val tileLabelSizeSp: Float,
+    val statusCompactScale: Float,
+    val statusIconSizeDp: Float,
+    val statusLabelSp: Float,
+    val tileBandDp: Float,
+    val approxThicknessDp: Float,
+    val labelZoneDp: Float,
+    val magnifyBandDp: Float,
+    val tileBottomPadDp: Float,
+    val statusTopPadDp: Float,
+    val statusBottomPadDp: Float,
+)
+
+internal fun computeDockChromeMetrics(
+    config: DockConfig,
+    dpiComp: Float,
+    dockWindowDp: Float = Float.NaN,
+): DockChromeMetrics {
+    val showTileTitles = config.showLabels && config.labelSizeSp >= 1
+    val tileLabelSizeSp = if (showTileTitles) config.labelSizeSp * dpiComp else 0f
+    val baseStatusLabelSp = if (config.labelSizeSp > 0) (config.labelSizeSp * dpiComp) else (13f * dpiComp)
+    val statusCompactScale = if (showTileTitles) 1f else 0.78f
+    val statusLabelSp = (baseStatusLabelSp * statusCompactScale).coerceAtLeast(8.5f * dpiComp)
+    val rawIcon = config.iconSizeDp.toFloat().coerceIn(36f, 220f) * dpiComp
+    val iconSizeDp = if (dockWindowDp.isNaN()) {
+        rawIcon
+    } else {
+        val minAppSlots = 3f
+        val fixed = 84f + 3.2f * statusLabelSp + 40f
+        val perIconUnits = minAppSlots + 2.5f + 1.7f
+        val maxIcon = ((dockWindowDp - fixed) / perIconUnits).coerceAtLeast(36f)
+        rawIcon.coerceAtMost(maxIcon)
+    }
+    val statusIconSizeDp = iconSizeDp * statusCompactScale
+    val tileBandDp = if (showTileTitles) {
+        iconSizeDp * 1.35f + tileLabelSizeSp + 21f
+    } else {
+        iconSizeDp * 1.15f + 18f
+    }
+    val approxThicknessDp = if (showTileTitles) {
+        iconSizeDp * 2.2f + tileLabelSizeSp + 21f
+    } else {
+        iconSizeDp * 2.0f + 18f
+    }
+    val labelZoneDp = if (showTileTitles) (tileLabelSizeSp + 14f) else 6f
+    return DockChromeMetrics(
+        showTileTitles = showTileTitles,
+        iconSizeDp = iconSizeDp,
+        tileLabelSizeSp = tileLabelSizeSp,
+        statusCompactScale = statusCompactScale,
+        statusIconSizeDp = statusIconSizeDp,
+        statusLabelSp = statusLabelSp,
+        tileBandDp = tileBandDp,
+        approxThicknessDp = approxThicknessDp,
+        labelZoneDp = labelZoneDp,
+        magnifyBandDp = tileBandDp + 5f,
+        tileBottomPadDp = if (showTileTitles) 10f else 6f,
+        statusTopPadDp = if (showTileTitles) 6f else 4f,
+        statusBottomPadDp = if (showTileTitles) 5f else 3f,
+    )
+}
+
 /**
  * Dock rendered on the external display. Supports BOTTOM / TOP / LEFT / RIGHT
  * positions. If [DockConfig.autoHideAfterSec] > 0, the dock fades out after that
@@ -478,13 +544,14 @@ fun DockBar(
     val gateDensity = androidx.compose.ui.platform.LocalDensity.current.density
     val cursorPos by remember(
         displayMetrics, config.position, config.iconSizeDp,
-        config.labelSizeSp, config.revealZoneHeightPx, gateDensity,
+        config.showLabels, config.labelSizeSp, config.revealZoneHeightPx, gateDensity,
     ) {
         val m = displayMetrics
         if (m == null) {
             app.injector.cursorPosition
         } else {
-            val dockThicknessPx = (config.iconSizeDp * 2.2f + config.labelSizeSp + 21f) * gateDensity
+            val gateDpiComp = (BASELINE_DENSITY / gateDensity).coerceIn(0.25f, 3.0f)
+            val dockThicknessPx = computeDockChromeMetrics(config, gateDpiComp).approxThicknessDp * gateDensity
             val revealPx = config.revealZoneHeightPx.coerceIn(2, 200).toFloat()
             val stripPx = maxOf(dockThicknessPx, revealPx) + 8f * gateDensity
             val w = m.widthPixels.toFloat()
@@ -575,61 +642,28 @@ fun DockBar(
     // coords) and compares against this value to compute its scale. For a
     // vertical (LEFT/RIGHT) dock we map Y instead. The raw float is exposed; a
     // tile with no position yet simply renders at scale 1.
+    // DPI-INDEPENDENT SIZING + COMPACTED NO-LABEL METRICS.
+    val displayDensity = androidx.compose.ui.platform.LocalDensity.current.density
+    val dpiComp = (BASELINE_DENSITY / displayDensity).coerceIn(0.25f, 3.0f)
+    val dockWindowDp = remember(displayMetrics, config.dockWidthPct) {
+        val metrics = displayMetrics ?: return@remember Float.NaN
+        val widthPx = metrics.widthPixels * (config.dockWidthPct.coerceIn(40, 100) / 100f)
+        widthPx / BASELINE_DENSITY
+    }
+    val chromeMetrics = remember(config.iconSizeDp, config.showLabels, config.labelSizeSp, dpiComp, dockWindowDp) {
+        computeDockChromeMetrics(config, dpiComp, dockWindowDp)
+    }
+    val iconSizeDp = chromeMetrics.iconSizeDp
+    val tileLabelSizeSp = chromeMetrics.tileLabelSizeSp
+    val statusLabelSp = chromeMetrics.statusLabelSp
+    val statusIconSizeDp = chromeMetrics.statusIconSizeDp
+    val statusCompactScale = chromeMetrics.statusCompactScale
+
     val isHorizontalDock = config.position == DockPosition.BOTTOM || config.position == DockPosition.TOP
-    // Estimated rendered dock thickness (cross-axis), used to gate magnification
-    // so it only fires when the cursor is actually over the bar — tightened to
-    // hug the icon row closely so hovering just above/below no longer magnifies.
-    val dockBandPx: Float = run {
-        val displayDensity2 = androidx.compose.ui.platform.LocalDensity.current.density
-        // The cursor "on dock band" zone must cover the FULL dock window height,
-        // because some controls (the status icons: VPN/BT/Wi-Fi/battery) are pinned
-        // to the TOP of the glass band while others (+/search/mic) sit at the
-        // bottom. The window's content height is rowMaxH = tileBandDp +
-        // popoutHeadroom = iconSize*1.35 + label + 21 + iconSize*0.85. Sizing the
-        // band shorter (the old iconSize*1.05) left the top-pinned status icons
-        // ABOVE the zone, so hovering on them didn't register (hover/tooltip only
-        // fired a little BELOW them). Match the full height; the intentional bottom
-        // label-strip exclusion is handled separately by labelZonePx.
-        val approxThicknessDp = config.iconSizeDp * 2.2f + config.labelSizeSp + 21f
-        approxThicknessDp * displayDensity2
-    }
-    // Asymmetric bottom exclusion (BOTTOM dock): the lower part of the bar — the
-    // label strip down to the screen edge — should NOT magnify, so hovering
-    // "under" the icons (around/below the label) doesn't trigger it. We exclude a
-    // band of ~label height up from the screen bottom; the TOP boundary is left
-    // as-is (top behavior was fine). Mirror for TOP dock (exclude the label strip
-    // on its inner side).
-    val labelZonePx: Float = run {
-        val displayDensity2 = androidx.compose.ui.platform.LocalDensity.current.density
-        (config.labelSizeSp + 14f) * displayDensity2
-    }
-    // TIGHTER band for the bottom controls (+/search/mic). The full dockBandPx is
-    // deliberately tall to catch the TOP-pinned status icons, but the controls sit
-    // at the very bottom — so on that wide band their tooltips fired from way above
-    // the icons. This covers ~one control-tile height above the label strip, so
-    // their tooltip/magnify only triggers when the cursor is close to them.
-    // TUNABLE: raise the 1.2f to extend the controls' trigger zone higher.
-    val controlsBandPx: Float = run {
-        val displayDensity2 = androidx.compose.ui.platform.LocalDensity.current.density
-        labelZonePx + config.iconSizeDp * 1.2f * displayDensity2
-    }
-    // Dedicated, TIGHTER band used only to gate ICON MAGNIFY. The full dockBandPx
-    // reaches up to the top of the headroom — where the minimized-windows bar now
-    // floats — so hovering that bar magnified the app icon beneath it (looked like
-    // you were selecting the icon when you meant the bar). Magnify only needs to
-    // cover the bottom-anchored icon row, so this caps the zone well below the bar.
-    // TUNABLE: the trailing constant extends the magnify zone higher (toward the
-    // bar). +5dp over the bare band height so hovering the icon's very TOP still
-    // magnifies (the band edge used to land exactly at the icon top, so the top
-    // pixel row fell just outside and you had to nudge the cursor down).
-    val magnifyBandPx: Float = run {
-        val displayDensity2 = androidx.compose.ui.platform.LocalDensity.current.density
-        // = tileBandDp (the glass band's visual height) + a 5dp reach so the icon's
-        // top edge is inside the zone. Covers the FULL icon row — including the room
-        // a magnified (1.35×) icon grows into — and stops just shy of the headroom
-        // where the minimized bar floats.
-        (config.iconSizeDp * 1.35f + config.labelSizeSp + 21f + 5f) * displayDensity2
-    }
+    val dockBandPx: Float = chromeMetrics.approxThicknessDp * displayDensity
+    val labelZonePx: Float = chromeMetrics.labelZoneDp * displayDensity
+    val controlsBandPx: Float = labelZonePx + iconSizeDp * 1.2f * displayDensity
+    val magnifyBandPx: Float = chromeMetrics.magnifyBandDp * displayDensity
     // Dock window height in px, captured from the root Box's layout below. Used to
     // map the cursor's vertical DISPLAY position into the icons' root coordinate
     // space for 2D-proximity hover on the stacked right-side controls. 0 until the
@@ -746,57 +780,8 @@ fun DockBar(
             app.setDockBandBounds(null)
         }
     }
-    // DPI-INDEPENDENT SIZING.
-    // The dock renders inside a ComposeView on the external display, whose
-    // `density` follows the Display DPI setting. A raw .dp value would
-    // therefore render bigger at 360 dpi than at 213 dpi — i.e. Display DPI
-    // would change the dock size, which we don't want. We compensate by
-    // dividing out the display's density against a fixed baseline, so the
-    // user's Dock-settings values map to a consistent on-screen size no matter
-    // what Display DPI is set to. Dock size is controlled ONLY here.
-    val displayDensity = androidx.compose.ui.platform.LocalDensity.current.density
-    // Clamp wide enough that it NEVER binds across the full DPI slider (80–640 dpi
-    // ⇒ density 0.5–4.0 ⇒ dpiComp 2.66–0.33). If it clamps, the density stops fully
-    // cancelling and the chrome bleeds with the slider — the old 0.4 floor did
-    // exactly that above ~530 dpi. These bounds are only an out-of-range safety net.
-    val dpiComp = (BASELINE_DENSITY / displayDensity).coerceIn(0.25f, 3.0f)
-    // "Overall scale" was removed (it only multiplied icon + label size, which have
-    // their own sliders). Fixed at 1.0 so those sliders apply directly.
-    val scale = 1f
-    val labelSizeSp = (config.labelSizeSp * dpiComp * scale)
-    // SAFETY CLAMP: no slider combination should ever crowd out the app icons.
-    // The dock window is dockWidthPct of the display; the pinned regions (search +
-    // mic on the left, connectivity + battery + clock on the right) take a chunk
-    // that grows with icon AND label size. We cap the EFFECTIVE icon size so at
-    // least ~3 app slots always fit in whatever width remains — otherwise large
-    // icon×scale on a narrow dock left no room and showed "just the dock".
-    val iconSizeDp = run {
-        // Clamp the icon in BASELINE-dp (the user's setting space) BEFORE applying
-        // dpiComp, not after. Clamping the already-compensated value floors it in
-        // shrunken high-DPI dp, which then renders back UP at the high density and
-        // bleeds bigger (36.dp × 4.0 density = 144px vs the intended 80px). Clamping
-        // first keeps the on-screen size fixed at any DPI.
-        val raw = (config.iconSizeDp * scale).coerceIn(36f, 220f) * dpiComp
-        val dockWindowDp = run {
-            val metrics = displayMetrics ?: return@run Float.NaN
-            // Convert px → dp using THIS dock's pinned baseline density (the dock's
-            // own coordinate space), matching how iconSizeDp is interpreted.
-            val widthPx = metrics.widthPixels * (config.dockWidthPct.coerceIn(40, 100) / 100f)
-            widthPx / BASELINE_DENSITY
-        }
-        if (dockWindowDp.isNaN()) raw
-        else {
-            // Pinned-region budget (dp), in EFFECTIVE icon units: left search+mic
-            // (~2.5·icon) + right status (1.7·icon + 84 + 3.2·label) + padding.
-            // Reserve room for MIN_APP_SLOTS app icons in the remainder.
-            val minAppSlots = 3f
-            // Solve: minAppSlots*icon + 2.5*icon + 1.7*icon + 84 + 3.2*label + 40 <= dockWindowDp
-            val fixed = 84f + 3.2f * labelSizeSp + 40f
-            val perIconUnits = minAppSlots + 2.5f + 1.7f
-            val maxIcon = ((dockWindowDp - fixed) / perIconUnits).coerceAtLeast(36f)
-            raw.coerceAtMost(maxIcon)
-        }
-    }
+    // Sizing metrics (displayDensity, dpiComp, chromeMetrics) were computed above
+    // so both the cursor bands and the rendered dock share one source of truth.
 
     // macOS-style glassy look:
     //   - Deeply translucent dark fill (lets the app behind subtly show through)
@@ -1018,44 +1003,10 @@ fun DockBar(
                     // The glass-band tile height (icon + gap + reflection + label
                     // + padding) — this is the visible bar's content height.
                     // Trimmed from the original 28, then nudged back up slightly.
-                    val tileBandDp = iconSizeDp * 1.35f + labelSizeSp + 21f
-                    // Pop-out headroom carried INSIDE the row, above the icons, so
-                    // a magnified icon grows up into in-bounds space (not clipped
-                    // by the fade-mask layer). popoutHeadroom is the same value the
-                    // glass uses for its top transparent band, so the glass paints
-                    // the bottom (tile) portion and this headroom sits above it.
+                    val tileBandDp = chromeMetrics.tileBandDp
                     val rowMaxH = (tileBandDp + popoutHeadroom.value).dp
-                    // leftPadW: search + mic moved to the right of the "+" button, so
-                    // the left region is now just a small pad keeping the left
-                    // chevron/separator off the dock edge (not flush). Starting
-                    // estimate — tune if the chevron sits too close to / too far from
-                    // the edge.
                     val leftPadW = 10.dp
-                    // addRegionW = the status region width. It must be WIDE ENOUGH to
-                    // contain the status content (cluster + %), so the content sits
-                    // within its bounds — that keeps each status icon's drawn position,
-                    // touch target, and tooltip anchor all in the same place (clickable
-                    // + aligned). Shrinking it below the content width forces the
-                    // content to overflow, which decouples draw from hit/anchor and
-                    // breaks clicking — so do NOT shrink it. (The earlier "slide mic
-                    // under VPN" attempt shrank this and broke status-icon clicks; the
-                    // +cluster now sits cleanly to the LEFT of the status instead.)
-                    //
-                    // Coefficient bumped (1.82→2.34, +22→+28) to fit the added CELLULAR
-                    // glyph in the cluster and to give the battery "%" headroom — at the
-                    // old width the last glyph (the % sign) was being clipped by the
-                    // region's right edge at the 1.66× battery text size. On-device:
-                    // if the % still clips or the cluster looks cramped, raise these.
-                    //
-                    // Text term: the battery "%" is drawn at 1.66× labelSizeSp and is
-                    // the LAST child of the bounded status Row, so it only gets the
-                    // leftover width after the connectivity cluster. A 2-digit "NN%"
-                    // fit, but "100%" is one glyph wider and the leftover fell short,
-                    // clipping the %. An earlier 3.2→4.3 bump wasn't enough on-device;
-                    // raised to 6.0 (+ fixed 28→34) for clear 3-digit headroom in all
-                    // connectivity states. Scales with the font. On-device: if the %
-                    // ever clips again or the cluster looks too wide, adjust here.
-                    val addRegionW = (iconSizeDp * 2.34f + 34f + labelSizeSp * 6.0f).dp
+                    val addRegionW = (statusIconSizeDp * 2.34f + 34f + statusLabelSp * 6.0f).dp
                     // Gap from the region's (= dock's) right edge for the cluster (%),
                     // the time, and the date.
                     val statusEndPad = 6.dp
@@ -1243,7 +1194,7 @@ fun DockBar(
                                             )
                                         }
                                     }
-                                    .padding(bottom = 10.dp),
+                                    .padding(bottom = chromeMetrics.tileBottomPadDp.dp),
                                 horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
                                 verticalAlignment = Alignment.Bottom,
                             ) {
@@ -1251,7 +1202,7 @@ fun DockBar(
                                     DockTile(
                                         item = item,
                                         iconSizeDp = iconSizeDp,
-                                        labelSizeSp = labelSizeSp,
+                                        labelSizeSp = tileLabelSizeSp,
                                         onClick = {
                                             lastInteraction = System.currentTimeMillis()
                                             if (reorderMode) {
@@ -1357,7 +1308,7 @@ fun DockBar(
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 AddTile(
-                                    iconSizeDp = iconSizeDp * 0.88f, labelSizeSp = labelSizeSp, onClick = openAddApps,
+                                    iconSizeDp = iconSizeDp * 0.88f, labelSizeSp = tileLabelSizeSp, onClick = openAddApps,
                                     hoverCursorPx = cursorAxisInWindowPx,
                                     hoverOnBand = cursorOnControlsBand,
                                     hoverHorizontal = isHorizontalDock,
@@ -1419,7 +1370,7 @@ fun DockBar(
                                 Box(
                                     Modifier
                                         .align(Alignment.TopEnd)
-                                        .padding(top = 6.dp, end = statusEndPad),
+                                        .padding(top = chromeMetrics.statusTopPadDp.dp, end = statusEndPad),
                                     contentAlignment = Alignment.CenterEnd,
                                 ) {
                                     androidx.compose.foundation.layout.Row(
@@ -1428,7 +1379,7 @@ fun DockBar(
                                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     ) {
                                         DockConnectivity(
-                                            iconSizeDp = iconSizeDp,
+                                            iconSizeDp = statusIconSizeDp,
                                             strongColor = statusStrong,
                                             mutedColor = statusMuted,
                                             hoverCursorPx = cursorAxisInWindowPx,
@@ -1437,8 +1388,8 @@ fun DockBar(
                                             crossAxisCursorPx = cursorCrossInWindowPx,
                                         )
                                         DockBattery(
-                                            labelSizeSp = labelSizeSp,
-                                            iconSizeDp = iconSizeDp,
+                                            labelSizeSp = statusLabelSp,
+                                            iconSizeDp = statusIconSizeDp,
                                             strongColor = statusStrong,
                                             mutedColor = statusMuted,
                                             hoverCursorPx = cursorAxisInWindowPx,
@@ -1467,39 +1418,33 @@ fun DockBar(
                                         .align(Alignment.CenterEnd)
                                         .padding(end = statusEndPad),
                                     contentAlignment = Alignment.CenterEnd,
-                                ) { DockClock(labelSizeSp = labelSizeSp, part = ClockPart.TIME, textColor = statusStrong, timeFormat = config.clockTimeFormat, dateFormat = config.clockDateFormat) }
+                                ) { DockClock(labelSizeSp = statusLabelSp, part = ClockPart.TIME, textColor = statusStrong, timeFormat = config.clockTimeFormat, dateFormat = config.clockDateFormat) }
                                 // Date — pinned to the BOTTOM, right-aligned under the
                                 // time's "PM" / the % above.
                                 Box(
                                     Modifier
                                         .align(Alignment.BottomEnd)
-                                        .padding(bottom = 5.dp, end = statusEndPad),
+                                        .padding(bottom = chromeMetrics.statusBottomPadDp.dp, end = statusEndPad),
                                     contentAlignment = Alignment.CenterEnd,
                                 ) {
                                     DockClock(
-                                        labelSizeSp = labelSizeSp,
+                                        labelSizeSp = statusLabelSp,
                                         part = ClockPart.DATE,
                                         textColor = statusStrong,
                                         timeFormat = config.clockTimeFormat,
                                         dateFormat = config.clockDateFormat,
                                     )
                                 }
-                                // Notification bell + badge + highlight, moved RIGHT to
-                                // sit just LEFT of the time/date column with a small gap
-                                // so the highlight nearly touches it without overlapping.
-                                // The end pad ≈ the clock column width + gap, estimated
-                                // from label size. Tunable: smaller = further right
-                                // (closer to the clock), larger = further left.
                                 val bellNearClockPad = statusEndPad +
-                                    (labelSizeSp * 4.5f).dp + 22.dp
+                                    (statusLabelSp * 4.5f).dp + 22.dp
                                 Box(
                                     Modifier
                                         .align(Alignment.BottomEnd)
-                                        .padding(bottom = 5.dp, end = bellNearClockPad),
+                                        .padding(bottom = chromeMetrics.statusBottomPadDp.dp, end = bellNearClockPad),
                                     contentAlignment = Alignment.CenterEnd,
                                 ) {
                                     DockNotificationBell(
-                                        iconSizeDp = iconSizeDp,
+                                        iconSizeDp = statusIconSizeDp,
                                         strongColor = statusStrong,
                                         mutedColor = statusMuted,
                                         dockBgColor = dockAvgColor,
@@ -1508,6 +1453,7 @@ fun DockBar(
                                         hoverHorizontal = isHorizontalDock,
                                         crossAxisCursorPx = cursorCrossInWindowPx,
                                         activeTooltip = bellTooltip,
+                                        compactScale = statusCompactScale,
                                     )
                                 }
                             }
@@ -1541,7 +1487,7 @@ fun DockBar(
                             DockTile(
                                 item = item,
                                 iconSizeDp = iconSizeDp,
-                                labelSizeSp = labelSizeSp,
+                                labelSizeSp = tileLabelSizeSp,
                                 onClick = {
                                     lastInteraction = System.currentTimeMillis()
                                     if (reorderMode) {
@@ -1574,7 +1520,7 @@ fun DockBar(
                             )
                         }
                         item(key = "__add_tile__") {
-                            AddTile(iconSizeDp = iconSizeDp, labelSizeSp = labelSizeSp, onClick = openAddApps)
+                            AddTile(iconSizeDp = iconSizeDp, labelSizeSp = tileLabelSizeSp, onClick = openAddApps)
                         }
                         // (Minimized-window tiles removed — see the chip above the
                         //  chevron in the bottom-dock layout. This vertical branch
@@ -5879,6 +5825,7 @@ private fun DockNotificationBell(
     hoverHorizontal: Boolean = true,
     crossAxisCursorPx: Float = Float.NaN,
     activeTooltip: androidx.compose.runtime.MutableState<Pair<String, Float>?>? = null,
+    compactScale: Float = 1f,
 ) {
     // Live notification count from the same store that feeds the external-display
     // notification panel.
@@ -5954,12 +5901,7 @@ private fun DockNotificationBell(
             // enclose the badge too. All values are FIXED fractions of the bell /
             // a fixed badge dp, so they scale identically on every device.
             val bellDp = iconSizeDp * 0.40f
-            // FIXED badge diameter (dp) — kept at the previous size so the badge and
-            // its "99+" text read clearly. (Tried a bell-proportional badge; it came
-            // out too small.) The hover-highlight off-centre issue was fixed
-            // separately by centring the highlight on the bell, so the badge can stay
-            // this size even though it's a bit larger than the bell. ← tune to resize.
-            val badgeDia = 33f                             // circle diameter (dp)
+            val badgeDia = 33f * compactScale              // scaled proportionally when compacted
             // Badge sits at the bell's top-right. anchorXf uses a SMALL overlap
             // factor so it sits a bit RIGHT of the corner; lower 0.38f to push it
             // further right, raise it to pull it left. Raw Float dp (not .dp) so

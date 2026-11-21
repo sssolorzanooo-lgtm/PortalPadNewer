@@ -47,6 +47,7 @@ interface BoundShellBackend {
     fun injectKey(keyCode: Int, action: Int, metaState: Int, displayId: Int): Boolean
     fun gamepadKey(displayId: Int, keyCode: Int): Boolean
     fun pointer(action: Int, x: Float, y: Float, displayId: Int, source: Int, buttonState: Int, downTime: Long): Boolean
+    fun setUseHardwareMousePointer(enabled: Boolean) {}
     fun parkSystemPointer(displayId: Int, x: Float, y: Float): Boolean = false
 
     // ─── IME policy ─────────────────────────────────────────────────────

@@ -68,6 +68,7 @@ class ShellUserService : IShellService.Stub {
     private var lastMouseActionButton = 0
     @Volatile private var cachedTouchDeviceId: Int? = null
     @Volatile private var cachedMouseDeviceId: Int? = null
+    @Volatile private var useHardwareMousePointer: Boolean = false
 
     private val virtualDisplays = ConcurrentHashMap<Int, VirtualDisplay>()
     private val mirrorVirtualDisplays = ConcurrentHashMap<Int, VirtualDisplay>()
@@ -188,13 +189,43 @@ class ShellUserService : IShellService.Stub {
 
     /**
      * Resolve an active InputDevice id matching [source] (fallback -1 virtual device, never 0).
-     * For SOURCE_MOUSE synthetic hover/click events, always use virtual -1 rather than a
-     * connected physical mouse's hardware id; stamping a physical mouse id wakes Android's
-     * black system PointerController cursor alongside PortalPad's white cursor.
+     * When [useHardwareMousePointer] is false, SOURCE_MOUSE returns -1 so PortalPad's custom
+     * white cursor runs alone without waking Android's black PointerController cursor.
+     * When [useHardwareMousePointer] is true (an external mouse is connected), SOURCE_MOUSE
+     * resolves to the connected physical mouse's InputDevice id so touchpad input drives the
+     * same unified black system pointer.
      */
+    override fun setUseHardwareMousePointer(enabled: Boolean) {
+        if (useHardwareMousePointer != enabled) {
+            useHardwareMousePointer = enabled
+            cachedMouseDeviceId = null
+            Log.d(TAG, "useHardwareMousePointer=$enabled")
+        }
+    }
+
     private fun resolvePointerDeviceId(source: Int): Int {
         val isMouse = (source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE || source == 8194
-        if (isMouse) return -1
+        if (isMouse) {
+            if (!useHardwareMousePointer) return -1
+            val cached = cachedMouseDeviceId
+            if (cached != null) {
+                val dev = runCatching { InputDevice.getDevice(cached) }.getOrNull()
+                if (dev != null && !dev.isVirtual &&
+                    (dev.sources and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
+                ) {
+                    return cached
+                }
+                cachedMouseDeviceId = null
+            }
+            val resolved = runCatching {
+                InputDevice.getDeviceIds().firstOrNull { id ->
+                    val dev = InputDevice.getDevice(id) ?: return@firstOrNull false
+                    !dev.isVirtual && (dev.sources and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
+                }
+            }.getOrNull() ?: -1
+            cachedMouseDeviceId = if (resolved >= 0) resolved else null
+            return resolved
+        }
         val cached = cachedTouchDeviceId
         if (cached != null) return cached
         val resolved = runCatching {
@@ -349,9 +380,10 @@ class ShellUserService : IShellService.Stub {
             if (hScroll != 0f) setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll)
         }
         try {
+            val devId = resolvePointerDeviceId(InputDevice.SOURCE_MOUSE)
             val event = MotionEvent.obtain(
                 now, now, MotionEvent.ACTION_SCROLL, 1, arrayOf(props), arrayOf(coords),
-                0, 0, 1f, 1f, -1, 0, InputDevice.SOURCE_MOUSE, 0,
+                0, 0, 1f, 1f, devId, 0, InputDevice.SOURCE_MOUSE, 0,
             )
             setDisplayId(event, displayId)
             injectInputEventMethod?.invoke(inputManager, event, injectModeAsync)

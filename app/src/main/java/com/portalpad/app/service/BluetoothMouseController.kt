@@ -103,7 +103,23 @@ class BluetoothMouseController(private val injector: InputInjector) {
         }
         scope.launch {
             PortalPadApp.instance.prefs.int(keys.EXT_MOUSE_INPUT_MODE, MODE_MOUSE)
-                .collect { inputMode = it }
+                .collect { mode ->
+                    inputMode = mode
+                    injector.setExternalMouseRemoteMode(mode == MODE_REMOTE)
+                    if (mode == MODE_MOUSE) {
+                        pollJob?.cancel()
+                        pollJob = null
+                        if (running && !learnOnlySession) stopCapture()
+                        val app = PortalPadApp.instance
+                        lastStatus = when {
+                            injector.displayId == 0 -> "no-display"
+                            hasExternalPointerConnected(app) -> "black-pointer-active"
+                            else -> "idle"
+                        }
+                    } else if (shouldAutoCaptureNow() && !running && injector.displayId != 0) {
+                        maybeAutoArm(delayMs = 50L)
+                    }
+                }
         }
         scope.launch {
             PortalPadApp.instance.prefs.string(keys.EXT_MOUSE_DEVICE, "")
@@ -514,6 +530,15 @@ class BluetoothMouseController(private val injector: InputInjector) {
     /** Called by InputDevice / BT listeners when physical pointer hardware attaches. */
     fun onPointerHardwareAttached() {
         userExplicitlyDisabled = false
+        if (inputMode == MODE_MOUSE) {
+            pollJob?.cancel()
+            pollJob = null
+            if (running && !learnOnlySession) stopCapture()
+            if (PortalPadApp.instance.injector.displayId != 0) {
+                lastStatus = "black-pointer-active"
+            }
+            return
+        }
         if (running) {
             if (isActivelyGrabbed) injector.dismissSystemPointer()
             return
@@ -528,11 +553,21 @@ class BluetoothMouseController(private val injector: InputInjector) {
             (autoCaptureEnabled && !userExplicitlyDisabled && hasExternalPointerConnected(PortalPadApp.instance))
 
     fun maybeAutoArm(delayMs: Long = 0L) {
+        if (inputMode == MODE_MOUSE) {
+            if (running && !learnOnlySession) stopCapture()
+            val disp = PortalPadApp.instance.injector.displayId
+            lastStatus = when {
+                disp == 0 -> "no-display"
+                hasExternalPointerConnected(PortalPadApp.instance) -> "black-pointer-active"
+                else -> "idle"
+            }
+            return
+        }
         if (!userEnabled && (!autoCaptureEnabled || userExplicitlyDisabled)) return
         val requestedAt = SystemClock.uptimeMillis()
         scope.launch {
             if (delayMs > 0L) kotlinx.coroutines.delay(delayMs)
-            if (running) return@launch
+            if (running || inputMode == MODE_MOUSE) return@launch
             if (!shouldAutoCaptureNow()) return@launch
             val disp = PortalPadApp.instance.injector.displayId
             Log.i(
@@ -600,6 +635,19 @@ class BluetoothMouseController(private val injector: InputInjector) {
         if (inputMode == mode) return
         inputMode = mode
         stopSeek()
+        injector.setExternalMouseRemoteMode(mode == MODE_REMOTE)
+        if (mode == MODE_MOUSE) {
+            pollJob?.cancel()
+            pollJob = null
+            if (running && !learnOnlySession) stopCapture()
+            lastStatus = when {
+                injector.displayId == 0 -> "no-display"
+                hasExternalPointerConnected(PortalPadApp.instance) -> "black-pointer-active"
+                else -> "idle"
+            }
+        } else if (!running && injector.displayId != 0 && shouldAutoCaptureNow()) {
+            maybeAutoArm(delayMs = 50L)
+        }
         Log.d(TAG, "input mode -> $mode (immediate)")
     }
 
@@ -614,21 +662,17 @@ class BluetoothMouseController(private val injector: InputInjector) {
         // Internal teardown only — does NOT cancel the re-arm poller (this is
         // often called BY the poller). Public disable() handles opt-out.
         stopCapture()
-        // No external display, no capture. Every AUTOMATIC path already checked
-        // this — maybeAutoArm, startRearmPoller, and the readLoop re-arm all bail
-        // on displayId 0 — but the three settings controls that call enable()
-        // directly (Enable, Exclusive grab, Reconnect) did not. Any of them could
-        // exclusively grab the mouse and inject at display 0, the phone: exactly
-        // the invisible-capture state onExternalDisplayGone() exists to prevent.
-        // Guarding here rather than in the UI covers all callers, including any
-        // added later. "no-display" is already the string the status strip knows
-        // how to render, so nothing downstream needs to change.
-        // A learn-only session is EXEMPT deliberately (SH): it injects nothing
-        // by construction, lives seconds, and the grab dies with the process,
-        // so the invisible-capture hazard the guard exists for cannot occur.
         if (!learnOnly && PortalPadApp.instance.injector.displayId == 0) {
             Log.i(TAG, "enable() refused: no external display")
             lastStatus = "no-display"
+            return lastStatus
+        }
+        if (!learnOnly && inputMode == MODE_MOUSE) {
+            val mousePresent = hasExternalPointerConnected(PortalPadApp.instance)
+            injector.setExternalMouseRemoteMode(false)
+            injector.updateExternalMouseConnected(mousePresent)
+            lastStatus = if (mousePresent) "black-pointer-active" else "idle"
+            Log.i(TAG, "enable() in Mouse mode -> unified black pointer ($lastStatus)")
             return lastStatus
         }
         val backend = PortalPadApp.instance.activeBoundBackend

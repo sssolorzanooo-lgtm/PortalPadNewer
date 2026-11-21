@@ -105,6 +105,9 @@ class RootClickBackend(private val context: Context) : BoundShellBackend {
     override fun gamepadKey(displayId: Int, keyCode: Int): Boolean = svcCall { it.injectGamepadKeyPress(keyCode, displayId); true }
     override fun pointer(action: Int, x: Float, y: Float, displayId: Int, source: Int, buttonState: Int, downTime: Long): Boolean =
         svcCall { it.injectPointer(action, x, y, displayId, source, buttonState, downTime) }
+    override fun setUseHardwareMousePointer(enabled: Boolean) {
+        svcCall { it.setUseHardwareMousePointer(enabled); true }
+    }
     override fun parkSystemPointer(displayId: Int, x: Float, y: Float): Boolean =
         svcCall { it.parkSystemPointer(displayId, x, y) }
     override fun setImePolicy(displayId: Int, policy: Int): Boolean = svcCall { it.setDisplayImePolicy(displayId, policy) }

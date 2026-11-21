@@ -177,8 +177,10 @@ class WallpaperActivity : ComponentActivity() {
                         MotionEvent.ACTION_MOVE,
                         -> {
                             if (!app.injector.isLikelyOwnInjectedHover(ev.x, ev.y)) {
-                                app.injector.notifyExternalMouseMoving()
                                 app.injector.syncExternalCursorPositionQuietly(ev.x, ev.y)
+                                if (!app.injector.blackPointerModeActive) {
+                                    app.injector.notifyExternalMouseMoving()
+                                }
                             }
                         }
                         MotionEvent.ACTION_BUTTON_PRESS -> {

@@ -126,28 +126,29 @@ class PortalPadForegroundService : Service() {
     private val inputDeviceListener = object : android.hardware.input.InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) {
             val dev = android.view.InputDevice.getDevice(deviceId)
+            val app = applicationContext as? PortalPadApp ?: return
+            val hasMouse = BluetoothMouseController.hasExternalPointerConnected(applicationContext)
+            app.injector.updateExternalMouseConnected(hasMouse)
             if (BluetoothMouseController.isExternalPointerDevice(dev)) {
                 Log.i(TAG, "USB/BT pointer device added: id=$deviceId name=${dev?.name}")
-                val app = applicationContext as? PortalPadApp
-                app?.btMouse?.onPointerHardwareAttached()
-                if (app?.injector?.displayId != 0) {
-                    app?.injector?.dismissSystemPointer()
-                }
+                app.btMouse.onPointerHardwareAttached()
             }
         }
         override fun onInputDeviceRemoved(deviceId: Int) {
-            if (!BluetoothMouseController.hasExternalPointerConnected(applicationContext)) {
-                (applicationContext as? PortalPadApp)?.injector?.notifyTouchpadOrAirMouseActive()
+            val app = applicationContext as? PortalPadApp ?: return
+            val hasMouse = BluetoothMouseController.hasExternalPointerConnected(applicationContext)
+            app.injector.updateExternalMouseConnected(hasMouse)
+            if (!hasMouse) {
+                app.injector.notifyTouchpadOrAirMouseActive()
             }
         }
         override fun onInputDeviceChanged(deviceId: Int) {
             val dev = android.view.InputDevice.getDevice(deviceId)
+            val app = applicationContext as? PortalPadApp ?: return
+            val hasMouse = BluetoothMouseController.hasExternalPointerConnected(applicationContext)
+            app.injector.updateExternalMouseConnected(hasMouse)
             if (BluetoothMouseController.isExternalPointerDevice(dev)) {
-                val app = applicationContext as? PortalPadApp
-                app?.btMouse?.onPointerHardwareAttached()
-                if (app?.injector?.displayId != 0) {
-                    app?.injector?.dismissSystemPointer()
-                }
+                app.btMouse.onPointerHardwareAttached()
             }
         }
     }
@@ -765,6 +766,7 @@ class PortalPadForegroundService : Service() {
         scope.launch {
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching { virtualDisplaySession.stop() }
+                app.injector.displayId = 0
                 app.setExternalDisplayId(null)
                 app.setVirtualDisplayId(null)
                 // force_resizable_activities left ON system-wide crashes
@@ -1084,6 +1086,9 @@ class PortalPadForegroundService : Service() {
         (applicationContext as PortalPadApp).setServiceRunning(true)
         displayManager.registerDisplayListener(displayListener, null)
         runCatching { inputManager.registerInputDeviceListener(inputDeviceListener, mainHandler) }
+        (applicationContext as? PortalPadApp)?.injector?.updateExternalMouseConnected(
+            BluetoothMouseController.hasExternalPointerConnected(applicationContext),
+        )
         displayManager.displays.forEach { logDisplayDiag(it.displayId, "baseline") }
         refreshExternalDisplay(autoLaunchOnFirstAttach = false, trigger = "onCreate")
         (applicationContext as? PortalPadApp)?.btMouse?.maybeAutoArm(delayMs = 1000L)
@@ -3081,6 +3086,7 @@ class PortalPadForegroundService : Service() {
         if (external == null) {
             com.portalpad.app.presentation.PixelDesktopGuardOverlay.dismiss()
             app.injector.mirrorTargetDisplayZero = false
+            if (lastId != null) app.injector.displayId = 0
             app.setExternalDisplayId(null)
             app.setPhysicalExternalDisplayId(null)
             app.setVirtualDisplayId(null)
@@ -3325,22 +3331,16 @@ class PortalPadForegroundService : Service() {
         //    full trusted-VD pipeline.
         val injectionDisplayId = if (usingVd) effectiveDisplayId else external.displayId
         app.injector.displayId = injectionDisplayId
-        // The setter above dedupes on an UNCHANGED id and skips its metrics
-        // read — which is exactly the resolution-switch case: rebind() resizes
-        // the SAME VD in place (e.g. 1920→3840 ultrawide), the resize's
-        // onDisplayChanged is swallowed by the suppression window around
-        // session start, and the injector kept clamping the cursor to the old
-        // width — the cursor dead-ended at the center of an ultrawide canvas.
-        // Re-read the size explicitly: clamps without recentering and is a
-        // documented cheap no-op when nothing changed, so fresh attaches are
-        // unaffected. Second delayed read covers DisplayManager propagation
-        // lag after an in-place resize (the aspect path sleeps 250ms for the
-        // same reason).
+        app.injector.updateExternalMouseConnected(
+            BluetoothMouseController.hasExternalPointerConnected(applicationContext),
+        )
         runCatching { app.injector.updateDisplaySizeForRotation() }
         mainHandler.postDelayed({
             runCatching { app.injector.updateDisplaySizeForRotation() }
         }, 600L)
-        if (wasNullBefore || vdJustCreated || trigger.startsWith("displayAdded")) {
+        if ((wasNullBefore || vdJustCreated || trigger.startsWith("displayAdded")) &&
+            !app.injector.blackPointerModeActive
+        ) {
             app.injector.dismissSystemPointer()
             mainHandler.postDelayed({
                 runCatching { app.injector.dismissSystemPointer() }

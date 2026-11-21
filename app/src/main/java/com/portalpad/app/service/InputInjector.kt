@@ -118,6 +118,11 @@ class InputInjector(
             _nativeCaptionDragActive.value = false
             Log.d(TAG, "displayId change $old → $value")
             refreshDisplayMetrics()
+            updateEffectiveCursorVisibility()
+            syncHardwareMousePointerPreference()
+            if (blackPointerModeActive && old == 0) {
+                scheduleHoverInject(cursorX, cursorY)
+            }
             runCatching { repinImePolicy(aggressive = false) }
         }
 
@@ -138,7 +143,7 @@ class InputInjector(
      *  this checked only the Shizuku backend, which wrongly forced a11y on root
      *  even though root injects fine.) */
     private fun activeBackendReady(): Boolean =
-        PortalPadApp.instance.clickBackend.isReady
+        runCatching { PortalPadApp.instance.clickBackend.isReady }.getOrDefault(false)
 
     /** Route this gesture through the accessibility framework: external display,
      *  and either untrusted (no VD) or the active backend unavailable, and the
@@ -1177,6 +1182,8 @@ class InputInjector(
 
     private val _baseCursorVisible = MutableStateFlow(true)
     private val _externalMouseHidingCursor = MutableStateFlow(false)
+    private val _externalMouseConnected = MutableStateFlow(false)
+    private val _externalMouseRemoteMode = MutableStateFlow(false)
     private val _cursorVisible = MutableStateFlow(true)
     private val cursorVisibilityHandler =
         android.os.Handler(android.os.Looper.getMainLooper())
@@ -1187,8 +1194,90 @@ class InputInjector(
         }
     }
 
+    /** True when external mouse is connected, we're on an external display, and not in Remote mode. */
+    val externalMouseConnected: StateFlow<Boolean> = _externalMouseConnected.asStateFlow()
+
+    val blackPointerModeActive: Boolean
+        get() = _externalMouseConnected.value && displayId != 0 && !_externalMouseRemoteMode.value
+
+    @Volatile private var lastPushedHardwareMouseBackend: BoundShellBackend? = null
+    @Volatile private var lastPushedHardwareMouseMode: Boolean? = null
+
     private fun updateEffectiveCursorVisibility() {
-        _cursorVisible.value = _baseCursorVisible.value && !_externalMouseHidingCursor.value
+        _cursorVisible.value = _baseCursorVisible.value &&
+            !_externalMouseHidingCursor.value &&
+            !blackPointerModeActive
+    }
+
+    private fun syncHardwareMousePointerPreference() {
+        val want = blackPointerModeActive
+        val backend = runCatching { PortalPadApp.instance.activeBoundBackend }.getOrNull() ?: return
+        if (!backend.isReady) {
+            lastPushedHardwareMouseBackend = null
+            lastPushedHardwareMouseMode = null
+            return
+        }
+        if (lastPushedHardwareMouseBackend === backend && lastPushedHardwareMouseMode == want) return
+        lastPushedHardwareMouseBackend = backend
+        lastPushedHardwareMouseMode = want
+        runCatching {
+            injectExecutor.execute {
+                runCatching { backend.setUseHardwareMousePointer(want) }
+            }
+        }
+    }
+
+    /**
+     * Switch between unified black pointer mode (when a physical external mouse
+     * is connected on an external display) and PortalPad's custom white cursor
+     * (when disconnected).
+     */
+    fun updateExternalMouseConnected(connected: Boolean) {
+        val wasBlackMode = blackPointerModeActive
+        val changed = _externalMouseConnected.value != connected
+        _externalMouseConnected.value = connected
+        cursorVisibilityHandler.removeCallbacks(restoreCursorAfterExternalMouse)
+        if (!connected) {
+            _externalMouseHidingCursor.value = false
+        }
+        updateEffectiveCursorVisibility()
+        syncHardwareMousePointerPreference()
+        val nowBlackMode = blackPointerModeActive
+        if (changed || wasBlackMode != nowBlackMode) {
+            Log.i(
+                TAG,
+                "externalMouseConnected=$connected remote=${_externalMouseRemoteMode.value} " +
+                    "disp=$displayId blackPointerMode=$nowBlackMode cursorVisible=${_cursorVisible.value}",
+            )
+        }
+        if (nowBlackMode && !wasBlackMode) {
+            scheduleHoverInject(cursorX, cursorY)
+        } else if (!nowBlackMode && wasBlackMode) {
+            dismissSystemPointer()
+        }
+    }
+
+    /**
+     * Remote mode uses exclusive evdev capture without moving a pointer, so
+     * black-pointer unification pauses while Remote mode is selected.
+     */
+    fun setExternalMouseRemoteMode(remoteMode: Boolean) {
+        if (_externalMouseRemoteMode.value == remoteMode) return
+        val wasBlackMode = blackPointerModeActive
+        _externalMouseRemoteMode.value = remoteMode
+        updateEffectiveCursorVisibility()
+        syncHardwareMousePointerPreference()
+        val nowBlackMode = blackPointerModeActive
+        Log.i(
+            TAG,
+            "externalMouseRemoteMode=$remoteMode blackPointerMode=$nowBlackMode " +
+                "cursorVisible=${_cursorVisible.value}",
+        )
+        if (nowBlackMode && !wasBlackMode) {
+            scheduleHoverInject(cursorX, cursorY)
+        } else if (!nowBlackMode && wasBlackMode) {
+            dismissSystemPointer()
+        }
     }
 
     /**
@@ -1196,8 +1285,7 @@ class InputInjector(
      *  - The CursorOverlay observes this and short-circuits onDraw when false
      *  - TrackpadActivity sets this based on (mode == Media || hideInAppPref)
      *  - Service can also force it false if no display is attached
-     *  - Dynamic external-mouse suppression when an un-grabbed physical mouse
-     *    drives Android's black pointer.
+     *  - Unified black-pointer handoff when an external mouse is connected
      */
     val cursorVisible: StateFlow<Boolean> = _cursorVisible.asStateFlow()
 
@@ -1207,10 +1295,7 @@ class InputInjector(
     }
 
     /**
-     * Hide PortalPad's white cursor while an un-grabbed external mouse is
-     * actively moving. When [idleRestoreMs] > 0, restores after idle; when <= 0,
-     * stays hidden until Touchpad/Air Mouse resumes or the mouse disconnects so
-     * two cursors never coexist.
+     * Hide PortalPad's white cursor while an external mouse drives the pointer.
      */
     fun notifyExternalMouseMoving(idleRestoreMs: Long = EXTERNAL_MOUSE_IDLE_RESTORE_MS) {
         cursorVisibilityHandler.removeCallbacks(restoreCursorAfterExternalMouse)
@@ -1218,7 +1303,7 @@ class InputInjector(
             _externalMouseHidingCursor.value = true
             updateEffectiveCursorVisibility()
         }
-        if (idleRestoreMs > 0L) {
+        if (idleRestoreMs > 0L && !blackPointerModeActive) {
             cursorVisibilityHandler.postDelayed(
                 restoreCursorAfterExternalMouse,
                 idleRestoreMs.coerceAtLeast(150L),
@@ -1226,7 +1311,8 @@ class InputInjector(
         }
     }
 
-    /** Restore PortalPad's white cursor when Touchpad or Air Mouse resumes. */
+    /** Restore PortalPad's white cursor when Touchpad or Air Mouse resumes
+     *  (suppressed while unified black pointer mode is active with an external mouse). */
     fun notifyTouchpadOrAirMouseActive() {
         cursorVisibilityHandler.removeCallbacks(restoreCursorAfterExternalMouse)
         if (_externalMouseHidingCursor.value) {
@@ -1239,9 +1325,11 @@ class InputInjector(
      * Move Android's black system mouse pointer to the bottom-right corner edge
      * (width - 1, height - 1) and dismiss it across every relevant display (target
      * VD, physical external display, and default display) so only PortalPad's
-     * custom white cursor remains visible.
+     * custom white cursor remains visible. No-op while unified black-pointer
+     * mode is active.
      */
     fun dismissSystemPointer() = safe {
+        if (blackPointerModeActive) return@safe
         val backend = PortalPadApp.instance.activeBoundBackend ?: return@safe
         if (!backend.isReady) return@safe
         refreshDisplayMetrics()
@@ -2397,6 +2485,14 @@ class InputInjector(
         when (backend) {
             is ClickBackend.ShizukuUserService -> {
                 if (!backend.backend.isReady) return
+                val wantHwPointer = blackPointerModeActive
+                if (lastPushedHardwareMouseBackend !== backend.backend ||
+                    lastPushedHardwareMouseMode != wantHwPointer
+                ) {
+                    lastPushedHardwareMouseBackend = backend.backend
+                    lastPushedHardwareMouseMode = wantHwPointer
+                    runCatching { backend.backend.setUseHardwareMousePointer(wantHwPointer) }
+                }
                 val (tDisp, tx, ty) = resolveTargetDisplayAndCoords(x, y)
                 val now = SystemClock.uptimeMillis()
                 // Mirror the reference implementation's pattern: send HOVER_ENTER (action 9) before

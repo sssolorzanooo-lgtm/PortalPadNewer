@@ -20,6 +20,8 @@ interface IShellService {
     // Action: 0=DOWN, 1=UP, 2=MOVE, 7=HOVER_MOVE, 9=HOVER_ENTER, 10=HOVER_EXIT
     // Source: 4098=TOUCHSCREEN|CLASS_POINTER, 8194=MOUSE|CLASS_POINTER
     boolean injectPointer(int action, float x, float y, int displayId, int source, int buttonState, long downTime);
+    /** Switch synthetic SOURCE_MOUSE deviceId between -1 (PortalPad white cursor) and connected mouse hardware id (Android black pointer). */
+    void setUseHardwareMousePointer(boolean enabled);
     /** Park any visible black system mouse pointer at (x, y) on displayId and exit hover. */
     boolean parkSystemPointer(int displayId, float x, float y);
     // Discrete mouse-wheel scroll (ACTION_SCROLL / AXIS_VSCROLL) at (x,y) on the
