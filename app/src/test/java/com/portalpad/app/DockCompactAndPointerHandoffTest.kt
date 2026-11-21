@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.portalpad.app.data.DockConfig
+import com.portalpad.app.service.CursorStyle
 import com.portalpad.app.service.ElevatedAccess
 import com.portalpad.app.service.InputInjector
 import com.portalpad.app.ui.dock.computeDockChromeMetrics
@@ -65,37 +66,63 @@ class DockCompactAndPointerHandoffTest {
     }
 
     @Test
-    fun inputInjector_unifiedBlackPointerHidesWhiteCursorUntilMouseDisconnectsOrRemoteMode() {
+    fun inputInjector_seamlessBlackMouseAndWhiteTouchpadCursorHandoff() {
         val context: Context = ApplicationProvider.getApplicationContext()
         val injector = InputInjector({ FakeAccess() }, context)
 
-        // Display 0 (no external display): white cursor stays enabled regardless.
-        injector.updateExternalMouseConnected(true)
-        assertFalse(injector.blackPointerModeActive)
+        // Default state: crisp white cursor, visible.
+        assertEquals(CursorStyle.WHITE, injector.cursorStyle.value)
         assertTrue(injector.cursorVisible.value)
 
-        // External display attaches while mouse is connected: unified black pointer takes over.
+        // External mouse connects on external display: cursor remains visible for touchpad too.
         injector.displayId = 2
-        assertTrue(injector.blackPointerModeActive)
-        assertFalse(injector.cursorVisible.value)
-
-        // Touchpad movement must NOT resurrect the white cursor while external mouse is attached.
-        injector.notifyTouchpadOrAirMouseActive()
-        assertFalse(injector.cursorVisible.value)
-
-        // Remote mode pauses black-pointer unification.
-        injector.setExternalMouseRemoteMode(true)
-        assertFalse(injector.blackPointerModeActive)
+        injector.updateExternalMouseConnected(true)
+        assertTrue(injector.externalMouseConnected.value)
         assertTrue(injector.cursorVisible.value)
 
-        // Returning to Mouse mode re-engages unified black pointer.
-        injector.setExternalMouseRemoteMode(false)
-        assertTrue(injector.blackPointerModeActive)
-        assertFalse(injector.cursorVisible.value)
+        // External mouse moves: switches style to BLACK and continues from shared cursor coordinate.
+        val beforeMouse = injector.cursorPosition.value
+        injector.notifyExternalMouseSourceActive(grabbed = true)
+        injector.pointerMove(24f, 16f)
+        assertEquals(CursorStyle.BLACK, injector.cursorStyle.value)
+        assertTrue(injector.cursorVisible.value)
+        val afterMouse = injector.cursorPosition.value
+        assertEquals(beforeMouse.first + 24f, afterMouse.first, 0.01f)
+        assertEquals(beforeMouse.second + 16f, afterMouse.second, 0.01f)
 
-        // Unplugging the external mouse restores PortalPad's white cursor.
+        // Touchpad immediately takes over from the external mouse's exact coordinates and turns WHITE.
+        injector.notifyTouchpadOrAirMouseActive()
+        injector.pointerMove(-10f, 8f)
+        assertEquals(CursorStyle.WHITE, injector.cursorStyle.value)
+        assertTrue(injector.cursorVisible.value)
+        val afterTouchpad = injector.cursorPosition.value
+        assertEquals(afterMouse.first - 10f, afterTouchpad.first, 0.01f)
+        assertEquals(afterMouse.second + 8f, afterTouchpad.second, 0.01f)
+
+        // External mouse takes back over seamlessly.
+        injector.notifyExternalMouseSourceActive(grabbed = true)
+        assertEquals(CursorStyle.BLACK, injector.cursorStyle.value)
+        assertTrue(injector.cursorVisible.value)
+
+        // Remote mode resets style back to WHITE.
+        injector.setExternalMouseRemoteMode(true)
+        assertEquals(CursorStyle.WHITE, injector.cursorStyle.value)
+        assertTrue(injector.cursorVisible.value)
+        injector.setExternalMouseRemoteMode(false)
+
+        // Un-grabbed fallback briefly hides overlay while updating BLACK style, but touchpad restores it at once.
+        injector.notifyExternalMouseMoving(idleRestoreMs = 500L)
+        assertEquals(CursorStyle.BLACK, injector.cursorStyle.value)
+        assertFalse(injector.cursorVisible.value)
+        injector.notifyTouchpadOrAirMouseActive()
+        assertEquals(CursorStyle.WHITE, injector.cursorStyle.value)
+        assertTrue(injector.cursorVisible.value)
+
+        // Disconnecting resets style to WHITE and leaves touchpad cursor visible.
+        injector.notifyExternalMouseSourceActive(grabbed = true)
+        assertEquals(CursorStyle.BLACK, injector.cursorStyle.value)
         injector.updateExternalMouseConnected(false)
-        assertFalse(injector.blackPointerModeActive)
+        assertEquals(CursorStyle.WHITE, injector.cursorStyle.value)
         assertTrue(injector.cursorVisible.value)
     }
 }

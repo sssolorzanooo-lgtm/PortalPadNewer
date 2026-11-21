@@ -6576,9 +6576,7 @@ private fun ExternalMouseControls() {
     } else {
         ""
     }
-    val externalMouseConnected by app.injector.externalMouseConnected.collectAsState()
-    val unifiedBlackPointer = inputMode == 0 && hasDisplay != null && externalMouseConnected
-    val isConnected = unifiedBlackPointer || ((mouseOn || autoCapture) && status.startsWith("OK"))
+    val isConnected = (mouseOn || autoCapture) && status.startsWith("OK")
 
     // ── Enable | Input mode, two columns ────────────────────────────────
     // The status used to hang under "Enable" as a subtitle, which forced this
@@ -6683,8 +6681,6 @@ private fun ExternalMouseControls() {
     // separates "what is happening" from the controls that choose it. Green when
     // grabbed, muted otherwise, so state reads at a glance.
     val statusText = when {
-        unifiedBlackPointer -> "Unified black pointer active (external mouse + touchpad)"
-        inputMode == 0 && hasDisplay != null -> "White touchpad cursor active (connect a mouse to switch to black pointer)"
         !mouseOn && !autoCapture -> "Off"
         hasDisplay == null -> "Waiting for external display"
         status == "no-display" -> "Waiting for external display"
@@ -6692,7 +6688,7 @@ private fun ExternalMouseControls() {
         status.startsWith("OK") -> {
             val who = if (connectedName.isBlank()) "" else " \u2014 $connectedName"
             when {
-                status.contains("grab=OK") -> "Connected$who"
+                status.contains("grab=OK") -> "Connected$who (black mouse + white touchpad)"
                 status.contains("grab=skipped") -> "Connected$who (shared, grab off)"
                 else -> "Connected$who \u2014 grab refused (" +
                     status.substringAfter("grab=", "").trim() + ")"
@@ -6760,7 +6756,7 @@ private fun ExternalMouseControls() {
                 style = MaterialTheme.typography.bodyLarge,
             )
             Text(
-                "Automatically hand off to Android's unified black pointer when a USB or Bluetooth mouse connects (or capture in Remote mode). Default: On",
+                "Automatically capture USB/Bluetooth mice when an external display attaches (Default: On)",
                 color = PhoneOnSurfaceMuted,
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -6786,7 +6782,7 @@ private fun ExternalMouseControls() {
     // — reading order beats keeping the mode-dependent block strictly contiguous.
     Text(
         if (inputMode == 0) {
-            "Unified pointer mode: when an external mouse connects, PortalPad hides the white cursor so both mouse and touchpad control the single black pointer. Unplugging restores the white cursor."
+            "Routes mouse clicks, drag, scroll, and Back button directly to the external display. Displays a black cursor for the external mouse and seamlessly switches to white when you use the touchpad."
         } else {
             "Turns the device into a remote. Best for TV-style apps: it does " +
                 "nothing in apps that do not support arrow-key navigation."

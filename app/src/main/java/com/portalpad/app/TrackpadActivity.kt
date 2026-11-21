@@ -1683,14 +1683,20 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
             // ◀◀/▶▶ (no-op when the cursor is anywhere else).
             override fun onLongPressStart() = injector.kbSeekHoldStart()
             override fun onLongPressEnd() = injector.kbSeekHoldEnd()
-            override fun onScroll(dx: Float, dy: Float) = injector.scroll(dx, dy)
+            override fun onScroll(dx: Float, dy: Float) {
+                injector.notifyTouchpadOrAirMouseActive()
+                injector.scroll(dx, dy)
+            }
             override fun onDragStart(captionMove: Boolean) {
                 injector.notifyTouchpadOrAirMouseActive()
                 injector.dragStart(captionMove)
             }
             override fun onDragMove(dx: Float, dy: Float) = injector.dragMove(dx, dy)
             override fun onDragEnd() = injector.dragEnd()
-            override fun onPinch(scale: Float) = injector.pinchUpdate(scale)
+            override fun onPinch(scale: Float) {
+                injector.notifyTouchpadOrAirMouseActive()
+                injector.pinchUpdate(scale)
+            }
             override fun onPinchEnd() = injector.pinchCommit()
             override fun isOnResizeEdge(): Boolean =
                 injector.cursorType.value != com.portalpad.app.service.CursorType.ARROW &&

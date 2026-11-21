@@ -168,7 +168,7 @@ class WallpaperActivity : ComponentActivity() {
                     app.injector.notifyPageScroll(v * 40f)
                 }
             }
-            if (!app.btMouse.isActivelyGrabbed) {
+            if (!app.btMouse.running) {
                 val dev = InputDevice.getDevice(ev.deviceId)
                 val isRealExternal = dev != null && !dev.isVirtual
                 if (isRealExternal) {
@@ -178,9 +178,7 @@ class WallpaperActivity : ComponentActivity() {
                         -> {
                             if (!app.injector.isLikelyOwnInjectedHover(ev.x, ev.y)) {
                                 app.injector.syncExternalCursorPositionQuietly(ev.x, ev.y)
-                                if (!app.injector.blackPointerModeActive) {
-                                    app.injector.notifyExternalMouseMoving()
-                                }
+                                app.injector.notifyExternalMouseMoving()
                             }
                         }
                         MotionEvent.ACTION_BUTTON_PRESS -> {

@@ -106,17 +106,7 @@ class BluetoothMouseController(private val injector: InputInjector) {
                 .collect { mode ->
                     inputMode = mode
                     injector.setExternalMouseRemoteMode(mode == MODE_REMOTE)
-                    if (mode == MODE_MOUSE) {
-                        pollJob?.cancel()
-                        pollJob = null
-                        if (running && !learnOnlySession) stopCapture()
-                        val app = PortalPadApp.instance
-                        lastStatus = when {
-                            injector.displayId == 0 -> "no-display"
-                            hasExternalPointerConnected(app) -> "black-pointer-active"
-                            else -> "idle"
-                        }
-                    } else if (shouldAutoCaptureNow() && !running && injector.displayId != 0) {
+                    if (shouldAutoCaptureNow() && !running && injector.displayId != 0) {
                         maybeAutoArm(delayMs = 50L)
                     }
                 }
@@ -530,15 +520,6 @@ class BluetoothMouseController(private val injector: InputInjector) {
     /** Called by InputDevice / BT listeners when physical pointer hardware attaches. */
     fun onPointerHardwareAttached() {
         userExplicitlyDisabled = false
-        if (inputMode == MODE_MOUSE) {
-            pollJob?.cancel()
-            pollJob = null
-            if (running && !learnOnlySession) stopCapture()
-            if (PortalPadApp.instance.injector.displayId != 0) {
-                lastStatus = "black-pointer-active"
-            }
-            return
-        }
         if (running) {
             if (isActivelyGrabbed) injector.dismissSystemPointer()
             return
@@ -553,21 +534,11 @@ class BluetoothMouseController(private val injector: InputInjector) {
             (autoCaptureEnabled && !userExplicitlyDisabled && hasExternalPointerConnected(PortalPadApp.instance))
 
     fun maybeAutoArm(delayMs: Long = 0L) {
-        if (inputMode == MODE_MOUSE) {
-            if (running && !learnOnlySession) stopCapture()
-            val disp = PortalPadApp.instance.injector.displayId
-            lastStatus = when {
-                disp == 0 -> "no-display"
-                hasExternalPointerConnected(PortalPadApp.instance) -> "black-pointer-active"
-                else -> "idle"
-            }
-            return
-        }
         if (!userEnabled && (!autoCaptureEnabled || userExplicitlyDisabled)) return
         val requestedAt = SystemClock.uptimeMillis()
         scope.launch {
             if (delayMs > 0L) kotlinx.coroutines.delay(delayMs)
-            if (running || inputMode == MODE_MOUSE) return@launch
+            if (running) return@launch
             if (!shouldAutoCaptureNow()) return@launch
             val disp = PortalPadApp.instance.injector.displayId
             Log.i(
@@ -636,16 +607,7 @@ class BluetoothMouseController(private val injector: InputInjector) {
         inputMode = mode
         stopSeek()
         injector.setExternalMouseRemoteMode(mode == MODE_REMOTE)
-        if (mode == MODE_MOUSE) {
-            pollJob?.cancel()
-            pollJob = null
-            if (running && !learnOnlySession) stopCapture()
-            lastStatus = when {
-                injector.displayId == 0 -> "no-display"
-                hasExternalPointerConnected(PortalPadApp.instance) -> "black-pointer-active"
-                else -> "idle"
-            }
-        } else if (!running && injector.displayId != 0 && shouldAutoCaptureNow()) {
+        if (!running && injector.displayId != 0 && shouldAutoCaptureNow()) {
             maybeAutoArm(delayMs = 50L)
         }
         Log.d(TAG, "input mode -> $mode (immediate)")
@@ -665,14 +627,6 @@ class BluetoothMouseController(private val injector: InputInjector) {
         if (!learnOnly && PortalPadApp.instance.injector.displayId == 0) {
             Log.i(TAG, "enable() refused: no external display")
             lastStatus = "no-display"
-            return lastStatus
-        }
-        if (!learnOnly && inputMode == MODE_MOUSE) {
-            val mousePresent = hasExternalPointerConnected(PortalPadApp.instance)
-            injector.setExternalMouseRemoteMode(false)
-            injector.updateExternalMouseConnected(mousePresent)
-            lastStatus = if (mousePresent) "black-pointer-active" else "idle"
-            Log.i(TAG, "enable() in Mouse mode -> unified black pointer ($lastStatus)")
             return lastStatus
         }
         val backend = PortalPadApp.instance.activeBoundBackend
@@ -709,8 +663,10 @@ class BluetoothMouseController(private val injector: InputInjector) {
         }
         val grabOk = status.contains("grab=OK")
         isActivelyGrabbed = grabOk
+        if (!learnOnly) {
+            injector.updateExternalMouseConnected(true)
+        }
         if (grabOk) {
-            injector.notifyTouchpadOrAirMouseActive()
             injector.dismissSystemPointer()
             scope.launch {
                 for (waitMs in longArrayOf(120L, 250L, 450L)) {
@@ -1014,25 +970,21 @@ class BluetoothMouseController(private val injector: InputInjector) {
                 // Left DOWN: begin a pending press (click vs drag decided by
                 // movement). Right DOWN: immediate context tap. Middle: unmapped.
                 if (pressed and BTN_LEFT != 0) {
+                    injector.notifyExternalMouseSourceActive(grabSucceeded)
                     leftHeld = true; leftDragging = false; dragResolved = false
                     dragAccX = 0f; dragAccY = 0f
                 }
-                if (pressed and BTN_RIGHT != 0) injector.rightClick()
+                if (pressed and BTN_RIGHT != 0) {
+                    injector.notifyExternalMouseSourceActive(grabSucceeded)
+                    injector.rightClick()
+                }
 
                 // Movement: while left is held, accumulate until it crosses the
                 // drag threshold, then promote to a real held touch-drag (window
                 // move, or resize when grabbing an edge); below threshold it's
                 // just cursor movement, so a quick press/release stays a click.
                 if (dx != 0 || dy != 0) {
-                    if (grabSucceeded) {
-                        // Captured exclusively: Android's black pointer is suppressed,
-                        // so PortalPad's cursor IS the active pointer and must stay visible.
-                        injector.notifyTouchpadOrAirMouseActive()
-                    } else {
-                        // Un-grabbed fallback: keep white cursor hidden while external mouse
-                        // is driving Android's black pointer so two cursors never coexist.
-                        injector.notifyExternalMouseMoving(-1L)
-                    }
+                    injector.notifyExternalMouseSourceActive(grabSucceeded)
                     if (leftHeld && leftDragging) {
                         injector.dragMove(sdx, sdy)
                     } else if (leftHeld && !dragResolved) {
@@ -1050,6 +1002,7 @@ class BluetoothMouseController(private val injector: InputInjector) {
 
                 // Left UP: end the drag, or — if it never became one — click.
                 if (released and BTN_LEFT != 0) {
+                    injector.notifyExternalMouseSourceActive(grabSucceeded)
                     if (leftDragging) injector.dragEnd() else injector.leftClick()
                     leftHeld = false; leftDragging = false; dragResolved = false
                 }
@@ -1060,20 +1013,16 @@ class BluetoothMouseController(private val injector: InputInjector) {
                 // while the wheel turns. vNotches +1 = up; reverseScroll flips
                 // for devices whose wheel reports the opposite sign.
                 if (wheel != 0) {
+                    injector.notifyExternalMouseSourceActive(grabSucceeded)
                     var v = wheel * scrollSpeed
                     if (reverseScroll) v = -v
                     injector.wheelScroll(v)
                 }
                 // Horizontal wheel. On a trackpad-style device this IS the
                 // two-finger sideways swipe: the firmware resolves the second
-                // finger for us and reports it here. It was dropped in the native
-                // reader, so sideways swipes did nothing at all until now.
-                //
-                // Not inverted by reverseScroll: that setting exists for the
-                // vertical direction argument (wheel-up scrolls content up or
-                // down, which people disagree about). Sideways has no equivalent
-                // dispute, and flipping it would just be wrong half the time.
+                // finger for us and reports it here.
                 if (hwheel != 0) {
+                    injector.notifyExternalMouseSourceActive(grabSucceeded)
                     injector.wheelScrollHorizontal(hwheel * scrollSpeed)
                 }
             }

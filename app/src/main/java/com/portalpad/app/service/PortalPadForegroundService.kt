@@ -3338,9 +3338,7 @@ class PortalPadForegroundService : Service() {
         mainHandler.postDelayed({
             runCatching { app.injector.updateDisplaySizeForRotation() }
         }, 600L)
-        if ((wasNullBefore || vdJustCreated || trigger.startsWith("displayAdded")) &&
-            !app.injector.blackPointerModeActive
-        ) {
+        if (wasNullBefore || vdJustCreated || trigger.startsWith("displayAdded")) {
             app.injector.dismissSystemPointer()
             mainHandler.postDelayed({
                 runCatching { app.injector.dismissSystemPointer() }

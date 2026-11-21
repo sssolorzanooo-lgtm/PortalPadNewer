@@ -13,6 +13,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import androidx.core.graphics.toColorInt
+import com.portalpad.app.service.CursorStyle
 import com.portalpad.app.service.CursorType
 import com.portalpad.app.service.InputInjector
 import kotlinx.coroutines.CoroutineScope
@@ -217,6 +218,11 @@ class CursorOverlay(
                 if (!lastAppliedX.isNaN()) moveTo(lastAppliedX, lastAppliedY)
             }
         }
+        s.launch {
+            injector.cursorStyle.collect { style ->
+                view.setCursorStyle(style)
+            }
+        }
         // Live "Cursor smoothing" pref (s): higher = smoother. alpha = 1 - s,
         // floored at 0.1 so it never fully stalls; default 0 → alpha 1 (snap/off,
         // no added latency).
@@ -314,6 +320,7 @@ class CursorOverlay(
         private val shadowPath = Path()
         private val resizePath = Path()
         private var cursorType: CursorType = CursorType.ARROW
+        private var cursorStyle: CursorStyle = CursorStyle.WHITE
 
         fun setVisible(v: Boolean) {
             if (visible == v) return
@@ -324,6 +331,23 @@ class CursorOverlay(
         fun setCursorType(t: CursorType) {
             if (cursorType == t) return
             cursorType = t
+            invalidate()
+        }
+
+        fun setCursorStyle(s: CursorStyle) {
+            if (cursorStyle == s) return
+            cursorStyle = s
+            if (s == CursorStyle.BLACK) {
+                fillPaint.color = "#FF111111".toColorInt()
+                outlinePaint.color = "#FFFFFFFF".toColorInt()
+                resizeOutlinePaint.color = "#FFFFFFFF".toColorInt()
+                resizeStrokePaint.color = "#FF111111".toColorInt()
+            } else {
+                fillPaint.color = "#FFFFFFFF".toColorInt()
+                outlinePaint.color = "#FF000000".toColorInt()
+                resizeOutlinePaint.color = "#FF000000".toColorInt()
+                resizeStrokePaint.color = "#FFFFFFFF".toColorInt()
+            }
             invalidate()
         }
 
