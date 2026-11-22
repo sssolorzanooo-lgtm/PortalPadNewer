@@ -4495,15 +4495,16 @@ class PortalPadForegroundService : Service() {
                     app.appInForeground,
                     app.physicalExternalDisplayId,
                     app.prefs.bool(PreferencesRepository.Keys.FLOATING_BUBBLE, default = true),
-                ) { inForeground, displayId, enabled ->
+                    app.bubbleReboundSuppressed,
+                ) { inForeground, displayId, enabled, reboundSuppressed ->
                     floatingBubbleEnabled = enabled
                     // Reset session-hide whenever the user comes back to the app.
                     if (inForeground) bubble.clearSessionHide()
-                    val shouldShow = enabled && !inForeground && displayId != null
+                    val shouldShow = enabled && !inForeground && !reboundSuppressed && displayId != null
                     Log.d(
                         "BubbleActivate",
                         "reactive: enabled=$enabled inForeground=$inForeground " +
-                            "displayId=$displayId → shouldShow=$shouldShow",
+                            "reboundSuppressed=$reboundSuppressed displayId=$displayId → shouldShow=$shouldShow",
                     )
                     shouldShow
                 }
@@ -4528,6 +4529,7 @@ class PortalPadForegroundService : Service() {
                     kotlinx.coroutines.delay(3000)
                     val shouldShow = floatingBubbleEnabled &&
                         !app.appInForeground.value &&
+                        !app.bubbleReboundSuppressed.value &&
                         app.physicalExternalDisplayId.value != null
                     if (shouldShow && !bubble.isActuallyShown) {
                         Log.d(
@@ -4557,6 +4559,7 @@ class PortalPadForegroundService : Service() {
                     kotlinx.coroutines.delay(500)
                     val shouldShow = floatingBubbleEnabled &&
                         !app.appInForeground.value &&
+                        !app.bubbleReboundSuppressed.value &&
                         app.physicalExternalDisplayId.value != null
                     if (shouldShow && !bubble.isActuallyShown) {
                         Log.d(

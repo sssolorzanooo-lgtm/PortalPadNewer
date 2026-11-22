@@ -142,7 +142,7 @@ class FloatingBubbleManager(private val context: Context) {
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = ctx.resources.displayMetrics.widthPixels - sizePx - 32
-            y = (ctx.resources.displayMetrics.heightPixels * 0.35f).toInt()
+            y = computeInitialBubbleY(ctx.resources.displayMetrics.heightPixels, sizePx)
         }
 
         attachInputHandling(container, params)
@@ -457,5 +457,14 @@ class FloatingBubbleManager(private val context: Context) {
     companion object {
         private const val TAG = "FloatingBubble"
         private const val BUBBLE_SIZE_DP = 56
+
+        /**
+         * Shifts the resting bubble down by one button width ([sizePx]) relative to its
+         * historical 35% height anchor, clamped so it never spawns off-screen.
+         */
+        internal fun computeInitialBubbleY(heightPixels: Int, sizePx: Int): Int {
+            val maxTop = (heightPixels - sizePx).coerceAtLeast(0)
+            return ((heightPixels * 0.35f).toInt() + sizePx).coerceIn(0, maxTop)
+        }
     }
 }

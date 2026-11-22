@@ -639,12 +639,16 @@ class DockOverlay(
                     )
                 }
                 runCatching {
+                    app.phoneHomeExitCoordinator.markInternalNavigation()
                     val opts = android.app.ActivityOptions.makeBasic()
                         .setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY)
                     app.startActivity(
                         android.content.Intent(
                             app, com.portalpad.app.ui.settings.ArrangeWindowsActivity::class.java,
-                        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                        ).addFlags(
+                            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                                android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                        ),
                         opts.toBundle(),
                     )
                 }
@@ -686,6 +690,7 @@ class DockOverlay(
             )
         }
         runCatching {
+            app.phoneHomeExitCoordinator.markInternalNavigation()
             // Force the activity onto the PHONE (default display 0). Without this,
             // it inherits the launch display from the caller context (DockOverlay
             // runs on the EXTERNAL display), so it opened ON the external display —
@@ -701,7 +706,10 @@ class DockOverlay(
                     // CLEAR_TOP here: it was clearing PortalPad's WallpaperActivity
                     // (same default package affinity), blacking out the external
                     // display's backdrop while the floating windows stayed.
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    .addFlags(
+                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                            android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                    ),
                 opts.toBundle(),
             )
             Log.d(TAG, "window-limit: toast on disp ${display.displayId} + launched WindowLimitActivity on phone")
@@ -780,6 +788,7 @@ class DockOverlay(
             com.portalpad.app.presentation.GlassesToast.show(app, display, msg, dur)
         }
         runCatching {
+            app.phoneHomeExitCoordinator.markInternalNavigation()
             // Pin the launch to the PHONE (display 0). Without an explicit launch
             // display the activity inherits PortalPad's external-display task and
             // lands on the glasses; the whole point here is to keep search input
@@ -789,7 +798,10 @@ class DockOverlay(
                 .toBundle()
             app.startActivity(
                 android.content.Intent(app, com.portalpad.app.SearchActivity::class.java)
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .addFlags(
+                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                            android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                    )
                     .putExtra(com.portalpad.app.SearchActivity.EXTRA_START_VOICE, startVoice),
                 opts,
             )

@@ -5390,10 +5390,14 @@ internal fun launchRenameOnPhone(ctx: android.content.Context, itemId: String, c
         }
     }
     runCatching {
+        app.phoneHomeExitCoordinator.markInternalNavigation()
         val intent = android.content.Intent(
             app, com.portalpad.app.ui.settings.RenameActivity::class.java,
         )
-            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            .addFlags(
+                android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                    android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+            )
             .putExtra("itemId", itemId)
             .putExtra("current", currentLabel)
         val opts = android.app.ActivityOptions.makeBasic()

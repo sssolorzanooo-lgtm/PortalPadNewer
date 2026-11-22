@@ -12597,6 +12597,17 @@ private fun TrackpadSurfaceControls() {
         default = true,
     )
     ToggleRowWithDesc(
+        label = androidx.compose.ui.res.stringResource(
+            com.portalpad.app.R.string.pref_phone_home_external_home_label,
+        ),
+        desc = androidx.compose.ui.res.stringResource(
+            com.portalpad.app.R.string.pref_phone_home_external_home_desc,
+        ),
+        key = PreferencesRepository.Keys.PHONE_HOME_EXTERNAL_HOME,
+        default = true,
+        testTag = "phone_home_external_home_toggle",
+    )
+    ToggleRowWithDesc(
         label = "Show finger dots",
         desc = "Render a visible dot under each finger touching the trackpad surface.",
         key = PreferencesRepository.Keys.SHOW_FINGER_DOTS,

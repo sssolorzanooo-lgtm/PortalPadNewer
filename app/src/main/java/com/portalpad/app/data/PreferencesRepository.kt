@@ -242,6 +242,13 @@ class PreferencesRepository(private val context: Context) {
          * risk of accidental clicks from small adjustments.
          */
         val TAP_TO_CLICK = booleanPreferencesKey("tap_to_click")
+        /**
+         * When true (default): pressing or gesturing phone Home once while on
+         * Touchpad or Air Mouse triggers the configured external display Home
+         * action; pressing or gesturing Home twice within 1.5s exits silently
+         * to the phone.
+         */
+        val PHONE_HOME_EXTERNAL_HOME = booleanPreferencesKey("phone_home_external_home")
         val EDGE_SCROLL = booleanPreferencesKey("edge_scroll")
         // Which side the edge-scroll strip sits on: "left" or "right" (default).
         val EDGE_SCROLL_SIDE = stringPreferencesKey("edge_scroll_side")

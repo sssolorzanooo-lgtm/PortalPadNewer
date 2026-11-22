@@ -927,12 +927,16 @@ class TopWindowBarOverlay(
             )
         }
         runCatching {
+            app.phoneHomeExitCoordinator.markInternalNavigation()
             val opts = android.app.ActivityOptions.makeBasic()
                 .setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY)
             app.startActivity(
                 android.content.Intent(app, com.portalpad.app.ui.settings.WindowLimitActivity::class.java)
                     .putExtra("mode", "manage")
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    .addFlags(
+                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                            android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                    ),
                 opts.toBundle(),
             )
             Log.d(TAG, "top-bar: launched WindowLimitActivity (manage) on phone")
@@ -992,11 +996,15 @@ class TopWindowBarOverlay(
             )
         }
         runCatching {
+            app.phoneHomeExitCoordinator.markInternalNavigation()
             val opts = android.app.ActivityOptions.makeBasic()
                 .setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY)
             app.startActivity(
                 android.content.Intent(app, com.portalpad.app.ui.settings.ArrangeWindowsActivity::class.java)
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    .addFlags(
+                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                            android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                    ),
                 opts.toBundle(),
             )
             Log.d(TAG, "top-bar: launched ArrangeWindowsActivity on phone")
@@ -1015,11 +1023,15 @@ class TopWindowBarOverlay(
             )
         }
         runCatching {
+            app.phoneHomeExitCoordinator.markInternalNavigation()
             val opts = android.app.ActivityOptions.makeBasic()
                 .setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY)
             app.startActivity(
                 android.content.Intent(app, com.portalpad.app.ui.settings.MaximizeWindowActivity::class.java)
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    .addFlags(
+                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                            android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                    ),
                 opts.toBundle(),
             )
             Log.d(TAG, "top-bar: launched MaximizeWindowActivity on phone")
@@ -1038,11 +1050,15 @@ class TopWindowBarOverlay(
             )
         }
         runCatching {
+            app.phoneHomeExitCoordinator.markInternalNavigation()
             val opts = android.app.ActivityOptions.makeBasic()
                 .setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY)
             app.startActivity(
                 android.content.Intent(app, com.portalpad.app.ui.settings.MinimizeWindowActivity::class.java)
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    .addFlags(
+                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                            android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                    ),
                 opts.toBundle(),
             )
             Log.d(TAG, "top-bar: launched MinimizeWindowActivity on phone")

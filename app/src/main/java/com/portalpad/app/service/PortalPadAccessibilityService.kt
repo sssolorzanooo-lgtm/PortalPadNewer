@@ -1008,9 +1008,13 @@ class PortalPadAccessibilityService : AccessibilityService() {
         targetNode?.let { old -> if (old !== node) runCatching { old.recycle() } }
         targetNode = node
         runCatching {
+            PortalPadApp.instance.phoneHomeExitCoordinator.markInternalNavigation()
             startActivity(
                 android.content.Intent(applicationContext, KeyboardRelayActivity::class.java)
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .addFlags(
+                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                            android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                    )
                     .apply {
                         if (temporaryRelay) {
                             putExtra(KeyboardRelayActivity.EXTRA_TEMPORARY_RELAY, true)
@@ -1766,10 +1770,14 @@ class PortalPadAccessibilityService : AccessibilityService() {
         restoreExternalRouteOnClose: Boolean = false,
     ) {
         runCatching {
+            PortalPadApp.instance.phoneHomeExitCoordinator.markInternalNavigation()
             val opts = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(0).toBundle()
             startActivity(
                 android.content.Intent(applicationContext, KeyboardRelayActivity::class.java)
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .addFlags(
+                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                            android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                    )
                     .apply {
                         if (temporaryRelay) {
                             putExtra(KeyboardRelayActivity.EXTRA_TEMPORARY_RELAY, true)

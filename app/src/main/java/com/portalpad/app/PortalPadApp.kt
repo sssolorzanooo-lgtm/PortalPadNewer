@@ -620,6 +620,72 @@ class PortalPadApp : Application() {
     }
 
     /**
+     * Mirror of PHONE_HOME_EXTERNAL_HOME (Controls > Trackpad & Air Mouse).
+     * Read synchronously inside TrackpadActivity.onUserLeaveHint().
+     */
+    @Volatile var phoneHomeExternalHomeEnabled: Boolean = true
+
+    val phoneHomeExitCoordinator = com.portalpad.app.service.PhoneHomeExitCoordinator()
+
+    private val _bubbleReboundSuppressed = MutableStateFlow(false)
+    val bubbleReboundSuppressed: StateFlow<Boolean> = _bubbleReboundSuppressed.asStateFlow()
+
+    @Volatile private var homeReboundJob: kotlinx.coroutines.Job? = null
+
+    fun scheduleTrackpadReboundAfterPhoneHome(token: Long) {
+        homeReboundJob?.cancel()
+        _bubbleReboundSuppressed.value = true
+        homeReboundJob = appScope.launch {
+            val checkpointsMs = longArrayOf(75L, 175L, 340L)
+            var prev = 0L
+            for (target in checkpointsMs) {
+                kotlinx.coroutines.delay(target - prev)
+                prev = target
+                if (!phoneHomeExitCoordinator.shouldRefrontForToken(token)) return@launch
+                if (!TrackpadActivity.inputInterfaceForeground) {
+                    launchTrackpadReboundOnPhone()
+                }
+            }
+            val remainingSuppress =
+                (com.portalpad.app.service.PhoneHomeExitCoordinator.BUBBLE_SUPPRESS_WINDOW_MS - prev)
+                    .coerceAtLeast(0L)
+            if (remainingSuppress > 0L) kotlinx.coroutines.delay(remainingSuppress)
+            phoneHomeExitCoordinator.clearBubbleSuppression()
+            _bubbleReboundSuppressed.value = false
+        }
+    }
+
+    fun cancelTrackpadReboundAfterPhoneHome() {
+        homeReboundJob?.cancel()
+        homeReboundJob = null
+        phoneHomeExitCoordinator.clearBubbleSuppression()
+        _bubbleReboundSuppressed.value = false
+    }
+
+    private fun launchTrackpadReboundOnPhone() {
+        runCatching {
+            val intent = android.content.Intent(this, TrackpadActivity::class.java)
+                .addFlags(
+                    android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                        android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
+                )
+                .putExtra(TrackpadActivity.EXTRA_KEEP_CURRENT, true)
+            val opts = android.app.ActivityOptions.makeBasic().apply {
+                runCatching { launchDisplayId = android.view.Display.DEFAULT_DISPLAY }
+                if (android.os.Build.VERSION.SDK_INT >= 34) {
+                    runCatching {
+                        pendingIntentBackgroundActivityStartMode =
+                            android.app.ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED
+                    }
+                }
+            }
+            startActivity(intent, opts.toBundle())
+        }.onFailure { err ->
+            android.util.Log.w("PortalPadApp", "Trackpad rebound startActivity failed", err)
+        }
+    }
+
+    /**
      * elapsedRealtime of the user's last DELIBERATE exit from PortalPad (back
      * out, Home, recents); 0 while they are with us.
      *
@@ -780,6 +846,13 @@ class PortalPadApp : Application() {
                 // Must match the SettingsScreen toggle default.
                 default = true,
             ).collectLatest { autoDesktopOnConnectEnabled = it }
+        }
+
+        appScope.launch {
+            prefs.bool(
+                com.portalpad.app.data.PreferencesRepository.Keys.PHONE_HOME_EXTERNAL_HOME,
+                default = true,
+            ).collectLatest { phoneHomeExternalHomeEnabled = it }
         }
 
         // Mirror the on-display keyboard pref the same way. Read on the

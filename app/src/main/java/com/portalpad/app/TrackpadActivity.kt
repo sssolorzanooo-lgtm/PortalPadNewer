@@ -478,6 +478,7 @@ class TrackpadActivity : PinnedDensityActivity() {
                         return
                     }
                     Log.d(TAG, "BACK: task root — going up to the Start page")
+                    app.phoneHomeExitCoordinator.markInternalNavigation()
                     runCatching {
                         // Pinned to the phone for the same reason every other
                         // launch here is: a singleTask activity can otherwise
@@ -489,7 +490,8 @@ class TrackpadActivity : PinnedDensityActivity() {
                             android.content.Intent(this@TrackpadActivity, MainActivity::class.java)
                                 .addFlags(
                                     android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                                        android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                                        android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                                        android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
                                 ),
                             opts.toBundle(),
                         )
@@ -685,14 +687,63 @@ class TrackpadActivity : PinnedDensityActivity() {
         }.onFailure { Log.w(TAG, "refocusExternalDisplay failed", it) }
     }
 
-    /** Home / recents. Android raises this ONLY for user-driven departure, so
-     *  it is the right signal to suppress the MainActivity reassert. */
+    /** Home / recents. Intercepted on the 1st Home during Touchpad or Air Mouse
+     *  (when enabled) to fire external Home and rebound to the phone interface; a
+     *  2nd Home within 1.5s confirms exiting silently to the phone. */
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        runCatching { app.noteUserLeftDeliberately("onUserLeaveHint trackpad") }
+        if (isFinishing) {
+            app.phoneHomeExitCoordinator.reset()
+            app.cancelTrackpadReboundAfterPhoneHome()
+            runCatching { app.noteUserLeftDeliberately("onUserLeaveHint trackpad finishing") }
+            return
+        }
+        val hasExternal = app.physicalExternalDisplayId.value != null ||
+            app.externalDisplayId.value != null ||
+            injector.displayId != Display.DEFAULT_DISPLAY
+        when (
+            app.phoneHomeExitCoordinator.onUserLeaveHint(
+                featureEnabled = app.phoneHomeExternalHomeEnabled,
+                isTouchpadOrAirMouse = trackpadOrAirMouseMode,
+                hasExternalDisplay = hasExternal,
+            )
+        ) {
+            com.portalpad.app.service.PhoneHomeExitCoordinator.LeaveDecision.TRIGGER_EXTERNAL_HOME_AND_REFRONT -> {
+                Log.d(TAG, "HOME-INTERCEPT: 1st phone Home → external display Home + refront")
+                val token = app.phoneHomeExitCoordinator.activeReboundToken()
+                runCatching {
+                    val trigger = homeTrigger
+                    if (trigger != null) {
+                        trigger()
+                    } else {
+                        com.portalpad.app.service.PortalPadForegroundService.dismissSearchOverlay()
+                        com.portalpad.app.service.PortalPadForegroundService.goHomeWallpaper()
+                    }
+                }
+                if (app.phoneHomeExitCoordinator.shouldRefrontForToken(token)) {
+                    app.scheduleTrackpadReboundAfterPhoneHome(token)
+                }
+            }
+            com.portalpad.app.service.PhoneHomeExitCoordinator.LeaveDecision.EXIT_ON_DOUBLE_HOME -> {
+                Log.d(TAG, "HOME-INTERCEPT: 2nd phone Home within 1.5s → exiting silently to phone")
+                app.cancelTrackpadReboundAfterPhoneHome()
+                runCatching { app.noteUserLeftDeliberately("double-home trackpad") }
+            }
+            com.portalpad.app.service.PhoneHomeExitCoordinator.LeaveDecision.EXIT_NORMALLY -> {
+                app.cancelTrackpadReboundAfterPhoneHome()
+                runCatching { app.noteUserLeftDeliberately("onUserLeaveHint trackpad") }
+            }
+            com.portalpad.app.service.PhoneHomeExitCoordinator.LeaveDecision.IGNORE_INTERNAL_NAVIGATION -> {
+                Log.d(TAG, "HOME-INTERCEPT: ignored internal navigation leave")
+                app.cancelTrackpadReboundAfterPhoneHome()
+                runCatching { app.noteUserLeftDeliberately("onUserLeaveHint internal nav") }
+            }
+        }
     }
 
     override fun onDestroy() {
+        app.phoneHomeExitCoordinator.reset()
+        app.cancelTrackpadReboundAfterPhoneHome()
         runCatching {
             volumeSession?.isActive = false
             volumeSession?.release()
@@ -704,6 +755,9 @@ class TrackpadActivity : PinnedDensityActivity() {
     override fun onResume() {
         super.onResume()
         inputInterfaceForeground = true
+        if (app.phoneHomeExitCoordinator.consumePendingReboundOnResume()) {
+            app.cancelTrackpadReboundAfterPhoneHome()
+        }
         // Suppression gate input changed - the a11y service re-evaluates whether
         // the system keyboard should stay off the phone screen.
         runCatching {
@@ -829,6 +883,7 @@ class TrackpadActivity : PinnedDensityActivity() {
 
     override fun onPause() {
         super.onPause()
+        app.phoneHomeExitCoordinator.markPaused()
         inputInterfaceForeground = false
         // The floating keyboard is scoped to the trackpad/air-mouse/remote
         // interface (SH): leaving it - home, app switch, another PortalPad page -
@@ -858,6 +913,10 @@ class TrackpadActivity : PinnedDensityActivity() {
         @Volatile
         var inputInterfaceForeground: Boolean = false
             private set
+
+        @Volatile
+        var trackpadOrAirMouseMode: Boolean = true
+            internal set
         const val EXTRA_MODE = "mode"
         const val MODE_TRACKPAD = "trackpad"
         const val MODE_MEDIA = "media"
@@ -928,8 +987,13 @@ class TrackpadActivity : PinnedDensityActivity() {
  * display "swap" bug. Pinning to DEFAULT_DISPLAY keeps settings on the phone.
  */
 private fun launchSettingsOnPhone(ctx: android.content.Context, extraFlags: Int = 0) {
+    PortalPadApp.instance.phoneHomeExitCoordinator.markInternalNavigation()
     val intent = android.content.Intent(ctx, MainActivity::class.java)
-        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or extraFlags)
+        .addFlags(
+            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION or
+                extraFlags,
+        )
     val opts = android.app.ActivityOptions.makeBasic().apply {
         runCatching { launchDisplayId = android.view.Display.DEFAULT_DISPLAY }
     }
@@ -949,8 +1013,12 @@ private fun launchPhoneOnlyActivity(
     context: android.content.Context,
     intent: android.content.Intent,
 ): Boolean {
+    PortalPadApp.instance.phoneHomeExitCoordinator.markInternalNavigation()
     val phoneIntent = android.content.Intent(intent)
-        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        .addFlags(
+            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+        )
     val options = android.app.ActivityOptions.makeBasic()
         .setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY)
     return runCatching {
@@ -979,6 +1047,7 @@ private fun openTypingPageFromKeyboardButton(
     startOnAndroid: Boolean = false,
     restoreExternalRouteOnClose: Boolean = false,
 ) {
+    app.phoneHomeExitCoordinator.markInternalNavigation()
     // Null means the VD has not reported its id yet. The service then scans the
     // active non-phone display instead of mistaking the physical-display id for
     // the app-hosting virtual display.
@@ -995,7 +1064,10 @@ private fun openTypingPageFromKeyboardButton(
     }
     app.startActivity(
         android.content.Intent(app, KeyboardRelayActivity::class.java)
-            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            .addFlags(
+                android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                    android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+            )
             .apply {
                 if (temporaryRelay) {
                     putExtra(KeyboardRelayActivity.EXTRA_TEMPORARY_RELAY, true)
@@ -1478,6 +1550,7 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
         if (granted) {
             flashlight.toggle()
         } else {
+            app.phoneHomeExitCoordinator.markInternalNavigation(3000L)
             cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
         }
     }
@@ -1486,6 +1559,11 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
     // hidden on other tabs (e.g. media). Updated reactively.
     LaunchedEffect(isTrackpadMode) {
         app.injector.setCursorVisible(isTrackpadMode)
+        TrackpadActivity.trackpadOrAirMouseMode = isTrackpadMode
+        if (!isTrackpadMode) {
+            app.phoneHomeExitCoordinator.reset()
+            app.cancelTrackpadReboundAfterPhoneHome()
+        }
     }
 
     // Air mouse — active when the Air Mouse tab is selected.
@@ -2296,9 +2374,13 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                 // whichever phone-side option they last used, with no way to see
                 // which one they'd landed on.
                 showKeyboardMenu.value = false
+                app.phoneHomeExitCoordinator.markInternalNavigation()
                 app.startActivity(
                     android.content.Intent(app, MainActivity::class.java)
-                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                        .addFlags(
+                            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                                android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                        )
                         .putExtra(MainActivity.EXTRA_OPEN_CONTROLS, true),
                     android.app.ActivityOptions.makeBasic()
                         .setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY)
@@ -2342,7 +2424,10 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                     add(com.portalpad.app.ui.trackpad.PermissionIssue(
                         label = "Camera",
                         why = "QR / barcode scanner",
-                    ) { permFixCameraLauncher.launch(android.Manifest.permission.CAMERA) })
+                    ) {
+                        app.phoneHomeExitCoordinator.markInternalNavigation(3000L)
+                        permFixCameraLauncher.launch(android.Manifest.permission.CAMERA)
+                    })
                 }
                 val notifOk = runCatching {
                     android.provider.Settings.Secure.getString(
@@ -2354,11 +2439,15 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                         label = "Notification access",
                         why = "Expand Notifications on the external display",
                     ) {
+                        app.phoneHomeExitCoordinator.markInternalNavigation()
                         runCatching {
                             ctxForPerm.startActivity(
                                 android.content.Intent(
                                     android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS,
-                                ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                                ).addFlags(
+                                    android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                                        android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                                ),
                             )
                         }
                     })
@@ -2420,7 +2509,10 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                         ctxForPerm, android.Manifest.permission.CAMERA,
                     ) == android.content.pm.PackageManager.PERMISSION_GRANTED
                     if (hasCam) showQrScanner = true
-                    else qrCameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+                    else {
+                        app.phoneHomeExitCoordinator.markInternalNavigation(3000L)
+                        qrCameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+                    }
                 }
             },
             qrFeed = if (showQrScanner) {
@@ -2857,8 +2949,12 @@ internal fun launchEntry(entry: com.portalpad.app.data.AppEntry, injector: Input
             android.util.Log.w("LaunchEntry", "Could not parse shortcut URI for ${entry.label}")
             return
         }
+        PortalPadApp.instance.phoneHomeExitCoordinator.markInternalNavigation()
         val flagged = android.content.Intent(shortcutIntent)
-            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            .addFlags(
+                android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                    android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+            )
         runCatching { app.startActivity(flagged) }
             .recoverCatching { app.sendBroadcast(shortcutIntent) }
             .recoverCatching {

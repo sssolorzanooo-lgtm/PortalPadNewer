@@ -1623,6 +1623,7 @@ class WidgetOverlay(
             )
         }
         runCatching {
+            PortalPadApp.instance.phoneHomeExitCoordinator.markInternalNavigation()
             val opts = android.app.ActivityOptions.makeBasic()
                 .setLaunchDisplayId(0)
                 .toBundle()
@@ -1630,7 +1631,10 @@ class WidgetOverlay(
                 android.content.Intent(
                     PortalPadApp.instance,
                     com.portalpad.app.WidgetSearchActivity::class.java,
-                ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                ).addFlags(
+                    android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                        android.content.Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                ),
                 opts,
             )
         }.onFailure {
