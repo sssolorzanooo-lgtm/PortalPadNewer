@@ -70,3 +70,74 @@ class DockScrollHideTracker(
         }
     }
 }
+
+/**
+ * Pure state machine for manual dock hide via the Hide dock button.
+ *
+ * Once manually hidden, the dock stays hidden indefinitely until the cursor
+ * remains on the lower edge for strictly more than [dwellThresholdMs] (1.5s).
+ * Moving off the edge earlier resets the dwell timer and keeps the dock hidden.
+ */
+class DockManualHideController(
+    val dwellThresholdMs: Long = DEFAULT_REVEAL_DWELL_MS,
+) {
+    var isManuallyHidden: Boolean = false
+        private set
+
+    private var edgeDwellStartUptimeMs: Long? = null
+
+    fun hideManually() {
+        isManuallyHidden = true
+        edgeDwellStartUptimeMs = null
+    }
+
+    fun clearManualHide() {
+        isManuallyHidden = false
+        edgeDwellStartUptimeMs = null
+    }
+
+    /**
+     * Record whether the cursor is currently on the lower edge at [uptimeMs].
+     * Returns `true` when the cursor has dwelt continuously on the lower edge for
+     * strictly more than [dwellThresholdMs], clearing [isManuallyHidden] so the
+     * dock reappears.
+     */
+    fun onEdgeSample(atLowerEdge: Boolean, uptimeMs: Long): Boolean {
+        if (!isManuallyHidden) {
+            edgeDwellStartUptimeMs = null
+            return false
+        }
+        if (!atLowerEdge) {
+            edgeDwellStartUptimeMs = null
+            return false
+        }
+        val start = edgeDwellStartUptimeMs
+        if (start == null) {
+            edgeDwellStartUptimeMs = uptimeMs
+            return false
+        }
+        if (uptimeMs - start > dwellThresholdMs) {
+            isManuallyHidden = false
+            edgeDwellStartUptimeMs = null
+            return true
+        }
+        return false
+    }
+
+    companion object {
+        const val DEFAULT_REVEAL_DWELL_MS = 1_500L
+
+        fun isAtLowerEdge(
+            x: Float,
+            y: Float,
+            displayWidthPx: Int,
+            displayHeightPx: Int,
+            edgeThresholdPx: Int,
+        ): Boolean {
+            if (displayWidthPx <= 0 || displayHeightPx <= 0) return false
+            if (x < 0f || y < 0f) return false
+            val threshold = edgeThresholdPx.coerceIn(2, 200)
+            return x <= displayWidthPx.toFloat() && y >= displayHeightPx - threshold
+        }
+    }
+}

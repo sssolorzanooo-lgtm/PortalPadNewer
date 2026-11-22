@@ -168,7 +168,7 @@ class WallpaperActivity : ComponentActivity() {
                     app.injector.notifyPageScroll(v * 40f)
                 }
             }
-            if (!app.btMouse.running) {
+            if (!app.btMouse.running && app.btMouse.isUserEnabled) {
                 val dev = InputDevice.getDevice(ev.deviceId)
                 val isRealExternal = dev != null && !dev.isVirtual
                 if (isRealExternal) {

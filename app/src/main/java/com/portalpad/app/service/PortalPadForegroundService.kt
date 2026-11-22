@@ -1496,8 +1496,14 @@ class PortalPadForegroundService : Service() {
         }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int =
-        if (abortedRelaunch) START_NOT_STICKY else START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP_SERVICE) {
+            Log.i(TAG, "Stop service requested from foreground notification")
+            stop(this)
+            return START_NOT_STICKY
+        }
+        return if (abortedRelaunch) START_NOT_STICKY else START_STICKY
+    }
 
     /**
      * Recover a session stranded on the phone after a VirtualDisplay "flap" — the
@@ -4575,19 +4581,7 @@ class PortalPadForegroundService : Service() {
         }
     }
 
-    private fun buildNotification(): Notification {
-        val openIntent = android.app.PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            android.app.PendingIntent.FLAG_IMMUTABLE,
-        )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText("Watching for external display")
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentIntent(openIntent)
-            .setOngoing(true)
-            .build()
-    }
+    internal fun buildNotification(): Notification = buildWatchNotification(this)
 
     /** Show + manage the red "Tap here to exit" bands around a settings window we
      *  launched on the phone (display 0). Finds the launched task, sizes it to sit
@@ -5978,6 +5972,35 @@ class PortalPadForegroundService : Service() {
          *  flowing into the live mirror surface. */
         private const val OVERLAY_REASSERT_DELAY_MS = 600L
         private const val CHANNEL_ID = "portalpad_service"
+        const val ACTION_STOP_SERVICE = "com.portalpad.app.action.STOP_SERVICE"
+
+        internal fun buildWatchNotification(context: Context): Notification {
+            val openIntent = android.app.PendingIntent.getActivity(
+                context, 0, Intent(context, MainActivity::class.java),
+                android.app.PendingIntent.FLAG_IMMUTABLE,
+            )
+            val stopIntent = Intent(context, PortalPadForegroundService::class.java).apply {
+                action = ACTION_STOP_SERVICE
+            }
+            val stopPendingIntent = android.app.PendingIntent.getService(
+                context,
+                1,
+                stopIntent,
+                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            return NotificationCompat.Builder(context, CHANNEL_ID)
+                .setContentTitle(context.getString(R.string.app_name))
+                .setContentText("Watching for external display")
+                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .setContentIntent(openIntent)
+                .addAction(
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    context.getString(R.string.notif_action_stop_service),
+                    stopPendingIntent,
+                )
+                .setOngoing(true)
+                .build()
+        }
 
         fun start(context: Context) {
             // Deliberate start — clear the user-stopped marker BEFORE launching

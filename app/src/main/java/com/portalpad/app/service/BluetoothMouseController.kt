@@ -51,10 +51,7 @@ class BluetoothMouseController(private val injector: InputInjector) {
     @Volatile private var reverseScroll: Boolean = false
     /** User opted into the external mouse (persisted) — drives auto-resume. */
     @Volatile private var userEnabled: Boolean = false
-    /** Automatically capture connected USB/BT mice when external display is active (Default ON). */
-    @Volatile private var autoCaptureEnabled: Boolean = true
-    /** True if the user explicitly toggled Enable OFF during this session. */
-    @Volatile private var userExplicitlyDisabled: Boolean = false
+    val isUserEnabled: Boolean get() = userEnabled
     /** True when the active capture session exclusively grabbed evdev (EVIOCGRAB=OK). */
     @Volatile var isActivelyGrabbed: Boolean = false
         private set
@@ -106,14 +103,24 @@ class BluetoothMouseController(private val injector: InputInjector) {
                 .collect { mode ->
                     inputMode = mode
                     injector.setExternalMouseRemoteMode(mode == MODE_REMOTE)
-                    if (shouldAutoCaptureNow() && !running && injector.displayId != 0) {
+                    if (userEnabled && !running && injector.displayId != 0) {
                         maybeAutoArm(delayMs = 50L)
                     }
                 }
         }
         scope.launch {
+            var firstDeviceEmit = true
             PortalPadApp.instance.prefs.string(keys.EXT_MOUSE_DEVICE, "")
-                .collect { preferDevice = it }
+                .collect { name ->
+                    val changed = preferDevice != name
+                    preferDevice = name
+                    if (!firstDeviceEmit && changed && running && userEnabled &&
+                        injector.displayId != 0 && !learnOnlySession
+                    ) {
+                        enable(userGrab)
+                    }
+                    firstDeviceEmit = false
+                }
         }
         scope.launch {
             PortalPadApp.instance.prefs.int(keys.EXT_MOUSE_SWIPE_DISTANCE, 60)
@@ -124,28 +131,24 @@ class BluetoothMouseController(private val injector: InputInjector) {
                 .collect { reverseSeek = it }
         }
         scope.launch {
+            var firstEnabledEmit = true
             PortalPadApp.instance.prefs.bool(keys.EXT_MOUSE_ENABLED, false)
-                .collect {
-                    userEnabled = it
-                    // Opted out → stop any in-flight re-arm polling.
-                    if (!it && !autoCaptureEnabled) { pollJob?.cancel(); pollJob = null }
-                }
-        }
-        scope.launch {
-            PortalPadApp.instance.prefs.bool(keys.EXT_MOUSE_AUTO_CAPTURE, true)
-                .collect { auto ->
-                    autoCaptureEnabled = auto
-                    if (auto) {
-                        userExplicitlyDisabled = false
-                        if (!running && PortalPadApp.instance.injector.displayId != 0 &&
-                            hasExternalPointerConnected(PortalPadApp.instance)
-                        ) {
-                            maybeAutoArm(delayMs = 200L)
+                .collect { enabled ->
+                    val wasEnabled = userEnabled
+                    userEnabled = enabled
+                    if (!enabled) {
+                        pollJob?.cancel()
+                        pollJob = null
+                        if (!firstEnabledEmit && wasEnabled && running && !learnOnlySession) {
+                            stopCapture()
+                            injector.notifyTouchpadOrAirMouseActive()
                         }
-                    } else if (!userEnabled) {
-                        pollJob?.cancel(); pollJob = null
-                        if (running) stopCapture()
+                    } else if (!firstEnabledEmit && !wasEnabled && !running &&
+                        injector.displayId != 0 && !learnOnlySession
+                    ) {
+                        maybeAutoArm(delayMs = 50L)
                     }
+                    firstEnabledEmit = false
                 }
         }
         scope.launch {
@@ -519,32 +522,26 @@ class BluetoothMouseController(private val injector: InputInjector) {
 
     /** Called by InputDevice / BT listeners when physical pointer hardware attaches. */
     fun onPointerHardwareAttached() {
-        userExplicitlyDisabled = false
         if (running) {
             if (isActivelyGrabbed) injector.dismissSystemPointer()
             return
         }
-        if (!userEnabled && !autoCaptureEnabled) return
+        if (!userEnabled) return
         if (PortalPadApp.instance.injector.displayId == 0) return
         maybeAutoArm(delayMs = 50L)
     }
 
-    private fun shouldAutoCaptureNow(): Boolean =
-        userEnabled ||
-            (autoCaptureEnabled && !userExplicitlyDisabled && hasExternalPointerConnected(PortalPadApp.instance))
-
     fun maybeAutoArm(delayMs: Long = 0L) {
-        if (!userEnabled && (!autoCaptureEnabled || userExplicitlyDisabled)) return
+        if (!userEnabled) return
         val requestedAt = SystemClock.uptimeMillis()
         scope.launch {
             if (delayMs > 0L) kotlinx.coroutines.delay(delayMs)
-            if (running) return@launch
-            if (!shouldAutoCaptureNow()) return@launch
+            if (!userEnabled || running) return@launch
             val disp = PortalPadApp.instance.injector.displayId
             Log.i(
                 TAG,
                 "ARM-TIMING autoArm fired after ${SystemClock.uptimeMillis() - requestedAt}ms " +
-                    "(requested delay=${delayMs}ms) displayId=$disp userEnabled=$userEnabled auto=$autoCaptureEnabled",
+                    "(requested delay=${delayMs}ms) displayId=$disp userEnabled=$userEnabled",
             )
             if (disp == 0) {
                 Log.w(TAG, "ARM-TIMING GAVE UP: no external display yet, nothing will retry")
@@ -607,7 +604,7 @@ class BluetoothMouseController(private val injector: InputInjector) {
         inputMode = mode
         stopSeek()
         injector.setExternalMouseRemoteMode(mode == MODE_REMOTE)
-        if (!running && injector.displayId != 0 && shouldAutoCaptureNow()) {
+        if (!running && injector.displayId != 0 && userEnabled) {
             maybeAutoArm(delayMs = 50L)
         }
         Log.d(TAG, "input mode -> $mode (immediate)")
@@ -650,13 +647,10 @@ class BluetoothMouseController(private val injector: InputInjector) {
         }
         lastStatus = status
         Log.i(TAG, "enable(grab=$grab learnOnly=$learnOnly) → $status")
-        if (!learnOnly) userExplicitlyDisabled = false
         if (status.startsWith("ERR")) {
             isActivelyGrabbed = false
             runCatching { readEnd.close() }
-            if (!learnOnly && (userEnabled || (autoCaptureEnabled && !userExplicitlyDisabled && hasExternalPointerConnected(PortalPadApp.instance))) &&
-                status.contains("no-mouse-found")
-            ) {
+            if (!learnOnly && userEnabled && status.contains("no-mouse-found")) {
                 startRearmPoller("enable-miss")
             }
             return status
@@ -1036,7 +1030,7 @@ class BluetoothMouseController(private val injector: InputInjector) {
             // initiated (which records this session in stoppedSessionId) — and the
             // user is still opted in with an external display, poll to re-arm so
             // the mouse reconnects on wake without toggling anything.
-            if (endedByEof && stoppedSessionId != mySession && shouldAutoCaptureNow() &&
+            if (endedByEof && stoppedSessionId != mySession && userEnabled &&
                 PortalPadApp.instance.injector.displayId != 0
             ) {
                 startRearmPoller("device-gone")
@@ -1046,11 +1040,11 @@ class BluetoothMouseController(private val injector: InputInjector) {
 
     @Synchronized
     fun disable(explicit: Boolean = false) {
-        if (explicit) userExplicitlyDisabled = true
-        // User opt-out: stop polling too, then tear the capture down.
+        // User opt-out / service stop: stop polling, release capture, and restore white cursor.
         pollJob?.cancel()
         pollJob = null
         stopCapture()
+        injector.notifyTouchpadOrAirMouseActive()
     }
 
     /** Tear down the active capture without touching the re-arm poller. Records
@@ -1081,7 +1075,7 @@ class BluetoothMouseController(private val injector: InputInjector) {
      */
     private fun startRearmPoller(reason: String) {
         synchronized(this) {
-            if (!shouldAutoCaptureNow() || running) return
+            if (!userEnabled || running) return
             if (PortalPadApp.instance.injector.displayId == 0) return
             if (pollJob?.isActive == true) return
             pollJob = scope.launch {
@@ -1091,7 +1085,7 @@ class BluetoothMouseController(private val injector: InputInjector) {
                 val deadline = System.currentTimeMillis() + REARM_WINDOW_MS
                 while (System.currentTimeMillis() < deadline) {
                     kotlinx.coroutines.delay(REARM_INTERVAL_MS)
-                    if (!shouldAutoCaptureNow() || PortalPadApp.instance.injector.displayId == 0) {
+                    if (!userEnabled || PortalPadApp.instance.injector.displayId == 0) {
                         Log.i(TAG, "rearm poll stop (opted out / no display)")
                         return@launch
                     }

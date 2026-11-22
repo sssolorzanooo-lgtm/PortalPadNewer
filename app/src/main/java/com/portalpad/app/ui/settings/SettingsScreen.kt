@@ -6493,10 +6493,6 @@ private fun ExternalMouseControls() {
         .collectAsState(initial = app.btMouse.running)
     var mouseOn by remember { mutableStateOf(storedMouseOn) }
     LaunchedEffect(storedMouseOn) { mouseOn = storedMouseOn }
-    val storedAutoCapture by app.prefs.bool(keys.EXT_MOUSE_AUTO_CAPTURE, true)
-        .collectAsState(initial = true)
-    var autoCapture by remember { mutableStateOf(storedAutoCapture) }
-    LaunchedEffect(storedAutoCapture) { autoCapture = storedAutoCapture }
     val status by app.btMouse.lastStatusFlow.collectAsState()
     val searching by app.btMouse.searchingFlow.collectAsState()
     val armed by app.btMouse.runningFlow.collectAsState()
@@ -6576,7 +6572,7 @@ private fun ExternalMouseControls() {
     } else {
         ""
     }
-    val isConnected = (mouseOn || autoCapture) && status.startsWith("OK")
+    val isConnected = mouseOn && status.startsWith("OK")
 
     // ── Enable | Input mode, two columns ────────────────────────────────
     // The status used to hang under "Enable" as a subtitle, which forced this
@@ -6595,7 +6591,7 @@ private fun ExternalMouseControls() {
                 onCheckedChange = { on ->
                     mouseOn = on
                     scope.launch { app.prefs.setBool(keys.EXT_MOUSE_ENABLED, on) }
-                    if (on) app.btMouse.enable(true) else app.btMouse.disable(explicit = true)
+                    if (on) app.btMouse.enable(true) else app.btMouse.disable()
                 },
                 modifier = Modifier.testTag("ext_mouse_enable_switch"),
             )
@@ -6681,20 +6677,19 @@ private fun ExternalMouseControls() {
     // separates "what is happening" from the controls that choose it. Green when
     // grabbed, muted otherwise, so state reads at a glance.
     val statusText = when {
-        !mouseOn && !autoCapture -> "Off"
+        !mouseOn -> "Off"
         hasDisplay == null -> "Waiting for external display"
         status == "no-display" -> "Waiting for external display"
         searching -> "Searching for mouse\u2026 move it to wake it"
         status.startsWith("OK") -> {
             val who = if (connectedName.isBlank()) "" else " \u2014 $connectedName"
             when {
-                status.contains("grab=OK") -> "Connected$who (black mouse + white touchpad)"
+                status.contains("grab=OK") -> "Connected$who"
                 status.contains("grab=skipped") -> "Connected$who (shared, grab off)"
                 else -> "Connected$who \u2014 grab refused (" +
                     status.substringAfter("grab=", "").trim() + ")"
             }
         }
-        !mouseOn && autoCapture -> "Auto-capture ready (connect a mouse)"
         else -> status
     }
     val strip = if (isConnected) PhoneAccent.copy(alpha = 0.14f) else PhoneSurfaceElevated
@@ -6729,7 +6724,7 @@ private fun ExternalMouseControls() {
     // as one unit. It is the only pure action on the page, so it is the only
     // thing that goes inactive - and the label says which of the two reasons
     // applies rather than leaving a dimmed button with no explanation.
-    val canReconnect = (mouseOn || autoCapture) && hasDisplay != null
+    val canReconnect = mouseOn && hasDisplay != null
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
         androidx.compose.material3.TextButton(
             onClick = { if (canReconnect) app.btMouse.enable(true) },
@@ -6737,7 +6732,7 @@ private fun ExternalMouseControls() {
         ) {
             Text(
                 when {
-                    !mouseOn && !autoCapture -> "Reconnect (enable first)"
+                    !mouseOn -> "Reconnect (enable first)"
                     hasDisplay == null -> "Reconnect (needs external display)"
                     else -> "Reconnect"
                 }
@@ -6745,44 +6740,12 @@ private fun ExternalMouseControls() {
         }
     }
 
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(
-                "Auto-capture connected mice",
-                color = PhoneOnSurface,
-                style = MaterialTheme.typography.bodyLarge,
-            )
-            Text(
-                "Automatically capture USB/Bluetooth mice when an external display attaches (Default: On)",
-                color = PhoneOnSurfaceMuted,
-                style = MaterialTheme.typography.bodySmall,
-            )
-        }
-        Switch(
-            checked = autoCapture,
-            onCheckedChange = { on ->
-                autoCapture = on
-                scope.launch { app.prefs.setBool(keys.EXT_MOUSE_AUTO_CAPTURE, on) }
-            },
-            colors = SwitchDefaults.colors(
-                checkedTrackColor = PhonePrimary,
-                checkedThumbColor = PhonePrimaryBright,
-                uncheckedTrackColor = PhoneSurfaceElevated,
-                uncheckedThumbColor = PhoneOnSurfaceDim,
-            ),
-            modifier = Modifier.testTag("ext_mouse_auto_capture_switch"),
-        )
-    }
-
     // Mode description, directly under the status strip. It explains the dropdown
     // in the row above, so it belongs next to it rather than three controls later
     // — reading order beats keeping the mode-dependent block strictly contiguous.
     Text(
         if (inputMode == 0) {
-            "Routes mouse clicks, drag, scroll, and Back button directly to the external display. Displays a black cursor for the external mouse and seamlessly switches to white when you use the touchpad."
+            "Drives PortalPad's cursor on the external display with click, drag, scroll, and Back button support while keeping the touchpad active."
         } else {
             "Turns the device into a remote. Best for TV-style apps: it does " +
                 "nothing in apps that do not support arrow-key navigation."

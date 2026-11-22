@@ -81,6 +81,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -342,7 +343,8 @@ fun DockBar(
     // Track last interaction time for auto-hide
     var lastInteraction by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var visible by remember { mutableStateOf(true) }
-    var manualHideLockedUntilMs by remember { mutableLongStateOf(0L) }
+    val manualHideController = remember { DockManualHideController() }
+    var manualHidden by remember { mutableStateOf(false) }
     val scrollTracker = remember { DockScrollHideTracker() }
     var scrollHidden by remember { mutableStateOf(false) }
 
@@ -380,7 +382,7 @@ fun DockBar(
     // it — UNLESS the top-bar customization page is suppressing the dock, in which
     // case forcing it visible would make it pop up over the top-bar preview.
     LaunchedEffect(config.items, config.position) {
-        if (topBarPreviewing) return@LaunchedEffect
+        if (topBarPreviewing || manualHidden) return@LaunchedEffect
         lastInteraction = System.currentTimeMillis()
         scrollTracker.reveal()
         scrollHidden = false
@@ -403,7 +405,7 @@ fun DockBar(
             return@LaunchedEffect
         }
         app.injector.dockScrollSignal.collect { pageDeltaY ->
-            if (topBarPreviewing || dockCustomizing || reorderMode || removeMode ||
+            if (manualHidden || topBarPreviewing || dockCustomizing || reorderMode || removeMode ||
                 com.portalpad.app.PortalPadApp.instance.quickSettingsOpen.value
             ) {
                 return@collect
@@ -434,18 +436,8 @@ fun DockBar(
     // hoverable behind the widget layer's scrim.
     val widgetOverlayUp by com.portalpad.app.PortalPadApp.instance
         .widgetOverlayOpen.collectAsState()
-    LaunchedEffect(manualHideLockedUntilMs) {
-        val remaining = manualHideLockedUntilMs - android.os.SystemClock.uptimeMillis()
-        if (remaining > 0L) {
-            visible = false
-            delay(remaining)
-            if (android.os.SystemClock.uptimeMillis() >= manualHideLockedUntilMs) {
-                manualHideLockedUntilMs = 0L
-            }
-        }
-    }
 
-    LaunchedEffect(config.autoHideAfterSec, dockCustomizing, topBarPreviewing, pinnedToWallpaper, widgetOverlayUp, manualHideLockedUntilMs) {
+    LaunchedEffect(config.autoHideAfterSec, dockCustomizing, topBarPreviewing, pinnedToWallpaper, widgetOverlayUp, manualHidden) {
         // Widget overlay is MODAL: the dock is unreachable beneath its scrim, so
         // suppress it entirely — before every other early-exit, including the
         // "no auto-hide / pinned" paths that return without entering the loop.
@@ -453,8 +445,15 @@ fun DockBar(
             visible = false
             return@LaunchedEffect
         }
-        // Manual 5-second hide lockout: keep dock hidden until the lockout expires.
-        if (android.os.SystemClock.uptimeMillis() < manualHideLockedUntilMs) {
+        // Top-bar preview wins: dock stays hidden so the zone preview is clean.
+        if (topBarPreviewing) {
+            visible = false
+            return@LaunchedEffect
+        }
+        // Explicit Hide button click: stay hidden regardless of auto-hide timeout
+        // or wallpaper pin until the user holds the cursor on the lower edge
+        // for > 1.5 seconds.
+        if (manualHidden) {
             visible = false
             return@LaunchedEffect
         }
@@ -464,11 +463,6 @@ fun DockBar(
                 "pinned=$pinnedToWallpaper autoHide=${config.autoHideAfterSec} " +
                 "dockCust=$dockCustomizing topPrev=$topBarPreviewing",
         )
-        // Top-bar preview wins: dock stays hidden so the zone preview is clean.
-        if (topBarPreviewing) {
-            visible = false
-            return@LaunchedEffect
-        }
         // Dock customization, no auto-hide, OR pinned-to-wallpaper keeps it visible.
         if (dockCustomizing || config.autoHideAfterSec <= 0 || pinnedToWallpaper) {
             visible = true
@@ -476,7 +470,7 @@ fun DockBar(
         }
         while (true) {
             delay(500L)
-            if (android.os.SystemClock.uptimeMillis() < manualHideLockedUntilMs) {
+            if (manualHidden) {
                 visible = false
                 continue
             }
@@ -591,17 +585,48 @@ fun DockBar(
     val triggerBandFraction = config.revealZoneWidthPct.coerceIn(10, 100) / 100f
     var wasAtRevealEdge by remember { mutableStateOf(false) }
 
-    LaunchedEffect(cursorPos, config.position, externalDisplayId, edgeThresholdPx, triggerBandFraction) {
+    val atLowerEdge = remember(cursorPos, displayMetrics, edgeThresholdPx) {
+        val metrics = displayMetrics ?: return@remember false
+        DockManualHideController.isAtLowerEdge(
+            x = cursorPos.first,
+            y = cursorPos.second,
+            displayWidthPx = metrics.widthPixels,
+            displayHeightPx = metrics.heightPixels,
+            edgeThresholdPx = edgeThresholdPx,
+        )
+    }
+
+    // Manual Hide reveal: cursor must stay continuously on the lower edge for > 1.5s.
+    // Moving off the lower edge cancels this coroutine immediately, keeping the dock hidden.
+    LaunchedEffect(manualHidden, atLowerEdge, externalDisplayId, topBarPreviewing, widgetOverlayUp) {
+        if (!manualHidden || !atLowerEdge || externalDisplayId == null || topBarPreviewing || widgetOverlayUp) {
+            return@LaunchedEffect
+        }
+        delay(DockManualHideController.DEFAULT_REVEAL_DWELL_MS + 50L)
+        manualHideController.clearManualHide()
+        manualHidden = false
+        scrollTracker.reveal()
+        scrollHidden = false
+        visible = true
+        lastInteraction = System.currentTimeMillis()
+    }
+
+    LaunchedEffect(cursorPos, config.position, externalDisplayId, edgeThresholdPx, triggerBandFraction, manualHidden) {
+        if (manualHidden) {
+            wasAtRevealEdge = false
+            return@LaunchedEffect
+        }
         if (config.autoHideAfterSec <= 0) return@LaunchedEffect
         // While the top-bar page is previewing, the dock stays hidden — don't let
         // an edge-hover summon it back over the zone preview.
         if (topBarPreviewing) return@LaunchedEffect
-        // Respect the 5-second manual hide lockout so bottom-edge clicks never
-        // accidentally re-open the dock.
-        if (android.os.SystemClock.uptimeMillis() < manualHideLockedUntilMs) return@LaunchedEffect
         val id = externalDisplayId ?: return@LaunchedEffect
         val metrics = displayMetrics ?: return@LaunchedEffect
         val (x, y) = cursorPos
+        if (x < 0f || y < 0f) {
+            wasAtRevealEdge = false
+            return@LaunchedEffect
+        }
         // Centered band bounds along each axis.
         val wBand = metrics.widthPixels * triggerBandFraction
         val hBand = metrics.heightPixels * triggerBandFraction
@@ -1056,16 +1081,18 @@ fun DockBar(
                             SearchTile(
                                 iconSizeDp * 0.88f, Icons.Default.KeyboardArrowDown, "Hide dock",
                                 onClick = {
-                                    manualHideLockedUntilMs = android.os.SystemClock.uptimeMillis() + 5_000L
+                                    manualHideController.hideManually()
+                                    manualHidden = true
                                     visible = false
                                 },
                                 hoverCursorPx = cursorAxisInWindowPx,
                                 hoverOnBand = cursorOnControlsBand,
                                 hoverHorizontal = isHorizontalDock,
-                                tooltip = "Hide dock (5s)",
+                                tooltip = "Hide dock",
                                 tintColor = statusStrong,
                                 tooltipHolder = dockTooltip,
                                 tooltipId = "hide_dock",
+                                modifier = Modifier.testTag("hide_dock_button"),
                             )
                             SearchTile(
                                 iconSizeDp * 0.88f, Icons.Default.Home, "Home",
@@ -2007,6 +2034,7 @@ private fun SearchTile(
     tintColor: Color = Color.White,
     tooltipHolder: androidx.compose.runtime.MutableState<Pair<String, Float>?>? = null,
     tooltipId: String? = null,
+    modifier: androidx.compose.ui.Modifier = androidx.compose.ui.Modifier,
 ) {
     // Flat utility glyph — no plate or colored circle — so it sits in the dock
     // as a clean member of the icon row (matching the macOS-style flat app
@@ -2021,7 +2049,7 @@ private fun SearchTile(
     val hoverScale = 1f + 0.18f * hover
     val iconAlpha = 0.92f + 0.08f * hover
     Box(
-        Modifier
+        modifier
             .size(iconSizeDp.dp)
             .then(hoverMod)
             .graphicsLayer { scaleX = pulseScale * hoverScale; scaleY = pulseScale * hoverScale }

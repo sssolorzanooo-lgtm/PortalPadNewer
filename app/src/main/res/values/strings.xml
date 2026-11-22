@@ -54,6 +54,9 @@
     <string name="dock_icon_size">Dock icon size: %1$d dp</string>
     <string name="dock_visible_items">Dock visible items: %1$d</string>
 
+    <!-- Foreground service notification -->
+    <string name="notif_action_stop_service">Stop service</string>
+
     <!-- Accessibility service: auto-open the typing relay on field focus -->
     <string name="accessibility_service_description">Lets PortalPad notice when a text field on the glasses is tapped or focused — including when you tap something that opens one, like a search icon — and automatically open the phone typing page, so you can type into apps on the external display without reaching for the keyboard button. PortalPad watches only editable fields on the external display, and reads the focused field\'s current text solely to show it in the typing page for editing. It does not store or transmit your content.</string>
 </resources>

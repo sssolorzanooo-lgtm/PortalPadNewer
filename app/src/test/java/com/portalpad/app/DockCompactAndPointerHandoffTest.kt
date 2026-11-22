@@ -125,4 +125,86 @@ class DockCompactAndPointerHandoffTest {
         assertEquals(CursorStyle.WHITE, injector.cursorStyle.value)
         assertTrue(injector.cursorVisible.value)
     }
+
+    @Test
+    fun dockManualHide_staysHiddenUnlessCursorDwellsOnLowerEdgeOver1500Ms() {
+        val controller = com.portalpad.app.ui.dock.DockManualHideController()
+        assertFalse(controller.isManuallyHidden)
+
+        // Clicking Hide dock locks dock hidden.
+        controller.hideManually()
+        assertTrue(controller.isManuallyHidden)
+
+        // Away from lower edge: stays hidden indefinitely.
+        assertFalse(controller.onEdgeSample(atLowerEdge = false, uptimeMs = 1_000L))
+        assertFalse(controller.onEdgeSample(atLowerEdge = false, uptimeMs = 10_000L))
+        assertTrue(controller.isManuallyHidden)
+
+        // Brief touch on lower edge (<= 1.5s): stays hidden and resets when cursor leaves.
+        assertFalse(controller.onEdgeSample(atLowerEdge = true, uptimeMs = 11_000L))
+        assertFalse(controller.onEdgeSample(atLowerEdge = true, uptimeMs = 12_500L)) // exactly 1.5s
+        assertTrue(controller.isManuallyHidden)
+        assertFalse(controller.onEdgeSample(atLowerEdge = false, uptimeMs = 12_550L))
+        assertTrue(controller.isManuallyHidden)
+
+        // Re-entering edge restarts timer; only > 1.5s reveals dock.
+        assertFalse(controller.onEdgeSample(atLowerEdge = true, uptimeMs = 13_000L))
+        assertFalse(controller.onEdgeSample(atLowerEdge = true, uptimeMs = 14_500L)) // 1.5s exact
+        assertTrue(controller.isManuallyHidden)
+        assertTrue(controller.onEdgeSample(atLowerEdge = true, uptimeMs = 14_501L)) // > 1.5s
+        assertFalse(controller.isManuallyHidden)
+
+        // Lower-edge geometry check rejects off-screen sentinel and accepts bottom strip.
+        assertFalse(
+            com.portalpad.app.ui.dock.DockManualHideController.isAtLowerEdge(
+                x = -1_000_000f,
+                y = -1_000_000f,
+                displayWidthPx = 1920,
+                displayHeightPx = 1080,
+                edgeThresholdPx = 3,
+            ),
+        )
+        assertFalse(
+            com.portalpad.app.ui.dock.DockManualHideController.isAtLowerEdge(
+                x = 960f,
+                y = 1070f,
+                displayWidthPx = 1920,
+                displayHeightPx = 1080,
+                edgeThresholdPx = 3,
+            ),
+        )
+        assertTrue(
+            com.portalpad.app.ui.dock.DockManualHideController.isAtLowerEdge(
+                x = 960f,
+                y = 1079f,
+                displayWidthPx = 1920,
+                displayHeightPx = 1080,
+                edgeThresholdPx = 3,
+            ),
+        )
+    }
+
+    @Test
+    fun foregroundNotification_hasStopServiceActionForWaitingState() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val notification = com.portalpad.app.service.PortalPadForegroundService.buildWatchNotification(context)
+
+        assertEquals(
+            "Watching for external display",
+            notification.extras.getCharSequence(android.app.Notification.EXTRA_TEXT)?.toString(),
+        )
+        val actions = notification.actions
+        assertTrue("Expected Stop service notification action", !actions.isNullOrEmpty())
+        val stopAction = actions!!.first { it.title?.toString() == "Stop service" }
+        val shadowPi = org.robolectric.Shadows.shadowOf(stopAction.actionIntent)
+        val savedIntent = shadowPi.savedIntent
+        assertEquals(
+            com.portalpad.app.service.PortalPadForegroundService.ACTION_STOP_SERVICE,
+            savedIntent.action,
+        )
+        assertEquals(
+            com.portalpad.app.service.PortalPadForegroundService::class.java.name,
+            savedIntent.component?.className,
+        )
+    }
 }
