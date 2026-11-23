@@ -114,4 +114,37 @@ class PhoneHomeAndBubblePositionTest {
             coordinator.onUserLeaveHint(featureEnabled = true, isTouchpadOrAirMouse = true, hasExternalDisplay = true),
         )
     }
+
+    @Test
+    fun explicitHide_suppressesExternalHomeAndClearsOnResumeOrConsume() {
+        var now = 20_000L
+        val coordinator = PhoneHomeExitCoordinator(clockMs = { now })
+
+        // Clicking Hide marks explicit hide, cancelling any pending intercept window.
+        coordinator.markExplicitHide()
+        now += 50L
+        assertEquals(
+            LeaveDecision.IGNORE_INTERNAL_NAVIGATION,
+            coordinator.onUserLeaveHint(featureEnabled = true, isTouchpadOrAirMouse = true, hasExternalDisplay = true),
+        )
+        assertEquals(0L, coordinator.activeReboundToken())
+        assertFalse(coordinator.shouldSuppressBubble())
+
+        // Consuming or returning to TrackpadActivity (onResume) clears hide suppression immediately.
+        now += 50L
+        assertEquals(
+            LeaveDecision.TRIGGER_EXTERNAL_HOME_AND_REFRONT,
+            coordinator.onUserLeaveHint(featureEnabled = true, isTouchpadOrAirMouse = true, hasExternalDisplay = true),
+        )
+
+        // If Android did not fire onUserLeaveHint during moveTaskToBack, clearExplicitHideSuppression()
+        // on next onResume guarantees the next Home press still works immediately.
+        coordinator.markExplicitHide()
+        coordinator.clearExplicitHideSuppression()
+        now += 20L
+        assertEquals(
+            LeaveDecision.TRIGGER_EXTERNAL_HOME_AND_REFRONT,
+            coordinator.onUserLeaveHint(featureEnabled = true, isTouchpadOrAirMouse = true, hasExternalDisplay = true),
+        )
+    }
 }

@@ -6135,26 +6135,7 @@ private fun ButtonsTab(onPickHome: () -> Unit, onPickBack: () -> Unit, scrollToT
                 ExternalMouseControls()
             }
         }
-        SectionCard(title = "Three-Finger Swipes") {
-            Text(
-                "Assign an action to each 3-finger swipe direction on the trackpad / air-mouse surface. Swipe with three fingers to trigger it.",
-                color = PhoneOnSurfaceMuted,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            Spacer(Modifier.height(4.dp))
-            val gUp by prefs.gestureSwipeUp.collectAsState(initial = com.portalpad.app.data.GestureAction.NOTIF_CLOSE)
-            val gDown by prefs.gestureSwipeDown.collectAsState(initial = com.portalpad.app.data.GestureAction.NOTIF_OPEN)
-            val gLeft by prefs.gestureSwipeLeft.collectAsState(initial = com.portalpad.app.data.GestureAction.HOME)
-            val gRight by prefs.gestureSwipeRight.collectAsState(initial = com.portalpad.app.data.GestureAction.BACK)
-            val gUpApp by prefs.gestureAppUp.collectAsState(initial = null)
-            val gDownApp by prefs.gestureAppDown.collectAsState(initial = null)
-            val gLeftApp by prefs.gestureAppLeft.collectAsState(initial = null)
-            val gRightApp by prefs.gestureAppRight.collectAsState(initial = null)
-            GestureActionRow("Swipe up", gUp, "gesture_up", gUpApp) { scope.launch { prefs.setGestureSwipeUp(it) } }
-            GestureActionRow("Swipe down", gDown, "gesture_down", gDownApp) { scope.launch { prefs.setGestureSwipeDown(it) } }
-            GestureActionRow("Swipe left", gLeft, "gesture_left", gLeftApp) { scope.launch { prefs.setGestureSwipeLeft(it) } }
-            GestureActionRow("Swipe right", gRight, "gesture_right", gRightApp) { scope.launch { prefs.setGestureSwipeRight(it) } }
-        }
+        ThreeFingerGesturesSection()
         SectionCard(title = "Vibration") {
             Text(
                 "Haptic feedback strength for taps — trackpad clicks and on-screen buttons. Affects the whole app. Some devices only support on/off regardless of level.",
@@ -7866,27 +7847,8 @@ fun ControlsSubpage(
                 }
             }
 
-        // 3-finger swipe gestures — apply to both trackpad and air mouse.
-        SectionCard(title = "Three-Finger Swipes") {
-            Text(
-                "Assign an action to each 3-finger swipe direction. Swipe with three fingers on the surface to trigger it.",
-                color = PhoneOnSurfaceMuted,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            Spacer(Modifier.height(4.dp))
-            val gUp by prefs.gestureSwipeUp.collectAsState(initial = com.portalpad.app.data.GestureAction.NOTIF_CLOSE)
-            val gDown by prefs.gestureSwipeDown.collectAsState(initial = com.portalpad.app.data.GestureAction.NOTIF_OPEN)
-            val gLeft by prefs.gestureSwipeLeft.collectAsState(initial = com.portalpad.app.data.GestureAction.HOME)
-            val gRight by prefs.gestureSwipeRight.collectAsState(initial = com.portalpad.app.data.GestureAction.BACK)
-            val gUpApp by prefs.gestureAppUp.collectAsState(initial = null)
-            val gDownApp by prefs.gestureAppDown.collectAsState(initial = null)
-            val gLeftApp by prefs.gestureAppLeft.collectAsState(initial = null)
-            val gRightApp by prefs.gestureAppRight.collectAsState(initial = null)
-            GestureActionRow("Swipe up", gUp, "gesture_up", gUpApp) { scope.launch { prefs.setGestureSwipeUp(it) } }
-            GestureActionRow("Swipe down", gDown, "gesture_down", gDownApp) { scope.launch { prefs.setGestureSwipeDown(it) } }
-            GestureActionRow("Swipe left", gLeft, "gesture_left", gLeftApp) { scope.launch { prefs.setGestureSwipeLeft(it) } }
-            GestureActionRow("Swipe right", gRight, "gesture_right", gRightApp) { scope.launch { prefs.setGestureSwipeRight(it) } }
-        }
+        // 3-finger gestures (tap, circular seek, directional swipes) — apply to both trackpad and air mouse.
+        ThreeFingerGesturesSection()
 
         // Cursor settings apply to both modes (the cursor shows in both).
         SectionCard(title = "Cursor") {
@@ -12462,14 +12424,74 @@ private fun ActionRow(label: String, value: String, onClick: () -> Unit) {
     }
 }
 
+@Composable
+private fun ThreeFingerGesturesSection() {
+    val prefs = PortalPadApp.instance.prefs
+    val scope = rememberCoroutineScope()
+    SectionCard(title = "Three-Finger Gestures") {
+        ToggleRowWithDesc(
+            label = androidx.compose.ui.res.stringResource(
+                com.portalpad.app.R.string.pref_three_finger_tap_enabled_label,
+            ),
+            desc = androidx.compose.ui.res.stringResource(
+                com.portalpad.app.R.string.pref_three_finger_tap_enabled_desc,
+            ),
+            key = PreferencesRepository.Keys.GESTURE_THREE_FINGER_TAP_ENABLED,
+            default = true,
+            testTag = "three_finger_tap_toggle",
+        )
+        val gThreeTap by prefs.gestureThreeFingerTap.collectAsState(
+            initial = com.portalpad.app.data.GestureAction.PLAY_PAUSE_MEDIA,
+        )
+        val gThreeTapApp by prefs.gestureAppThreeFingerTap.collectAsState(initial = null)
+        GestureActionRow(
+            label = "Tap action",
+            selected = gThreeTap,
+            target = "gesture_three_finger_tap",
+            appEntry = gThreeTapApp,
+            testTag = "three_finger_tap_action",
+        ) { scope.launch { prefs.setGestureThreeFingerTap(it) } }
+        HorizontalDivider(
+            color = PhoneSurfaceElevated,
+            thickness = 1.dp,
+            modifier = Modifier.padding(vertical = 6.dp),
+        )
+        Text(
+            "Three-finger swipes",
+            color = PhoneOnSurface,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Text(
+            "Assign an action to each 3-finger swipe direction on the trackpad / air-mouse surface (defaults: Volume up/down and Seek/Rewind). Hold and slide further during Volume or Seek swipes to keep adjusting.",
+            color = PhoneOnSurfaceMuted,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Spacer(Modifier.height(4.dp))
+        val gUp by prefs.gestureSwipeUp.collectAsState(initial = com.portalpad.app.data.GestureAction.VOLUME_UP)
+        val gDown by prefs.gestureSwipeDown.collectAsState(initial = com.portalpad.app.data.GestureAction.VOLUME_DOWN)
+        val gLeft by prefs.gestureSwipeLeft.collectAsState(initial = com.portalpad.app.data.GestureAction.REWIND)
+        val gRight by prefs.gestureSwipeRight.collectAsState(initial = com.portalpad.app.data.GestureAction.SEEK_FORWARD)
+        val gUpApp by prefs.gestureAppUp.collectAsState(initial = null)
+        val gDownApp by prefs.gestureAppDown.collectAsState(initial = null)
+        val gLeftApp by prefs.gestureAppLeft.collectAsState(initial = null)
+        val gRightApp by prefs.gestureAppRight.collectAsState(initial = null)
+        GestureActionRow("Swipe up", gUp, "gesture_up", gUpApp) { scope.launch { prefs.setGestureSwipeUp(it) } }
+        GestureActionRow("Swipe down", gDown, "gesture_down", gDownApp) { scope.launch { prefs.setGestureSwipeDown(it) } }
+        GestureActionRow("Swipe left", gLeft, "gesture_left", gLeftApp) { scope.launch { prefs.setGestureSwipeLeft(it) } }
+        GestureActionRow("Swipe right", gRight, "gesture_right", gRightApp) { scope.launch { prefs.setGestureSwipeRight(it) } }
+    }
+}
+
 /** One labeled row with a dropdown to pick the [GestureAction] for a swipe
- *  direction. */
+ *  direction or multi-finger tap. */
 @Composable
 private fun GestureActionRow(
     label: String,
     selected: com.portalpad.app.data.GestureAction,
     target: String,
     appEntry: com.portalpad.app.data.AppEntry? = null,
+    testTag: String? = null,
     onPick: (com.portalpad.app.data.GestureAction) -> Unit,
 ) {
     val ctx = LocalContext.current
@@ -12494,6 +12516,7 @@ private fun GestureActionRow(
             Row(
                 Modifier
                     .fillMaxWidth()
+                    .then(if (testTag != null) Modifier.testTag(testTag) else Modifier)
                     .clip(RoundedCornerShape(10.dp))
                     .background(PhoneSurfaceElevated)
                     .border(1.dp, PhonePrimaryDim, RoundedCornerShape(10.dp))
@@ -12575,6 +12598,7 @@ private fun GestureActionRow(
                                     "gesture_down" -> prefs.setGestureAppDown(entry)
                                     "gesture_left" -> prefs.setGestureAppLeft(entry)
                                     "gesture_right" -> prefs.setGestureAppRight(entry)
+                                    "gesture_three_finger_tap" -> prefs.setGestureAppThreeFingerTap(entry)
                                 }
                             }
                             onPick(com.portalpad.app.data.GestureAction.LAUNCH_APP)

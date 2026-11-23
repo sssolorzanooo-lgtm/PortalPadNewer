@@ -102,14 +102,19 @@ fun GestureGuideDialog(
         default = "right",
     ).collectAsState(initial = "right").value
     val prefs = com.portalpad.app.PortalPadApp.instance.prefs
-    val gUp = prefs.gestureSwipeUp.collectAsState(initial = com.portalpad.app.data.GestureAction.NOTIF_CLOSE).value
-    val gDown = prefs.gestureSwipeDown.collectAsState(initial = com.portalpad.app.data.GestureAction.NOTIF_OPEN).value
-    val gLeft = prefs.gestureSwipeLeft.collectAsState(initial = com.portalpad.app.data.GestureAction.HOME).value
-    val gRight = prefs.gestureSwipeRight.collectAsState(initial = com.portalpad.app.data.GestureAction.BACK).value
+    val gUp = prefs.gestureSwipeUp.collectAsState(initial = com.portalpad.app.data.GestureAction.VOLUME_UP).value
+    val gDown = prefs.gestureSwipeDown.collectAsState(initial = com.portalpad.app.data.GestureAction.VOLUME_DOWN).value
+    val gLeft = prefs.gestureSwipeLeft.collectAsState(initial = com.portalpad.app.data.GestureAction.REWIND).value
+    val gRight = prefs.gestureSwipeRight.collectAsState(initial = com.portalpad.app.data.GestureAction.SEEK_FORWARD).value
+    val gThreeTapEnabled = prefs.gestureThreeFingerTapEnabled.collectAsState(initial = true).value
+    val gThreeTap = prefs.gestureThreeFingerTap.collectAsState(
+        initial = com.portalpad.app.data.GestureAction.PLAY_PAUSE_MEDIA,
+    ).value
     val gUpApp = prefs.gestureAppUp.collectAsState(initial = null).value
     val gDownApp = prefs.gestureAppDown.collectAsState(initial = null).value
     val gLeftApp = prefs.gestureAppLeft.collectAsState(initial = null).value
     val gRightApp = prefs.gestureAppRight.collectAsState(initial = null).value
+    val gThreeTapApp = prefs.gestureAppThreeFingerTap.collectAsState(initial = null).value
     fun gLabel(a: com.portalpad.app.data.GestureAction, app: com.portalpad.app.data.AppEntry?): String =
         if (a == com.portalpad.app.data.GestureAction.LAUNCH_APP && !app?.label.isNullOrBlank()) app!!.label else a.short
     val oneFingerRows = buildList {
@@ -133,6 +138,9 @@ fun GestureGuideDialog(
         GestureRow("Pinch", "zoom"),
     )
     val threeFingerRows = buildList {
+        if (gThreeTapEnabled && gThreeTap != com.portalpad.app.data.GestureAction.NONE) {
+            add(GestureRow("Tap", gLabel(gThreeTap, gThreeTapApp)))
+        }
         // Reflect the user-configured swipe actions. Hidden if set to None.
         if (gRight != com.portalpad.app.data.GestureAction.NONE) {
             add(GestureRow("Swipe right", gLabel(gRight, gRightApp)))

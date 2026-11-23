@@ -32,16 +32,23 @@ import com.portalpad.app.ui.theme.PhoneSurfaceElevated
 import kotlin.math.abs
 import kotlin.math.hypot
 
+data class ThreeFingerSwipeAxes(
+    val up: com.portalpad.app.data.GestureAction = com.portalpad.app.data.GestureAction.VOLUME_UP,
+    val down: com.portalpad.app.data.GestureAction = com.portalpad.app.data.GestureAction.VOLUME_DOWN,
+    val left: com.portalpad.app.data.GestureAction = com.portalpad.app.data.GestureAction.REWIND,
+    val right: com.portalpad.app.data.GestureAction = com.portalpad.app.data.GestureAction.SEEK_FORWARD,
+)
+
 /**
  * Smooth trackpad surface — no grid, no look-alike pattern. Visual:
  *  - rounded-rect inset card with a soft radial gradient (center brighter)
- *  - thin violet border at low alpha so the trackpad area reads as a discrete region
+ *  - thin border at low alpha so the trackpad area reads as a discrete region
  *  - per-touch finger dot with an outward halo that fades on release
  *
  * Gestures (wired through [GestureSink]):
- *  - 1 finger: move + tap (single click)  +  double-tap, long-press
- *  - 2 fingers: scroll, pinch  + 2-finger TAP → secondary click (right-click)
- *  - 3 fingers: swipe → back / recents / home depending on direction
+ *  - 1 finger: move + tap (single click) + double-tap, long-press
+ *  - 2 fingers: scroll, pinch + 2-finger TAP → secondary click (right-click)
+ *  - 3 fingers: tap → configured action (Play/Pause default), swipe → configured actions (incl. Volume/Seek)
  */
 @Composable
 fun TrackpadSurface(
@@ -57,6 +64,8 @@ fun TrackpadSurface(
     // Velocity-based pointer-acceleration strength. 1.0 = tuned default,
     // 0 = off (constant speed). Scales the base accel constant in the recognizer.
     pointerAccel: Float = 1.0f,
+    threeFingerTapEnabled: Boolean = true,
+    threeFingerSwipeAxes: ThreeFingerSwipeAxes = ThreeFingerSwipeAxes(),
 ) {
     val activeTouches = remember { mutableStateMapOf<Long, FingerTouch>() }
     val context = LocalContext.current
@@ -81,6 +90,8 @@ fun TrackpadSurface(
     val tapToClickState = rememberUpdatedState(tapToClick)
     val edgeStripSideState = rememberUpdatedState(edgeStripSide)
     val pointerAccelState = rememberUpdatedState(pointerAccel)
+    val threeFingerTapState = rememberUpdatedState(threeFingerTapEnabled)
+    val threeFingerSwipeAxesState = rememberUpdatedState(threeFingerSwipeAxes)
     val density = LocalDensity.current
     // Dead-zone band width (px) on the strip side where taps won't click.
     // Strip is 44dp + 8dp gap; a stray tap that misses the strip lands just
@@ -154,11 +165,13 @@ fun TrackpadSurface(
                             }
                         }
                         val recognizer = GestureRecognizer(
-                            sink,
-                            tapEnabledRef,
-                            deadZoneRef,
-                            { pointerAccelState.value },
+                            sink = sink,
+                            tapEnabled = tapEnabledRef,
+                            deadZone = deadZoneRef,
+                            pointerAccel = { pointerAccelState.value },
                             densityScale = density.density / 2.8125f,
+                            threeFingerTapEnabled = { threeFingerTapState.value },
+                            threeFingerSwipeAxes = { threeFingerSwipeAxesState.value },
                         )
                         while (true) {
                             val event = awaitPointerEvent(PointerEventPass.Main)
@@ -204,6 +217,12 @@ fun TrackpadSurface(
                     }
                 },
         ) {
+            DisposableEffect(Unit) {
+                onDispose {
+                    sink.onThreeFingerVolumeSwipeEnd(autoFadeAfterFlick = false)
+                    sink.onThreeFingerSeekSwipeEnd(0, commit = false, autoFadeAfterFlick = false)
+                }
+            }
             if (showFingerDots) {
                 Canvas(Modifier.fillMaxSize()) {
                     activeTouches.values.forEach { t ->
@@ -358,11 +377,11 @@ fun ScrollBar(
 
 /** Lazy-eval'd boolean so the recognizer can read pref state at decision time
  *  without re-keying pointerInput on every pref change. */
-private class TapEnabledRef(val get: () -> Boolean)
+internal class TapEnabledRef(val get: () -> Boolean)
 
 /** Predicate: was this press (at pressX, given surface width) in the edge-strip
  *  dead-zone where clicks should be suppressed? */
-private class TapDeadZoneRef(val inZone: (pressX: Float, surfaceWidth: Float) -> Boolean)
+internal class TapDeadZoneRef(val inZone: (pressX: Float, surfaceWidth: Float) -> Boolean)
 
 interface GestureSink {
     fun onMove(dx: Float, dy: Float)
@@ -374,6 +393,13 @@ interface GestureSink {
     fun onScroll(dx: Float, dy: Float)
     fun onPinch(scale: Float)
     fun onThreeFingerSwipe(dx: Float, dy: Float)
+    fun onThreeFingerTap() {}
+    fun onThreeFingerVolumeSwipeStart() {}
+    fun onThreeFingerVolumeSwipeStep(up: Boolean) {}
+    fun onThreeFingerVolumeSwipeEnd(autoFadeAfterFlick: Boolean) {}
+    fun onThreeFingerSeekSwipeStart() {}
+    fun onThreeFingerSeekSwipeUpdate(totalSeconds: Int, forward: Boolean) {}
+    fun onThreeFingerSeekSwipeEnd(totalSeconds: Int, commit: Boolean, autoFadeAfterFlick: Boolean) {}
     // Double-tap-drag: press the primary mouse button and hold it while moving,
     // so Android performs a real drag (e.g. moving a freeform window) instead of
     // a hover. onDragStart fires once when the drag begins, onDragMove per frame,
@@ -411,9 +437,9 @@ interface GestureSink {
 
 /**
  * Stream recognizer. Tracks pointer count + per-pointer state to disambiguate
- * single tap, double-tap, two-finger scroll/pinch/tap, and three-finger swipes.
+ * single tap, double-tap, two-finger scroll/pinch/tap/circle, and three-finger tap/swipes/circle.
  */
-private class GestureRecognizer(
+internal class GestureRecognizer(
     private val sink: GestureSink,
     private val tapEnabled: TapEnabledRef,
     private val deadZone: TapDeadZoneRef? = null,
@@ -428,6 +454,10 @@ private class GestureRecognizer(
     // transfer; scaling by density/2.8125 makes the gates the same PHYSICAL
     // size everywhere. Time thresholds are untouched.
     private val densityScale: Float = 1f,
+    private val threeFingerTapEnabled: () -> Boolean = { true },
+    private val threeFingerSwipeAxes: () -> ThreeFingerSwipeAxes = { ThreeFingerSwipeAxes() },
+    private val clockMs: () -> Long = { System.currentTimeMillis() },
+    private val scheduleHoldCallback: ((delayMs: Long, block: Runnable) -> Unit)? = null,
 ) {
     // Latest surface width (px), updated each event, for dead-zone evaluation.
     private var surfaceWidth: Float = 0f
@@ -490,13 +520,28 @@ private class GestureRecognizer(
     // Latches once a 2-finger gesture is clearly a pinch (scale moved past a
     // threshold), so it zooms instead of also scrolling.
     private var pinchLatched = false
+    private var suppressTwoFingerTapAfterThree = false
 
     // 3-finger state
+    private enum class ThreeFingerSwipeScrubMode { NONE, VOLUME, SEEK }
     private var threeFingerStart: Offset = Offset.Zero
+    private var threeFingerStartTime: Long = 0
+    private var threeFingerStartIds: List<Long> = emptyList()
+    private var threeFingerStartPositions: List<Offset>? = null
+    private var threeFingerMoved = false
+    private var threeFingerTapSuppressedByPriorMove = false
     // Latch so one continuous 3-finger swipe fires ONCE (until fingers lift).
-    // Without this, a held swipe re-fires every 60px and a tiny reverse drift
-    // sends the opposite action (e.g. opens then immediately closes the panel).
+    // Without this, a held swipe re-fires every threshold step.
     private var threeFingerFired = false
+    private var swipeScrubMode = ThreeFingerSwipeScrubMode.NONE
+    private var swipeAxisHorizontal = false
+    private var swipeLastStepCoord = 0f
+    private var swipeVolPositiveDirRaises = false
+    private var swipeSeekPositiveDirForwards = true
+    private var swipeSeekMinSeconds = -60
+    private var swipeSeekMaxSeconds = 60
+    private var swipeSeekSeconds = 0
+    private var swipeStartedAtMs = 0L
 
     private var lastPointerCount = 0
 
@@ -510,12 +555,10 @@ private class GestureRecognizer(
     //   Slop 5px: a finger that travels more than ~5px from where it landed
     //     can never tap-click on lift. Tight enough that small adjustment
     //     motions visibly drag the cursor before they could accidentally tap.
-    //   Tap window 0–199ms (no slop) = left click.
-    //   Touch-and-hold select 250ms+ (still) — the 200–249ms DEAD ZONE between
-    //     them is intentional: a slightly slow tap (~200–220ms is common for
-    //     deliberate tappers) must fall into safe nothing, NOT pop a context
-    //     menu. (This buffer was lost in a tuning pass when the hold threshold
-    //     drifted to 200ms, making slow taps fire select — restored.)
+    //   Tap window 0–249ms (no slop) = left click.
+    //   Touch-and-hold select 350ms+ (still) — the 250–349ms DEAD ZONE between
+    //     them gives deliberate clickers extra headroom without accidentally
+    //     triggering a long press or context menu.
     //   postDragSuppressMs 220: after a REAL drag (button-held), the next tap
     //     within this window is suppressed. Eliminates the "drag → lift →
     //     finger re-touches to continue positioning" accidental-click class.
@@ -535,8 +578,8 @@ private class GestureRecognizer(
     // observed), but a genuine cursor-repositioning slide travels much farther.
     // 40px cleanly separates "still hold with jitter" from "actually sliding".
     private val longPressSlopPx = 40f * densityScale
-    private val tapMaxDurationMs = 200L
-    private val longPressThresholdMs = 250L
+    private val tapMaxDurationMs = 250L
+    private val longPressThresholdMs = 350L
     // On a resize edge, a much shorter hold engages the resize so the border pops
     // almost immediately on a deliberate press-hold — but still long enough that a
     // quick press-and-slide near an edge stays a plain cursor move, not a resize.
@@ -562,6 +605,11 @@ private class GestureRecognizer(
     private val postDragSuppressMs = 220L
     private val twoFingerTapTimeoutMs = 220L
     private val twoFingerSlopPx = 24f * densityScale
+    private val threeFingerTapTimeoutMs = 240L
+    private val threeFingerTapSlopPx = 12f * densityScale
+    private val threeFingerSwipeThresholdPx = maxOf(48f, 24f * densityScale)
+    private val threeFingerVolumeStepPx = 28f * densityScale
+    private val threeFingerSeekStepPx = 42f * densityScale
     // Minimum per-frame movement to actually emit onMove. Avoids sending a
     // flood of zero-motion hover events when the finger is steady.
     private val motionEpsilonPx = 0.5f * densityScale
@@ -596,9 +644,11 @@ private class GestureRecognizer(
         // simply never recognized (only 2-finger tap, which has its own transition,
         // would work). That was the long-standing "left click on trackpad doesn't
         // work" bug.
-        if (lastPointerCount == 1 && count == 0) {
+        if (lastPointerCount == 1 && count != 1) {
             endHoldStream()
-            val now = System.currentTimeMillis()
+        }
+        if (lastPointerCount == 1 && count == 0) {
+            val now = clockMs()
             val held = now - pressedAt
             // If a double-tap-drag was active, end it (release the button) and
             // skip all tap/click classification — a drag lift is never a click.
@@ -676,32 +726,95 @@ private class GestureRecognizer(
             didMoveBeyondSlop = false
         }
 
-        // Transition: 2-finger gesture ended → if it was a quick no-move tap, fire right-click.
-        if (lastPointerCount == 2 && count < 2 && twoFingerStartPositions != null) {
-            val elapsed = System.currentTimeMillis() - twoFingerStartTime
-            if (!twoFingerMoved && elapsed < twoFingerTapTimeoutMs) {
-                sink.onSecondaryTap()
+        val priorOneFingerMoved = lastPointerCount == 1 && (didMoveBeyondSlop || dragActive || movedEarly)
+        val priorTwoFingerMoved = lastPointerCount == 2 && twoFingerMoved
+
+        // Transition: 2-finger gesture ended (dropped below 2 or added a 3rd finger).
+        if (lastPointerCount == 2 && count != 2 && twoFingerStartPositions != null) {
+            if (count < 2) {
+                val elapsed = clockMs() - twoFingerStartTime
+                if (!suppressTwoFingerTapAfterThree && !twoFingerMoved && elapsed < twoFingerTapTimeoutMs) {
+                    sink.onSecondaryTap()
+                } else if (pinchLatched) {
+                    sink.onPinchEnd()
+                }
             } else if (pinchLatched) {
                 sink.onPinchEnd()
             }
             resetTwoFingerState()
         }
+        // Transition: 3-finger gesture ended (finish scrub volume/seek, or fire 3-finger tap, or reset swipe).
         if (lastPointerCount == 3 && count < 3) {
-            threeFingerStart = Offset.Zero
-            threeFingerFired = false
+            suppressTwoFingerTapAfterThree = true
+            val now = clockMs()
+            val elapsed = now - threeFingerStartTime
+            // Check lift-frame positions too so a quick swipe that finishes on the exact
+            // frame a finger lifts never falls through as an accidental 3-finger tap.
+            if (!threeFingerMoved && threeFingerStartPositions != null) {
+                val startPts = threeFingerStartPositions!!
+                var sumX = 0f
+                var sumY = 0f
+                var matched = 0
+                for (i in threeFingerStartIds.indices) {
+                    val c = changes.firstOrNull { it.id.value == threeFingerStartIds[i] } ?: continue
+                    if (i < startPts.size &&
+                        hypot(c.position.x - startPts[i].x, c.position.y - startPts[i].y) > threeFingerTapSlopPx
+                    ) {
+                        threeFingerMoved = true
+                        break
+                    }
+                    sumX += c.position.x
+                    sumY += c.position.y
+                    matched++
+                }
+                if (!threeFingerMoved && matched > 0 &&
+                    hypot((sumX / matched) - threeFingerStart.x, (sumY / matched) - threeFingerStart.y) > threeFingerTapSlopPx
+                ) {
+                    threeFingerMoved = true
+                }
+            }
+            val quickFlick = (now - swipeStartedAtMs) < 380L
+            when (swipeScrubMode) {
+                ThreeFingerSwipeScrubMode.VOLUME -> {
+                    sink.onThreeFingerVolumeSwipeEnd(autoFadeAfterFlick = quickFlick)
+                }
+                ThreeFingerSwipeScrubMode.SEEK -> {
+                    sink.onThreeFingerSeekSwipeEnd(
+                        totalSeconds = swipeSeekSeconds,
+                        commit = swipeSeekSeconds != 0,
+                        autoFadeAfterFlick = quickFlick,
+                    )
+                }
+                ThreeFingerSwipeScrubMode.NONE -> {
+                    if (threeFingerTapEnabled() &&
+                        threeFingerStartPositions != null &&
+                        !threeFingerTapSuppressedByPriorMove &&
+                        !threeFingerMoved &&
+                        !threeFingerFired &&
+                        elapsed < threeFingerTapTimeoutMs
+                    ) {
+                        sink.onThreeFingerTap()
+                    }
+                }
+            }
+            resetThreeFingerState()
+        }
+
+        if (count == 0) {
+            suppressTwoFingerTapAfterThree = false
         }
 
         when (count) {
             1 -> handleOne(pressed[0])
             2 -> handleTwo(pressed)
-            3 -> handleThree(pressed)
+            3 -> handleThree(pressed, priorMoved = priorOneFingerMoved || priorTwoFingerMoved)
             else -> { /* idle */ }
         }
         lastPointerCount = count
     }
 
     private fun handleOne(p: PointerInputChange) {
-        val now = System.currentTimeMillis()
+        val now = clockMs()
         // Coming DOWN from a 2-/3-finger gesture to a single remaining finger:
         // that finger was already pressed and has been moving as part of the
         // multi-touch gesture, so lastSingleX/Y still hold a stale anchor from
@@ -737,7 +850,7 @@ private class GestureRecognizer(
             // finger is still down and hasn't slid.
             holdToken++
             val tok = holdToken
-            holdHandler.postDelayed({
+            val holdRunnable = Runnable {
                 val stationary = kotlin.math.hypot(
                     lastSingleX - pressStartX,
                     lastSingleY - pressStartY,
@@ -748,7 +861,13 @@ private class GestureRecognizer(
                     holdStreamActive = true
                     sink.onLongPressStart()
                 }
-            }, longPressThresholdMs + 30)
+            }
+            val delayMs = longPressThresholdMs + 30
+            if (scheduleHoldCallback != null) {
+                scheduleHoldCallback.invoke(delayMs, holdRunnable)
+            } else {
+                holdHandler.postDelayed(holdRunnable, delayMs)
+            }
             // On a resize edge OR caption strip the drag is unambiguous — a brief
             // hold engages it below (border shows / window sticks) with no 24px move.
             pressOnEdge = sink.isOnResizeEdge()
@@ -873,14 +992,16 @@ private class GestureRecognizer(
     }
 
     private fun handleTwo(ps: List<PointerInputChange>) {
-        val a = ps[0].position; val b = ps[1].position
+        val sorted = if (ps[0].id.value <= ps[1].id.value) ps else listOf(ps[1], ps[0])
+        val a = sorted[0].position
+        val b = sorted[1].position
         val dist = hypot(a.x - b.x, a.y - b.y)
-        val centroid = Offset((a.x + b.x) / 2, (a.y + b.y) / 2)
+        val centroid = Offset((a.x + b.x) / 2f, (a.y + b.y) / 2f)
 
         if (twoFingerStartPositions == null) {
             twoFingerStartPositions = a to b
-            twoFingerStartTime = System.currentTimeMillis()
-            twoFingerStartDist = dist
+            twoFingerStartTime = clockMs()
+            twoFingerStartDist = dist.coerceAtLeast(1f)
             twoFingerLastCentroid = centroid
             twoFingerMoved = false
             return
@@ -910,17 +1031,138 @@ private class GestureRecognizer(
         twoFingerLastCentroid = centroid
     }
 
-    private fun handleThree(ps: List<PointerInputChange>) {
+    private fun handleThree(ps: List<PointerInputChange>, priorMoved: Boolean) {
+        val sorted = ps.sortedBy { it.id.value }
+        val points = sorted.map { it.position }
         val centroid = Offset(
-            ps.map { it.position.x }.average().toFloat(),
-            ps.map { it.position.y }.average().toFloat(),
+            points.map { it.x }.average().toFloat(),
+            points.map { it.y }.average().toFloat(),
         )
-        if (threeFingerStart == Offset.Zero) threeFingerStart = centroid
+        if (threeFingerStartPositions == null) {
+            threeFingerStart = centroid
+            threeFingerStartTime = clockMs()
+            threeFingerStartIds = sorted.map { it.id.value }
+            threeFingerStartPositions = points
+            threeFingerMoved = priorMoved
+            threeFingerTapSuppressedByPriorMove = priorMoved
+            threeFingerFired = false
+            swipeScrubMode = ThreeFingerSwipeScrubMode.NONE
+            return
+        }
+
+        val startPts = threeFingerStartPositions!!
+        if (!threeFingerMoved && startPts.size == points.size) {
+            for (i in points.indices) {
+                if (hypot(points[i].x - startPts[i].x, points[i].y - startPts[i].y) > threeFingerTapSlopPx) {
+                    threeFingerMoved = true
+                    break
+                }
+            }
+        }
+
         val dx = centroid.x - threeFingerStart.x
         val dy = centroid.y - threeFingerStart.y
-        if (!threeFingerFired && hypot(dx, dy) > 60f) {
-            sink.onThreeFingerSwipe(dx, dy)
-            threeFingerFired = true
+        if (!threeFingerMoved && hypot(dx, dy) > threeFingerTapSlopPx) {
+            threeFingerMoved = true
+        }
+
+        when (swipeScrubMode) {
+            ThreeFingerSwipeScrubMode.VOLUME -> {
+                val coord = if (swipeAxisHorizontal) centroid.x else centroid.y
+                while (abs(coord - swipeLastStepCoord) >= threeFingerVolumeStepPx) {
+                    val movedPositive = coord > swipeLastStepCoord
+                    swipeLastStepCoord += if (movedPositive) threeFingerVolumeStepPx else -threeFingerVolumeStepPx
+                    val isUp = if (movedPositive) swipeVolPositiveDirRaises else !swipeVolPositiveDirRaises
+                    sink.onThreeFingerVolumeSwipeStep(up = isUp)
+                }
+                return
+            }
+            ThreeFingerSwipeScrubMode.SEEK -> {
+                val coord = if (swipeAxisHorizontal) centroid.x else centroid.y
+                while (abs(coord - swipeLastStepCoord) >= threeFingerSeekStepPx) {
+                    val movedPositive = coord > swipeLastStepCoord
+                    val isForward = if (movedPositive) swipeSeekPositiveDirForwards else !swipeSeekPositiveDirForwards
+                    val next = (swipeSeekSeconds + if (isForward) 10 else -10)
+                        .coerceIn(swipeSeekMinSeconds, swipeSeekMaxSeconds)
+                    if (next != swipeSeekSeconds) {
+                        swipeSeekSeconds = next
+                        swipeLastStepCoord += if (movedPositive) threeFingerSeekStepPx else -threeFingerSeekStepPx
+                        sink.onThreeFingerSeekSwipeUpdate(swipeSeekSeconds, forward = isForward)
+                    } else {
+                        // Snap anchor against the clamp boundary so reversing responds immediately.
+                        swipeLastStepCoord = coord
+                        break
+                    }
+                }
+                return
+            }
+            ThreeFingerSwipeScrubMode.NONE -> {
+                if (!threeFingerFired && hypot(dx, dy) > threeFingerSwipeThresholdPx) {
+                    threeFingerMoved = true
+                    val axes = threeFingerSwipeAxes()
+                    val horizontal = abs(dx) > abs(dy)
+                    val primaryAction = if (horizontal) {
+                        if (dx > 0) axes.right else axes.left
+                    } else {
+                        if (dy > 0) axes.down else axes.up
+                    }
+                    when {
+                        primaryAction.isVolumeControl -> {
+                            swipeScrubMode = ThreeFingerSwipeScrubMode.VOLUME
+                            swipeAxisHorizontal = horizontal
+                            swipeStartedAtMs = clockMs()
+                            swipeLastStepCoord = if (horizontal) centroid.x else centroid.y
+                            val posAction = if (horizontal) axes.right else axes.down
+                            val negAction = if (horizontal) axes.left else axes.up
+                            swipeVolPositiveDirRaises = when {
+                                posAction == com.portalpad.app.data.GestureAction.VOLUME_UP -> true
+                                posAction == com.portalpad.app.data.GestureAction.VOLUME_DOWN -> false
+                                negAction == com.portalpad.app.data.GestureAction.VOLUME_UP -> false
+                                negAction == com.portalpad.app.data.GestureAction.VOLUME_DOWN -> true
+                                else -> !horizontal
+                            }
+                            sink.onThreeFingerVolumeSwipeStart()
+                            sink.onThreeFingerVolumeSwipeStep(
+                                up = primaryAction == com.portalpad.app.data.GestureAction.VOLUME_UP,
+                            )
+                        }
+                        primaryAction.isSeekControl -> {
+                            swipeScrubMode = ThreeFingerSwipeScrubMode.SEEK
+                            swipeAxisHorizontal = horizontal
+                            swipeStartedAtMs = clockMs()
+                            swipeLastStepCoord = if (horizontal) centroid.x else centroid.y
+                            val posAction = if (horizontal) axes.right else axes.down
+                            val negAction = if (horizontal) axes.left else axes.up
+                            swipeSeekPositiveDirForwards = when {
+                                posAction == com.portalpad.app.data.GestureAction.SEEK_FORWARD -> true
+                                posAction == com.portalpad.app.data.GestureAction.REWIND -> false
+                                negAction == com.portalpad.app.data.GestureAction.SEEK_FORWARD -> false
+                                negAction == com.portalpad.app.data.GestureAction.REWIND -> true
+                                else -> true
+                            }
+                            swipeSeekMinSeconds =
+                                if (posAction == com.portalpad.app.data.GestureAction.REWIND ||
+                                    negAction == com.portalpad.app.data.GestureAction.REWIND
+                                ) -60 else 0
+                            swipeSeekMaxSeconds =
+                                if (posAction == com.portalpad.app.data.GestureAction.SEEK_FORWARD ||
+                                    negAction == com.portalpad.app.data.GestureAction.SEEK_FORWARD
+                                ) 60 else 0
+                            swipeSeekSeconds =
+                                if (primaryAction == com.portalpad.app.data.GestureAction.SEEK_FORWARD) 10 else -10
+                            sink.onThreeFingerSeekSwipeStart()
+                            sink.onThreeFingerSeekSwipeUpdate(
+                                swipeSeekSeconds,
+                                forward = swipeSeekSeconds > 0,
+                            )
+                        }
+                        else -> {
+                            sink.onThreeFingerSwipe(dx, dy)
+                            threeFingerFired = true
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -931,5 +1173,20 @@ private class GestureRecognizer(
         twoFingerLastCentroid = Offset.Zero
         twoFingerMoved = false
         pinchLatched = false
+    }
+
+    private fun resetThreeFingerState() {
+        threeFingerStart = Offset.Zero
+        threeFingerStartTime = 0
+        threeFingerStartIds = emptyList()
+        threeFingerStartPositions = null
+        threeFingerMoved = false
+        threeFingerTapSuppressedByPriorMove = false
+        threeFingerFired = false
+        swipeScrubMode = ThreeFingerSwipeScrubMode.NONE
+        swipeAxisHorizontal = false
+        swipeLastStepCoord = 0f
+        swipeSeekSeconds = 0
+        swipeStartedAtMs = 0L
     }
 }

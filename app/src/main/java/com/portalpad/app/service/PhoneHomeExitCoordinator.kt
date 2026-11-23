@@ -31,6 +31,7 @@ class PhoneHomeExitCoordinator(
     private val lock = Any()
     private var lastInterceptAtMs: Long? = null
     private var internalNavigationUntilMs: Long = 0L
+    private var hideLeaveSuppressUntilMs: Long = 0L
     private var bubbleSuppressUntilMs: Long = 0L
     private var nextToken: Long = 0L
     private var pendingReboundToken: Long = 0L
@@ -42,6 +43,12 @@ class PhoneHomeExitCoordinator(
         hasExternalDisplay: Boolean,
     ): LeaveDecision = synchronized(lock) {
         val now = clockMs()
+        if (now < hideLeaveSuppressUntilMs) {
+            hideLeaveSuppressUntilMs = 0L
+            clearReboundLocked()
+            lastInterceptAtMs = null
+            return@synchronized LeaveDecision.IGNORE_INTERNAL_NAVIGATION
+        }
         if (now < internalNavigationUntilMs) {
             clearReboundLocked()
             lastInterceptAtMs = null
@@ -79,6 +86,21 @@ class PhoneHomeExitCoordinator(
         lastInterceptAtMs = null
     }
 
+    /**
+     * Marks an explicit Hide tap from the top bar so returning to the previous phone app
+     * never triggers external Home or rebounds TrackpadActivity back to the foreground.
+     */
+    fun markExplicitHide(guardDurationMs: Long = INTERNAL_NAV_GUARD_MS) = synchronized(lock) {
+        val now = clockMs()
+        hideLeaveSuppressUntilMs = maxOf(hideLeaveSuppressUntilMs, now + guardDurationMs)
+        clearReboundLocked()
+        lastInterceptAtMs = null
+    }
+
+    fun clearExplicitHideSuppression() = synchronized(lock) {
+        hideLeaveSuppressUntilMs = 0L
+    }
+
     fun markPaused() = synchronized(lock) {
         if (pendingReboundToken != 0L) {
             reboundSawPause = true
@@ -111,6 +133,7 @@ class PhoneHomeExitCoordinator(
         clearReboundLocked()
         lastInterceptAtMs = null
         internalNavigationUntilMs = 0L
+        hideLeaveSuppressUntilMs = 0L
     }
 
     private fun clearReboundLocked() {

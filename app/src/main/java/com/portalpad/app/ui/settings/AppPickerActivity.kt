@@ -146,6 +146,7 @@ class AppPickerActivity : com.portalpad.app.PinnedDensityActivity() {
             target == "gesture_down" -> app.prefs.setGestureAppDown(entry)
             target == "gesture_left" -> app.prefs.setGestureAppLeft(entry)
             target == "gesture_right" -> app.prefs.setGestureAppRight(entry)
+            target == "gesture_three_finger_tap" -> app.prefs.setGestureAppThreeFingerTap(entry)
             target == "prog_red" -> app.prefs.setProgAction(com.portalpad.app.data.PreferencesRepository.Keys.PROG_KEY_ACTION_RED, entry)
             target == "prog_green" -> app.prefs.setProgAction(com.portalpad.app.data.PreferencesRepository.Keys.PROG_KEY_ACTION_GREEN, entry)
             target == "prog_yellow" -> app.prefs.setProgAction(com.portalpad.app.data.PreferencesRepository.Keys.PROG_KEY_ACTION_YELLOW, entry)
@@ -340,6 +341,7 @@ private fun AppPickerScreen(
     val gestureDownState by app.prefs.gestureAppDown.collectAsState(initial = null)
     val gestureLeftState by app.prefs.gestureAppLeft.collectAsState(initial = null)
     val gestureRightState by app.prefs.gestureAppRight.collectAsState(initial = null)
+    val gestureThreeTapState by app.prefs.gestureAppThreeFingerTap.collectAsState(initial = null)
     val isAlreadyDefault = when (target) {
         "home" -> homeActionState == null
         "back" -> backActionState == BackAction.System
@@ -634,6 +636,7 @@ private fun AppPickerScreen(
                         target == "gesture_down" -> gestureDownState?.isWidgetOverlay == true
                         target == "gesture_left" -> gestureLeftState?.isWidgetOverlay == true
                         target == "gesture_right" -> gestureRightState?.isWidgetOverlay == true
+                        target == "gesture_three_finger_tap" -> gestureThreeTapState?.isWidgetOverlay == true
                         else -> false
                     }
                     Row(

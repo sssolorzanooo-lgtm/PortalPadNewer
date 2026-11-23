@@ -4809,6 +4809,17 @@ class PortalPadForegroundService : Service() {
             )
         }
 
+        private fun resolveGestureDisplay(svc: PortalPadForegroundService): Display? {
+            svc.lastOverlayDisplay?.takeIf { it.displayId != Display.DEFAULT_DISPLAY }?.let {
+                return it
+            }
+            val extId = com.portalpad.app.PortalPadApp.instance.externalDisplayId.value
+                ?.takeIf { it != Display.DEFAULT_DISPLAY }
+                ?: return null
+            val dm = svc.getSystemService(Context.DISPLAY_SERVICE) as? android.hardware.display.DisplayManager
+            return dm?.getDisplay(extId)
+        }
+
         /** Show or update the centered external Gesture volume OSD. */
         fun showGestureVolume(
             percent: Int,
@@ -4818,7 +4829,7 @@ class PortalPadForegroundService : Service() {
             teachRotation: Boolean = false,
         ) {
             val svc = instance ?: return
-            val display = svc.lastOverlayDisplay ?: return
+            val display = resolveGestureDisplay(svc) ?: return
             val direction = when (clockwise) {
                 true -> com.portalpad.app.presentation.GestureFeedbackOverlay
                     .VolumeDirection.CLOCKWISE
@@ -4835,6 +4846,76 @@ class PortalPadForegroundService : Service() {
                 unmuted,
                 teachRotation,
             )
+        }
+
+        /** Live volume HUD centered in the middle of the external display during 3-finger volume swipe. */
+        fun showLiveTouchpadVolume(
+            percent: Int,
+            muted: Boolean,
+            clockwise: Boolean? = null,
+            autoFade: Boolean = false,
+            durationMs: Long = 750L,
+        ) {
+            val svc = instance ?: return
+            val display = resolveGestureDisplay(svc) ?: return
+            val direction = when (clockwise) {
+                true -> com.portalpad.app.presentation.GestureFeedbackOverlay
+                    .VolumeDirection.CLOCKWISE
+                false -> com.portalpad.app.presentation.GestureFeedbackOverlay
+                    .VolumeDirection.COUNTERCLOCKWISE
+                null -> null
+            }
+            com.portalpad.app.presentation.GestureFeedbackOverlay.showVolume(
+                serviceContext = svc,
+                display = display,
+                percent = percent,
+                muted = muted,
+                direction = direction,
+                durationMs = durationMs,
+                centeredMiddle = true,
+                autoFade = autoFade,
+            )
+        }
+
+        /** Live 10s-step seek HUD centered in the middle of the external display during 3-finger seek swipe. */
+        fun showLiveTouchpadSeek(
+            deltaSeconds: Int,
+            clockwise: Boolean? = null,
+            autoFade: Boolean = false,
+            durationMs: Long = 750L,
+        ) {
+            val svc = instance ?: return
+            val display = resolveGestureDisplay(svc) ?: return
+            val direction = when (clockwise) {
+                true -> com.portalpad.app.presentation.GestureFeedbackOverlay
+                    .VolumeDirection.CLOCKWISE
+                false -> com.portalpad.app.presentation.GestureFeedbackOverlay
+                    .VolumeDirection.COUNTERCLOCKWISE
+                null -> null
+            }
+            com.portalpad.app.presentation.GestureFeedbackOverlay.showSeek(
+                serviceContext = svc,
+                display = display,
+                deltaSeconds = deltaSeconds,
+                direction = direction,
+                durationMs = durationMs,
+                autoFade = autoFade,
+            )
+        }
+
+        /** Brief single combined Play/Pause badge centered in the middle of the external display. */
+        fun showLiveTouchpadPlayPause() {
+            val svc = instance ?: return
+            val display = resolveGestureDisplay(svc) ?: return
+            com.portalpad.app.presentation.GestureFeedbackOverlay.showPlayPause(
+                serviceContext = svc,
+                display = display,
+            )
+        }
+
+        /** Dismiss live touchpad volume/seek feedback immediately on finger lift. */
+        fun dismissLiveTouchpadFeedback() {
+            com.portalpad.app.presentation.GestureFeedbackOverlay.dismiss()
         }
 
         /** Remove a pending Gesture confirmation immediately when leaving Gesture. */

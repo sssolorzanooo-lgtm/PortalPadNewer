@@ -98,10 +98,12 @@ data class GestureActions(
     val down: com.portalpad.app.data.GestureAction,
     val left: com.portalpad.app.data.GestureAction,
     val right: com.portalpad.app.data.GestureAction,
+    val threeFingerTap: com.portalpad.app.data.GestureAction = com.portalpad.app.data.GestureAction.PLAY_PAUSE_MEDIA,
     val upApp: com.portalpad.app.data.AppEntry? = null,
     val downApp: com.portalpad.app.data.AppEntry? = null,
     val leftApp: com.portalpad.app.data.AppEntry? = null,
     val rightApp: com.portalpad.app.data.AppEntry? = null,
+    val threeFingerTapApp: com.portalpad.app.data.AppEntry? = null,
 )
 
 class TrackpadActivity : PinnedDensityActivity() {
@@ -755,6 +757,7 @@ class TrackpadActivity : PinnedDensityActivity() {
     override fun onResume() {
         super.onResume()
         inputInterfaceForeground = true
+        app.phoneHomeExitCoordinator.clearExplicitHideSuppression()
         if (app.phoneHomeExitCoordinator.consumePendingReboundOnResume()) {
             app.cancelTrackpadReboundAfterPhoneHome()
         }
@@ -999,6 +1002,65 @@ private fun launchSettingsOnPhone(ctx: android.content.Context, extraFlags: Int 
     }
     runCatching { ctx.startActivity(intent, opts.toBundle()) }
         .onFailure { runCatching { ctx.startActivity(intent) } }
+}
+
+private fun hideToPreviousApp(
+    app: PortalPadApp,
+    activity: android.app.Activity?,
+) {
+    app.phoneHomeExitCoordinator.markExplicitHide()
+    app.cancelTrackpadReboundAfterPhoneHome()
+    runCatching { app.noteUserLeftDeliberately("hide button") }
+    val moved = activity?.let { runCatching { it.moveTaskToBack(true) }.getOrDefault(false) } == true
+    if (!moved) {
+        val launcherIntent = android.content.Intent(android.content.Intent.ACTION_MAIN).apply {
+            addCategory(android.content.Intent.CATEGORY_HOME)
+            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val opts = android.app.ActivityOptions.makeBasic().apply {
+            runCatching { launchDisplayId = android.view.Display.DEFAULT_DISPLAY }
+        }
+        runCatching { app.startActivity(launcherIntent, opts.toBundle()) }
+            .onFailure { runCatching { app.startActivity(launcherIntent) } }
+    }
+}
+
+private fun resolveVisibleExternalPackages(app: PortalPadApp): List<String> {
+    val hasDisplay = app.externalDisplayId.value != null ||
+        app.physicalExternalDisplayId.value != null ||
+        app.virtualDisplayId != null
+    if (!hasDisplay) return emptyList()
+
+    val ownPkg = app.packageName
+    fun isUserAppPkg(pkg: String): Boolean =
+        pkg.isNotBlank() &&
+            pkg != ownPkg &&
+            !pkg.startsWith("com.portalpad") &&
+            !pkg.contains("launcher", ignoreCase = true) &&
+            !pkg.contains("nexuslauncher", ignoreCase = true)
+
+    val snap = app.windowMonitor.snapshot.value
+    val minimized = snap.minimizedIds
+    val tasks = if (app.freeform.isReady) {
+        runCatching { app.freeform.listExternalTasks() }.getOrElse { snap.tasks }
+    } else {
+        snap.tasks
+    }
+    val visiblePkgs = tasks
+        .filter { rt -> rt.visible && rt.taskId !in minimized && isUserAppPkg(rt.packageName) }
+        .map { it.packageName }
+        .distinct()
+    if (visiblePkgs.isNotEmpty()) return visiblePkgs
+
+    // Only fall back to activeExternalApp when task enumeration isn't available or a
+    // launch just occurred inside the settle window.
+    if (!app.freeform.isReady || app.launchedRecently(4000L)) {
+        val activePkg = app.activeExternalApp?.packageName
+        if (activePkg != null && isUserAppPkg(activePkg)) {
+            return listOf(activePkg)
+        }
+    }
+    return emptyList()
 }
 
 /**
@@ -1487,33 +1549,12 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
     ).collectAsState(initial = "right").value
     val edgeStripOnLeft = edgeScrollSide == "left"
 
-    // Flashlight — single instance held for the lifetime of this composable.
-    // The controller exposes a Flow that also reflects external state
-    // changes (Quick Settings tile, other apps' torch use) — so our UI
-    // stays in sync regardless of how the flashlight is toggled.
-    val flashlight = remember { com.portalpad.app.service.FlashlightController(app) }
-    val flashlightOn by flashlight.isOnFlow.collectAsState()
     // Bumped by EVERY permission-grant callback so anything keyed on it — the
     // Quick Wheel's "permission needed" chip list — recomputes the moment a
     // grant lands, no matter WHICH flow requested it. The chip's own fix
     // button was the only bumper before, so granting Camera via the QR button
     // left a stale "1 permission needed" chip until the wheel was reopened.
     var permRefresh by remember { mutableStateOf(0) }
-    val cameraPermissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
-        contract = androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        if (granted) {
-            permRefresh++
-            // Once granted, fulfill the originally-requested toggle.
-            flashlight.toggle()
-        } else {
-            android.widget.Toast.makeText(
-                app,
-                "Flashlight needs camera permission",
-                android.widget.Toast.LENGTH_SHORT,
-            ).show()
-        }
-    }
     val permFixCameraLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         contract = androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
     ) { permRefresh++ }
@@ -1530,30 +1571,6 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
         }
     }
     val ctxForPerm = androidx.compose.ui.platform.LocalContext.current
-    // Auto-turn-off flashlight when the activity goes away, and release the
-    // TorchCallback so we don't leak it.
-    androidx.compose.runtime.DisposableEffect(Unit) {
-        onDispose {
-            if (flashlight.isOn) flashlight.setOn(false)
-            flashlight.close()
-        }
-    }
-
-    fun onFlashlightTap() {
-        if (!flashlight.available) {
-            android.widget.Toast.makeText(ctxForPerm, "No flashlight on this device", android.widget.Toast.LENGTH_SHORT).show()
-            return
-        }
-        val granted = androidx.core.content.ContextCompat.checkSelfPermission(
-            ctxForPerm, android.Manifest.permission.CAMERA,
-        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        if (granted) {
-            flashlight.toggle()
-        } else {
-            app.phoneHomeExitCoordinator.markInternalNavigation(3000L)
-            cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
-        }
-    }
 
     // Cursor visibility: shown while on the trackpad (driving the cursor),
     // hidden on other tabs (e.g. media). Updated reactively.
@@ -1721,26 +1738,132 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
     // showAppDrawer setter directly).
     val openDrawer = rememberUpdatedState { showAppDrawer = true }
 
-    // Configurable 3-finger swipe actions. Collected here and exposed to the
-    // remembered sink via rememberUpdatedState so it always reads the current
-    // assignment without being recreated.
-    val gUp = app.prefs.gestureSwipeUp.collectAsState(initial = com.portalpad.app.data.GestureAction.NOTIF_CLOSE).value
-    val gDown = app.prefs.gestureSwipeDown.collectAsState(initial = com.portalpad.app.data.GestureAction.NOTIF_OPEN).value
-    val gLeft = app.prefs.gestureSwipeLeft.collectAsState(initial = com.portalpad.app.data.GestureAction.HOME).value
-    val gRight = app.prefs.gestureSwipeRight.collectAsState(initial = com.portalpad.app.data.GestureAction.BACK).value
+    // Configurable 3-finger swipe and 3-finger tap settings.
+    // Collected here and exposed to the remembered sink via rememberUpdatedState
+    // so updates apply immediately without recreating the gesture sink.
+    val gUp = app.prefs.gestureSwipeUp.collectAsState(initial = com.portalpad.app.data.GestureAction.VOLUME_UP).value
+    val gDown = app.prefs.gestureSwipeDown.collectAsState(initial = com.portalpad.app.data.GestureAction.VOLUME_DOWN).value
+    val gLeft = app.prefs.gestureSwipeLeft.collectAsState(initial = com.portalpad.app.data.GestureAction.REWIND).value
+    val gRight = app.prefs.gestureSwipeRight.collectAsState(initial = com.portalpad.app.data.GestureAction.SEEK_FORWARD).value
+    val gThreeTapEnabled by app.prefs.gestureThreeFingerTapEnabled.collectAsState(initial = true)
+    val gThreeTap = app.prefs.gestureThreeFingerTap.collectAsState(
+        initial = com.portalpad.app.data.GestureAction.PLAY_PAUSE_MEDIA,
+    ).value
     val gUpApp = app.prefs.gestureAppUp.collectAsState(initial = null).value
     val gDownApp = app.prefs.gestureAppDown.collectAsState(initial = null).value
     val gLeftApp = app.prefs.gestureAppLeft.collectAsState(initial = null).value
     val gRightApp = app.prefs.gestureAppRight.collectAsState(initial = null).value
+    val gThreeTapApp = app.prefs.gestureAppThreeFingerTap.collectAsState(initial = null).value
+    val swipeAxes = com.portalpad.app.ui.trackpad.ThreeFingerSwipeAxes(
+        up = gUp,
+        down = gDown,
+        left = gLeft,
+        right = gRight,
+    )
     val gestureActions = rememberUpdatedState(
         com.portalpad.app.GestureActions(
-            up = gUp, down = gDown, left = gLeft, right = gRight,
-            upApp = gUpApp, downApp = gDownApp, leftApp = gLeftApp, rightApp = gRightApp,
+            up = gUp,
+            down = gDown,
+            left = gLeft,
+            right = gRight,
+            threeFingerTap = gThreeTap,
+            upApp = gUpApp,
+            downApp = gDownApp,
+            leftApp = gLeftApp,
+            rightApp = gRightApp,
+            threeFingerTapApp = gThreeTapApp,
         ),
     )
 
     val sink = remember {
         object : GestureSink {
+            private var swipeVolumePct = 0
+            private var swipeVolumeHapticStep = -1
+            private var swipeVolumeAnnouncedEdge: Int? = null
+            private var swipeVolumeLastUp: Boolean? = null
+            private var liveSwipeVolumeActive = false
+            private var liveSwipeSeekActive = false
+
+            private fun stepVolumePercent(up: Boolean) {
+                val next = (swipeVolumePct + if (up) 5 else -5).coerceIn(0, 100)
+                swipeVolumeLastUp = up
+                if (next != swipeVolumePct) {
+                    swipeVolumePct = next
+                    app.media.setVolumePct(next)
+                    val nextStep = app.media.volumeStepForPercent(next)
+                    if (next == 0 || next == 100) {
+                        swipeVolumeAnnouncedEdge = next
+                        injector.buzzBoundary()
+                    } else if (nextStep != swipeVolumeHapticStep) {
+                        swipeVolumeAnnouncedEdge = null
+                        injector.buzz(longPress = false)
+                    }
+                    swipeVolumeHapticStep = nextStep
+                } else if (swipeVolumeAnnouncedEdge != swipeVolumePct) {
+                    swipeVolumeAnnouncedEdge = swipeVolumePct
+                    injector.buzzBoundary()
+                }
+            }
+
+            private fun dispatchGestureAction(
+                action: com.portalpad.app.data.GestureAction,
+                appEntry: com.portalpad.app.data.AppEntry?,
+            ) {
+                when (action) {
+                    com.portalpad.app.data.GestureAction.NONE -> {}
+                    com.portalpad.app.data.GestureAction.PLAY_PAUSE_MEDIA ->
+                        app.media.playPauseExternalDisplay { resolveVisibleExternalPackages(app) }
+                    com.portalpad.app.data.GestureAction.VOLUME_UP -> {
+                        swipeVolumePct = app.media.volumePct().coerceIn(0, 100)
+                        swipeVolumeHapticStep = app.media.volumeStepForPercent(swipeVolumePct)
+                        swipeVolumeAnnouncedEdge = null
+                        stepVolumePercent(up = true)
+                        com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadVolume(
+                            percent = swipeVolumePct,
+                            muted = swipeVolumePct == 0,
+                            clockwise = true,
+                            autoFade = true,
+                        )
+                    }
+                    com.portalpad.app.data.GestureAction.VOLUME_DOWN -> {
+                        swipeVolumePct = app.media.volumePct().coerceIn(0, 100)
+                        swipeVolumeHapticStep = app.media.volumeStepForPercent(swipeVolumePct)
+                        swipeVolumeAnnouncedEdge = null
+                        stepVolumePercent(up = false)
+                        com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadVolume(
+                            percent = swipeVolumePct,
+                            muted = swipeVolumePct == 0,
+                            clockwise = false,
+                            autoFade = true,
+                        )
+                    }
+                    com.portalpad.app.data.GestureAction.SEEK_FORWARD -> {
+                        app.media.seekBySeconds(10)
+                        com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadSeek(
+                            deltaSeconds = 10,
+                            clockwise = true,
+                            autoFade = true,
+                        )
+                    }
+                    com.portalpad.app.data.GestureAction.REWIND -> {
+                        app.media.seekBySeconds(-10)
+                        com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadSeek(
+                            deltaSeconds = -10,
+                            clockwise = false,
+                            autoFade = true,
+                        )
+                    }
+                    com.portalpad.app.data.GestureAction.BACK -> injector.backGuarded()
+                    com.portalpad.app.data.GestureAction.HOME -> injector.home()
+                    com.portalpad.app.data.GestureAction.NOTIF_OPEN ->
+                        com.portalpad.app.service.PortalPadForegroundService.showNotificationPanel()
+                    com.portalpad.app.data.GestureAction.NOTIF_CLOSE ->
+                        com.portalpad.app.service.PortalPadForegroundService.dismissNotificationPanel()
+                    com.portalpad.app.data.GestureAction.LAUNCH_APP ->
+                        appEntry?.let { launchEntry(it, injector) }
+                }
+            }
+
             override fun onMove(dx: Float, dy: Float) {
                 injector.notifyTouchpadOrAirMouseActive()
                 injector.pointerMove(dx, dy)
@@ -1794,21 +1917,117 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                 } else {
                     if (dy > 0) a.down else a.up
                 }
-                val app = if (horizontal) {
+                val entry = if (horizontal) {
                     if (dx > 0) a.rightApp else a.leftApp
                 } else {
                     if (dy > 0) a.downApp else a.upApp
                 }
-                when (action) {
-                    com.portalpad.app.data.GestureAction.NONE -> {}
-                    com.portalpad.app.data.GestureAction.BACK -> injector.backGuarded()
-                    com.portalpad.app.data.GestureAction.HOME -> injector.home()
-                    com.portalpad.app.data.GestureAction.NOTIF_OPEN ->
-                        com.portalpad.app.service.PortalPadForegroundService.showNotificationPanel()
-                    com.portalpad.app.data.GestureAction.NOTIF_CLOSE ->
-                        com.portalpad.app.service.PortalPadForegroundService.dismissNotificationPanel()
-                    com.portalpad.app.data.GestureAction.LAUNCH_APP ->
-                        app?.let { launchEntry(it, injector) }
+                dispatchGestureAction(action, entry)
+            }
+
+            override fun onThreeFingerTap() {
+                injector.notifyTouchpadOrAirMouseActive()
+                val a = gestureActions.value
+                if (a.threeFingerTap != com.portalpad.app.data.GestureAction.NONE) {
+                    injector.buzz(longPress = false)
+                    dispatchGestureAction(a.threeFingerTap, a.threeFingerTapApp)
+                    if (a.threeFingerTap == com.portalpad.app.data.GestureAction.PLAY_PAUSE_MEDIA) {
+                        com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadPlayPause()
+                    }
+                }
+            }
+
+            override fun onThreeFingerVolumeSwipeStart() {
+                injector.notifyTouchpadOrAirMouseActive()
+                swipeVolumePct = app.media.volumePct().coerceIn(0, 100)
+                swipeVolumeHapticStep = app.media.volumeStepForPercent(swipeVolumePct)
+                swipeVolumeAnnouncedEdge = null
+                swipeVolumeLastUp = null
+                liveSwipeVolumeActive = true
+                com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadVolume(
+                    percent = swipeVolumePct,
+                    muted = app.media.isMuted() || swipeVolumePct == 0,
+                    clockwise = null,
+                    autoFade = false,
+                )
+            }
+
+            override fun onThreeFingerVolumeSwipeStep(up: Boolean) {
+                injector.notifyTouchpadOrAirMouseActive()
+                stepVolumePercent(up = up)
+                liveSwipeVolumeActive = true
+                com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadVolume(
+                    percent = swipeVolumePct,
+                    muted = swipeVolumePct == 0,
+                    clockwise = up,
+                    autoFade = false,
+                )
+            }
+
+            override fun onThreeFingerVolumeSwipeEnd(autoFadeAfterFlick: Boolean) {
+                if (liveSwipeVolumeActive) {
+                    liveSwipeVolumeActive = false
+                    if (autoFadeAfterFlick) {
+                        com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadVolume(
+                            percent = swipeVolumePct,
+                            muted = swipeVolumePct == 0,
+                            clockwise = swipeVolumeLastUp,
+                            autoFade = true,
+                            durationMs = 750L,
+                        )
+                    } else {
+                        com.portalpad.app.service.PortalPadForegroundService.dismissLiveTouchpadFeedback()
+                    }
+                }
+            }
+
+            override fun onThreeFingerSeekSwipeStart() {
+                injector.notifyTouchpadOrAirMouseActive()
+                liveSwipeSeekActive = true
+                com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadSeek(
+                    deltaSeconds = 0,
+                    clockwise = null,
+                    autoFade = false,
+                )
+            }
+
+            override fun onThreeFingerSeekSwipeUpdate(totalSeconds: Int, forward: Boolean) {
+                injector.notifyTouchpadOrAirMouseActive()
+                liveSwipeSeekActive = true
+                if (kotlin.math.abs(totalSeconds) >= 60) {
+                    injector.buzzBoundary()
+                } else {
+                    injector.buzz(longPress = false)
+                }
+                com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadSeek(
+                    deltaSeconds = totalSeconds,
+                    clockwise = forward,
+                    autoFade = false,
+                )
+            }
+
+            override fun onThreeFingerSeekSwipeEnd(
+                totalSeconds: Int,
+                commit: Boolean,
+                autoFadeAfterFlick: Boolean,
+            ) {
+                val wasActive = liveSwipeSeekActive
+                liveSwipeSeekActive = false
+                if (commit && totalSeconds != 0) {
+                    injector.buzz(longPress = false)
+                    app.media.seekBySeconds(totalSeconds)
+                }
+                if (wasActive) {
+                    if (autoFadeAfterFlick && totalSeconds != 0) {
+                        com.portalpad.app.service.PortalPadForegroundService.showLiveTouchpadSeek(
+                            deltaSeconds = totalSeconds,
+                            clockwise = totalSeconds > 0,
+                            autoFade = true,
+                            durationMs = 750L,
+                        )
+                    } else {
+                        com.portalpad.app.service.PortalPadForegroundService.dismissLiveTouchpadFeedback()
+                    }
                 }
             }
         }
@@ -1880,8 +2099,9 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                         }
                 }
             },
-            onFlashlightClick = { onFlashlightTap() },
-            flashlightOn = flashlightOn,
+            onHideClick = {
+                hideToPreviousApp(app, trackpadActivity)
+            },
             onScreenshotClick = {
                 // Capture the external display via `screencap -d <physicalId>`
                 // through the Shizuku UserService. We use the PHYSICAL display
@@ -2008,6 +2228,8 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                                     tapToClick = tapToClick,
                                     pointerAccel = pointerAccel,
                                     edgeStripSide = "left",
+                                    threeFingerTapEnabled = gThreeTapEnabled,
+                                    threeFingerSwipeAxes = swipeAxes,
                                     modifier = Modifier.weight(1f).fillMaxSize(),
                                 )
                             } else {
@@ -2017,6 +2239,8 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                                     tapToClick = tapToClick,
                                     pointerAccel = pointerAccel,
                                     edgeStripSide = "right",
+                                    threeFingerTapEnabled = gThreeTapEnabled,
+                                    threeFingerSwipeAxes = swipeAxes,
                                     modifier = Modifier.weight(1f).fillMaxSize(),
                                 )
                                 androidx.compose.foundation.layout.Spacer(
@@ -2039,6 +2263,8 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                             showFingerDots = showFingerDots,
                             tapToClick = tapToClick,
                             pointerAccel = pointerAccel,
+                            threeFingerTapEnabled = gThreeTapEnabled,
+                            threeFingerSwipeAxes = swipeAxes,
                             modifier = Modifier.fillMaxSize(),
                         )
                     }

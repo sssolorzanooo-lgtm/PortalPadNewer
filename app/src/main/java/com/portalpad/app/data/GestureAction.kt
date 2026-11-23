@@ -12,12 +12,20 @@ package com.portalpad.app.data
  */
 enum class GestureAction(val id: String, val label: String, val short: String) {
     NONE("none", "None", "—"),
+    PLAY_PAUSE_MEDIA("play_pause_media", "Play / pause media", "Play/Pause"),
+    VOLUME_UP("volume_up", "Volume up", "Vol +"),
+    VOLUME_DOWN("volume_down", "Volume down", "Vol -"),
+    SEEK_FORWARD("seek_forward", "Seek forward (+10s)", "Seek +10s"),
+    REWIND("rewind", "Rewind (-10s)", "Rewind -10s"),
     BACK("back", "Back", "Back"),
     HOME("home", "Home", "Home"),
     NOTIF_OPEN("notif_open", "Open notifications panel", "Notifications"),
     NOTIF_CLOSE("notif_close", "Close notifications panel", "Close panel"),
     LAUNCH_APP("launch_app", "Launch app…", "Open app"),
     ;
+
+    val isVolumeControl: Boolean get() = this == VOLUME_UP || this == VOLUME_DOWN
+    val isSeekControl: Boolean get() = this == SEEK_FORWARD || this == REWIND
 
     companion object {
         fun fromId(id: String?): GestureAction =

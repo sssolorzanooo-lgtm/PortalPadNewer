@@ -45,6 +45,13 @@ class MediaController(private val context: Context) {
             Thread(r, "portalpad-volume").apply { isDaemon = true }
         }
 
+    // Off-UI executor for media session resolution & play/pause verification fallbacks.
+    private val mediaExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "portalpad-media").apply { isDaemon = true }
+        }
+    private val externalPlayPauseGen = java.util.concurrent.atomic.AtomicLong(0L)
+
     /** True when the user has granted Notification Access to PortalPad. */
     val hasNotificationAccess: Boolean
         get() {
@@ -193,12 +200,143 @@ class MediaController(private val context: Context) {
 
     // ─────────────────────────── media keys (no Shizuku needed) ───────────────────
 
-    fun playPause() = sendMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+    fun playPause() {
+        val gen = externalPlayPauseGen.incrementAndGet()
+        mediaExecutor.execute {
+            if (externalPlayPauseGen.get() != gen) return@execute
+            logSessions("key PLAY_PAUSE")
+            val active = if (hasNotificationAccess) {
+                pickAppSession()?.let(::RealSessionHandle)
+            } else null
+            if (active != null) {
+                dispatchPlayPauseSmart(
+                    initial = active,
+                    querySessionForPkg = { pkg ->
+                        findBestSessionForPackage(pkg)?.let(::RealSessionHandle)
+                    },
+                    sendPackageBroadcast = { pkg, keyCode ->
+                        sendViaPackageBroadcast(pkg, keyCode)
+                    },
+                    sleepMs = { ms -> runCatching { Thread.sleep(ms) } },
+                    shouldAbort = { externalPlayPauseGen.get() != gen },
+                )
+            } else {
+                sendViaBroadcast(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+            }
+        }
+    }
+
+    /**
+     * Play or pause media **strictly** for the app currently displayed on the
+     * external display. Never targets background phone apps or sends an
+     * unscoped global `ACTION_MEDIA_BUTTON` broadcast.
+     */
+    fun playPauseExternalDisplay(resolveVisiblePackages: () -> List<String>) {
+        val gen = externalPlayPauseGen.incrementAndGet()
+        mediaExecutor.execute {
+            if (externalPlayPauseGen.get() != gen) return@execute
+            val visiblePackages = runCatching { resolveVisiblePackages() }.getOrDefault(emptyList())
+            if (visiblePackages.isEmpty()) {
+                Log.i(
+                    TAG,
+                    "DIAG-MEDIA playPauseExternalDisplay -> no app visible on external display; ignoring",
+                )
+                return@execute
+            }
+            val sessions = if (hasNotificationAccess) {
+                runCatching {
+                    mediaSessionManager.getActiveSessions(listenerComponent)
+                }.getOrDefault(emptyList()).map(::RealSessionHandle)
+            } else {
+                emptyList()
+            }
+            val target = selectSessionForExternalPackages(
+                sessions = sessions,
+                visibleExternalPackages = visiblePackages,
+                ownPackageName = context.packageName,
+            )
+            if (target != null) {
+                Log.i(
+                    TAG,
+                    "DIAG-MEDIA playPauseExternalDisplay -> ${target.snapshot.packageName} " +
+                        "state=${stateName(target.snapshot.state)} visible=$visiblePackages",
+                )
+                dispatchPlayPauseSmart(
+                    initial = target,
+                    querySessionForPkg = { pkg ->
+                        findBestSessionForPackage(pkg)?.let(::RealSessionHandle)
+                    },
+                    sendPackageBroadcast = { pkg, keyCode ->
+                        sendViaPackageBroadcast(pkg, keyCode)
+                    },
+                    sleepMs = { ms -> runCatching { Thread.sleep(ms) } },
+                    shouldAbort = { externalPlayPauseGen.get() != gen },
+                )
+                return@execute
+            }
+
+            // No active MediaSession for the visible external app (e.g. Notification Access
+            // off, or player deactivated its session while paused). Scope ACTION_MEDIA_BUTTON
+            // strictly to the top visible external package so background apps never trigger.
+            val topPkg = visiblePackages.first()
+            Log.i(
+                TAG,
+                "DIAG-MEDIA playPauseExternalDisplay -> no MediaSession for visible=$visiblePackages; " +
+                    "package-scoped broadcast to $topPkg",
+            )
+            sendViaPackageBroadcast(topPkg, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+        }
+    }
+
     fun next() = sendMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
     fun prev() = sendMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
     fun fastForward() = seekRelativeOrKey(SKIP_MS, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD)
     fun rewind() = seekRelativeOrKey(-SKIP_MS, KeyEvent.KEYCODE_MEDIA_REWIND)
     fun stop() = sendMediaKey(KeyEvent.KEYCODE_MEDIA_STOP)
+
+    /**
+     * Seek forward (+) or backward (-) by [totalSeconds] in one shot when the
+     * active media session supports ACTION_SEEK_TO, or by dispatching matching
+     * 10-second FF/REW media key pulses otherwise.
+     */
+    fun seekBySeconds(totalSeconds: Int) {
+        if (totalSeconds == 0) return
+        val deltaMs = totalSeconds * 1000L
+        val fallbackKey = if (totalSeconds > 0) {
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD
+        } else {
+            KeyEvent.KEYCODE_MEDIA_REWIND
+        }
+        val session = pickAppSession()
+        val state = session?.playbackState
+        val canSeek = state != null && state.position >= 0 &&
+            (state.actions and android.media.session.PlaybackState.ACTION_SEEK_TO) != 0L
+        if (session != null && canSeek) {
+            val basePosition = if (
+                state!!.state == android.media.session.PlaybackState.STATE_PLAYING &&
+                state.lastPositionUpdateTime > 0L
+            ) {
+                val elapsed = (SystemClock.elapsedRealtime() - state.lastPositionUpdateTime).coerceAtLeast(0L)
+                state.position + (elapsed * state.playbackSpeed).toLong()
+            } else {
+                state.position
+            }
+            val dur = session.metadata?.getLong(
+                android.media.MediaMetadata.METADATA_KEY_DURATION,
+            ) ?: -1L
+            var target = basePosition + deltaMs
+            if (target < 0L) target = 0L
+            if (dur > 0L && target > dur) target = dur
+            Log.i(TAG, "DIAG-MEDIA seekBySeconds ${totalSeconds}s -> ${session.packageName} seekTo=$target")
+            runCatching { session.transportControls.seekTo(target) }
+            return
+        }
+        val steps = (kotlin.math.abs(totalSeconds) / 10).coerceIn(1, 30)
+        Log.i(TAG, "DIAG-MEDIA seekBySeconds ${totalSeconds}s -> fallback ${keyName(fallbackKey)} x$steps")
+        repeat(steps) {
+            sendMediaKey(fallbackKey)
+        }
+    }
 
     /**
      * (currentMs, durationMs) for the active media session. Returns null when
@@ -446,17 +584,38 @@ class MediaController(private val context: Context) {
         sendMediaKey(fallbackKey)
     }
 
+    private fun findBestSessionForPackage(pkg: String): android.media.session.MediaController? {
+        if (!hasNotificationAccess) return null
+        val sessions = runCatching {
+            mediaSessionManager.getActiveSessions(listenerComponent)
+        }.getOrNull() ?: return null
+        val matches = sessions.filter { it.packageName == pkg }
+        return matches.firstOrNull {
+            val s = it.playbackState?.state
+            s == android.media.session.PlaybackState.STATE_PLAYING ||
+                s == android.media.session.PlaybackState.STATE_BUFFERING
+        } ?: matches.firstOrNull {
+            it.playbackState?.state == android.media.session.PlaybackState.STATE_PAUSED &&
+                ((it.playbackState?.actions ?: 0L) and (
+                    android.media.session.PlaybackState.ACTION_PLAY or
+                        android.media.session.PlaybackState.ACTION_PLAY_PAUSE
+                    )) != 0L
+        } ?: matches.firstOrNull {
+            it.playbackState?.state == android.media.session.PlaybackState.STATE_PAUSED
+        } ?: matches.firstOrNull()
+    }
+
     private fun sendViaMediaSession(keyCode: Int): Boolean {
         if (!hasNotificationAccess) return false
         return try {
             val active = pickAppSession() ?: return false
             Log.i(TAG, "DIAG-MEDIA dispatch ${keyName(keyCode)} -> ${active.packageName}")
-            val now = SystemClock.uptimeMillis()
+            val downTime = SystemClock.uptimeMillis()
             active.dispatchMediaButtonEvent(
-                KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0)
+                KeyEvent(downTime, downTime, KeyEvent.ACTION_DOWN, keyCode, 0),
             )
             active.dispatchMediaButtonEvent(
-                KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0)
+                KeyEvent(downTime, downTime + 20L, KeyEvent.ACTION_UP, keyCode, 0),
             )
             true
         } catch (t: Throwable) {
@@ -465,14 +624,40 @@ class MediaController(private val context: Context) {
         }
     }
 
-    private fun sendViaBroadcast(keyCode: Int): Boolean {
+    private fun sendViaPackageBroadcast(pkg: String, keyCode: Int): Boolean {
         return try {
-            val now = SystemClock.uptimeMillis()
+            val downTime = SystemClock.uptimeMillis()
             val down = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
-                putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
+                setPackage(pkg)
+                putExtra(
+                    Intent.EXTRA_KEY_EVENT,
+                    KeyEvent(downTime, downTime, KeyEvent.ACTION_DOWN, keyCode, 0),
+                )
             }
             val up = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
-                putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0))
+                setPackage(pkg)
+                putExtra(
+                    Intent.EXTRA_KEY_EVENT,
+                    KeyEvent(downTime, downTime + 20L, KeyEvent.ACTION_UP, keyCode, 0),
+                )
+            }
+            context.sendOrderedBroadcast(down, null)
+            context.sendOrderedBroadcast(up, null)
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "Package-scoped media broadcast failed pkg=$pkg", t)
+            false
+        }
+    }
+
+    private fun sendViaBroadcast(keyCode: Int): Boolean {
+        return try {
+            val downTime = SystemClock.uptimeMillis()
+            val down = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
+                putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(downTime, downTime, KeyEvent.ACTION_DOWN, keyCode, 0))
+            }
+            val up = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
+                putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(downTime, downTime + 20L, KeyEvent.ACTION_UP, keyCode, 0))
             }
             context.sendOrderedBroadcast(down, null)
             context.sendOrderedBroadcast(up, null)
@@ -483,9 +668,189 @@ class MediaController(private val context: Context) {
         }
     }
 
+    private inner class RealSessionHandle(
+        private val controller: android.media.session.MediaController,
+    ) : SessionHandle {
+        override val snapshot: ExternalSessionSnapshot
+            get() {
+                val st = controller.playbackState
+                return ExternalSessionSnapshot(
+                    packageName = controller.packageName,
+                    state = st?.state,
+                    actions = st?.actions ?: 0L,
+                    hasPosition = (st?.position ?: -1L) >= 0L,
+                )
+            }
+
+        override fun play() {
+            runCatching { controller.transportControls.play() }
+                .onFailure { Log.w(TAG, "transportControls.play failed for ${controller.packageName}", it) }
+        }
+
+        override fun pause() {
+            runCatching { controller.transportControls.pause() }
+                .onFailure { Log.w(TAG, "transportControls.pause failed for ${controller.packageName}", it) }
+        }
+
+        override fun dispatchMediaKey(keyCode: Int) {
+            runCatching {
+                val downTime = SystemClock.uptimeMillis()
+                controller.dispatchMediaButtonEvent(
+                    KeyEvent(downTime, downTime, KeyEvent.ACTION_DOWN, keyCode, 0),
+                )
+                controller.dispatchMediaButtonEvent(
+                    KeyEvent(downTime, downTime + 20L, KeyEvent.ACTION_UP, keyCode, 0),
+                )
+            }.onFailure {
+                Log.w(TAG, "dispatchMediaButtonEvent($keyCode) failed for ${controller.packageName}", it)
+            }
+        }
+    }
+
+    internal data class ExternalSessionSnapshot(
+        val packageName: String,
+        val state: Int?,
+        val actions: Long,
+        val hasPosition: Boolean = false,
+    )
+
+    internal interface SessionHandle {
+        val snapshot: ExternalSessionSnapshot
+        fun play()
+        fun pause()
+        fun dispatchMediaKey(keyCode: Int)
+    }
+
     companion object {
         private const val TAG = "MediaController"
         /** Relative skip distance for the Fast-forward / Rewind buttons. */
         private const val SKIP_MS = 10_000L
+        private const val VERIFY_DELAY_MS = 200L
+
+        private fun isActivePlaybackState(state: Int?): Boolean =
+            state == android.media.session.PlaybackState.STATE_PLAYING ||
+                state == android.media.session.PlaybackState.STATE_BUFFERING
+
+        /**
+         * Selects the best [SessionHandle] strictly from [visibleExternalPackages]
+         * (ordered top-most/focused external display window first). Returns null if
+         * no app is displayed on the external display or none of the displayed apps
+         * own an active MediaSession — background phone apps are never selected.
+         */
+        internal fun selectSessionForExternalPackages(
+            sessions: List<SessionHandle>,
+            visibleExternalPackages: List<String>,
+            ownPackageName: String,
+        ): SessionHandle? {
+            if (visibleExternalPackages.isEmpty() || sessions.isEmpty()) return null
+            val visibleSet = visibleExternalPackages.toSet()
+            val candidateSessions = sessions.filter { s ->
+                val pkg = s.snapshot.packageName
+                pkg != ownPackageName && !pkg.startsWith("com.portalpad") && pkg in visibleSet
+            }
+            if (candidateSessions.isEmpty()) return null
+
+            for (pkg in visibleExternalPackages) {
+                val pkgSessions = candidateSessions.filter { it.snapshot.packageName == pkg }
+                if (pkgSessions.isEmpty()) continue
+                val picked = pkgSessions.firstOrNull { isActivePlaybackState(it.snapshot.state) }
+                    ?: pkgSessions.firstOrNull {
+                        it.snapshot.state == android.media.session.PlaybackState.STATE_PAUSED &&
+                            (it.snapshot.actions and (
+                                android.media.session.PlaybackState.ACTION_PLAY or
+                                    android.media.session.PlaybackState.ACTION_PLAY_PAUSE
+                                )) != 0L
+                    }
+                    ?: pkgSessions.firstOrNull {
+                        it.snapshot.state == android.media.session.PlaybackState.STATE_PAUSED
+                    }
+                    ?: pkgSessions.firstOrNull { it.snapshot.actions != 0L }
+                    ?: pkgSessions.first()
+                return picked
+            }
+            return null
+        }
+
+        /**
+         * Dispatches Pause or Resume Play reliably against [initial], verifying whether
+         * the player transitioned state and falling back cleanly (using non-toggle
+         * transport / PLAY / PAUSE calls before any package-scoped broadcast or toggle)
+         * so apps that ignore `KEYCODE_MEDIA_PLAY_PAUSE` when paused still resume.
+         */
+        internal fun dispatchPlayPauseSmart(
+            initial: SessionHandle,
+            querySessionForPkg: (String) -> SessionHandle?,
+            sendPackageBroadcast: (String, Int) -> Unit,
+            sleepMs: (Long) -> Unit,
+            shouldAbort: () -> Boolean = { false },
+        ) {
+            val snap = initial.snapshot
+            val pkg = snap.packageName
+            val actions = snap.actions
+            val wasPlaying = isActivePlaybackState(snap.state)
+
+            if (wasPlaying) {
+                val usedTogglePrimary =
+                    (actions and android.media.session.PlaybackState.ACTION_PAUSE) == 0L &&
+                        (actions and android.media.session.PlaybackState.ACTION_PLAY_PAUSE) != 0L
+                if (usedTogglePrimary) {
+                    initial.dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+                } else {
+                    initial.pause()
+                }
+                sleepMs(VERIFY_DELAY_MS)
+                if (shouldAbort()) return
+
+                val after1 = querySessionForPkg(pkg)
+                if (after1 == null || !isActivePlaybackState(after1.snapshot.state)) return
+
+                // Still playing — send explicit non-toggle PAUSE key event.
+                after1.dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE)
+                sleepMs(VERIFY_DELAY_MS)
+                if (shouldAbort()) return
+
+                val after2 = querySessionForPkg(pkg)
+                if (after2 == null || !isActivePlaybackState(after2.snapshot.state)) return
+
+                sendPackageBroadcast(pkg, KeyEvent.KEYCODE_MEDIA_PAUSE)
+                return
+            }
+
+            // Resuming from PAUSED / STOPPED / NONE:
+            // Many Android players handle Callback.onPlay() (transportControls.play()) or
+            // explicit KEYCODE_MEDIA_PLAY cleanly when paused even when they drop
+            // raw KEYCODE_MEDIA_PLAY_PAUSE button events.
+            val supportsPlay = (actions and android.media.session.PlaybackState.ACTION_PLAY) != 0L
+            val supportsPause = (actions and android.media.session.PlaybackState.ACTION_PAUSE) != 0L
+            val supportsToggle = (actions and android.media.session.PlaybackState.ACTION_PLAY_PAUSE) != 0L
+            val sentTogglePrimary = !supportsPlay && !supportsPause && actions != 0L && supportsToggle
+
+            if (sentTogglePrimary) {
+                initial.dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+            } else {
+                initial.play()
+            }
+            sleepMs(VERIFY_DELAY_MS)
+            if (shouldAbort()) return
+
+            val after1 = querySessionForPkg(pkg)
+            if (after1 != null && isActivePlaybackState(after1.snapshot.state)) return
+
+            if (sentTogglePrimary) {
+                (after1 ?: initial).play()
+            } else {
+                (after1 ?: initial).dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
+            }
+            sleepMs(VERIFY_DELAY_MS)
+            if (shouldAbort()) return
+
+            val after2 = querySessionForPkg(pkg)
+            if (after2 != null && isActivePlaybackState(after2.snapshot.state)) return
+
+            sendPackageBroadcast(pkg, KeyEvent.KEYCODE_MEDIA_PLAY)
+            if (!sentTogglePrimary && supportsToggle) {
+                (after2 ?: initial).dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+            }
+        }
     }
 }

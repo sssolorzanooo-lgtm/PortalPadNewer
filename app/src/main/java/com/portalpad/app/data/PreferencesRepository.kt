@@ -65,8 +65,8 @@ class PreferencesRepository(private val context: Context) {
         // smaller, letterboxed region — i.e. a smaller screen in the glasses' FOV
         // (not a resolution/UI-scale change; Display DPI handles that separately).
         val SCREEN_SIZE_PCT = intPreferencesKey("screen_size_pct")     // 0/100 = full
-        // 3-finger swipe gesture actions (store GestureAction.id). Defaults
-        // preserve the original hardcoded behavior.
+        // 3-finger swipe gesture actions (store GestureAction.id). Defaults:
+        // up→Volume up, down→Volume down, left→Rewind, right→Seek forward.
         val GESTURE_SWIPE_UP = stringPreferencesKey("gesture_swipe_up")
         val GESTURE_SWIPE_DOWN = stringPreferencesKey("gesture_swipe_down")
         val GESTURE_SWIPE_LEFT = stringPreferencesKey("gesture_swipe_left")
@@ -76,6 +76,10 @@ class PreferencesRepository(private val context: Context) {
         val GESTURE_APP_DOWN = stringPreferencesKey("gesture_app_down")
         val GESTURE_APP_LEFT = stringPreferencesKey("gesture_app_left")
         val GESTURE_APP_RIGHT = stringPreferencesKey("gesture_app_right")
+        // 3-finger tap touchpad gesture (enabled by default).
+        val GESTURE_THREE_FINGER_TAP_ENABLED = booleanPreferencesKey("gesture_three_finger_tap_enabled")
+        val GESTURE_THREE_FINGER_TAP = stringPreferencesKey("gesture_three_finger_tap")
+        val GESTURE_APP_THREE_FINGER_TAP = stringPreferencesKey("gesture_app_three_finger_tap")
         // Color tuning (GPU pipeline). 7 comma-separated floats:
         // brightness,contrast,saturation,temp,rGain,gGain,bGain. Empty = defaults
         // (all 1.0, temp 0). Re-applied to the glasses on each connect.
@@ -832,16 +836,16 @@ class PreferencesRepository(private val context: Context) {
             }
         }
 
-    // 3-finger swipe actions. Defaults preserve the original behavior:
-    // right→Back, left→Home, down→open notifications, up→close notifications.
+    // 3-finger swipe actions. Defaults:
+    // up→Volume up, down→Volume down, left→Rewind, right→Seek forward.
     val gestureSwipeUp: Flow<GestureAction> =
-        context.dataStore.data.map { GestureAction.fromId(it[Keys.GESTURE_SWIPE_UP] ?: GestureAction.NOTIF_CLOSE.id) }
+        context.dataStore.data.map { GestureAction.fromId(it[Keys.GESTURE_SWIPE_UP] ?: GestureAction.VOLUME_UP.id) }
     val gestureSwipeDown: Flow<GestureAction> =
-        context.dataStore.data.map { GestureAction.fromId(it[Keys.GESTURE_SWIPE_DOWN] ?: GestureAction.NOTIF_OPEN.id) }
+        context.dataStore.data.map { GestureAction.fromId(it[Keys.GESTURE_SWIPE_DOWN] ?: GestureAction.VOLUME_DOWN.id) }
     val gestureSwipeLeft: Flow<GestureAction> =
-        context.dataStore.data.map { GestureAction.fromId(it[Keys.GESTURE_SWIPE_LEFT] ?: GestureAction.HOME.id) }
+        context.dataStore.data.map { GestureAction.fromId(it[Keys.GESTURE_SWIPE_LEFT] ?: GestureAction.REWIND.id) }
     val gestureSwipeRight: Flow<GestureAction> =
-        context.dataStore.data.map { GestureAction.fromId(it[Keys.GESTURE_SWIPE_RIGHT] ?: GestureAction.BACK.id) }
+        context.dataStore.data.map { GestureAction.fromId(it[Keys.GESTURE_SWIPE_RIGHT] ?: GestureAction.SEEK_FORWARD.id) }
 
     val gestureAppUp: Flow<AppEntry?> = context.dataStore.data.map { p ->
         p[Keys.GESTURE_APP_UP]?.let { runCatching { json.decodeFromString<AppEntry>(it) }.getOrNull() }
@@ -854,6 +858,15 @@ class PreferencesRepository(private val context: Context) {
     }
     val gestureAppRight: Flow<AppEntry?> = context.dataStore.data.map { p ->
         p[Keys.GESTURE_APP_RIGHT]?.let { runCatching { json.decodeFromString<AppEntry>(it) }.getOrNull() }
+    }
+    val gestureThreeFingerTapEnabled: Flow<Boolean> =
+        context.dataStore.data.map { it[Keys.GESTURE_THREE_FINGER_TAP_ENABLED] ?: true }
+    val gestureThreeFingerTap: Flow<GestureAction> =
+        context.dataStore.data.map {
+            GestureAction.fromId(it[Keys.GESTURE_THREE_FINGER_TAP] ?: GestureAction.PLAY_PAUSE_MEDIA.id)
+        }
+    val gestureAppThreeFingerTap: Flow<AppEntry?> = context.dataStore.data.map { p ->
+        p[Keys.GESTURE_APP_THREE_FINGER_TAP]?.let { runCatching { json.decodeFromString<AppEntry>(it) }.getOrNull() }
     }
     val colorTuning: Flow<String> = context.dataStore.data.map { it[Keys.COLOR_TUNING] ?: "" }
     val gpuColorPipeline: Flow<Boolean> = context.dataStore.data.map { it[Keys.GPU_COLOR_PIPELINE] ?: true }
@@ -1077,6 +1090,14 @@ class PreferencesRepository(private val context: Context) {
     }
     suspend fun setGestureAppRight(entry: AppEntry) = context.dataStore.edit {
         it[Keys.GESTURE_SWIPE_RIGHT] = GestureAction.LAUNCH_APP.id; it[Keys.GESTURE_APP_RIGHT] = json.encodeToString(entry)
+    }
+    suspend fun setGestureThreeFingerTapEnabled(enabled: Boolean) =
+        context.dataStore.edit { it[Keys.GESTURE_THREE_FINGER_TAP_ENABLED] = enabled }
+    suspend fun setGestureThreeFingerTap(a: GestureAction) =
+        context.dataStore.edit { it[Keys.GESTURE_THREE_FINGER_TAP] = a.id }
+    suspend fun setGestureAppThreeFingerTap(entry: AppEntry) = context.dataStore.edit {
+        it[Keys.GESTURE_THREE_FINGER_TAP] = GestureAction.LAUNCH_APP.id
+        it[Keys.GESTURE_APP_THREE_FINGER_TAP] = json.encodeToString(entry)
     }
     suspend fun setColorTuning(value: String) = context.dataStore.edit { it[Keys.COLOR_TUNING] = value }
     suspend fun setGpuColorPipeline(value: Boolean) = context.dataStore.edit { it[Keys.GPU_COLOR_PIPELINE] = value }

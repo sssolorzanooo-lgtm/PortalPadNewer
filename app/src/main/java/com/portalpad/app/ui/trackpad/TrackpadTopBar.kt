@@ -8,8 +8,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.FlashlightOff
-import androidx.compose.material.icons.filled.FlashlightOn
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -19,14 +18,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.portalpad.app.ui.theme.PhoneOnSurface
 import com.portalpad.app.ui.theme.PhoneOnSurfaceMuted
 import com.portalpad.app.ui.theme.PhonePrimary
-import com.portalpad.app.ui.theme.PhonePrimaryBright
 import com.portalpad.app.ui.theme.PhoneSurface
 import com.portalpad.app.ui.theme.PhoneSurfaceElevated
 
@@ -34,10 +32,9 @@ import com.portalpad.app.ui.theme.PhoneSurfaceElevated
 fun TrackpadTopBar(
     mode: TrackpadViewMode,
     onSelectMode: (TrackpadViewMode) -> Unit,
+    onHideClick: () -> Unit,
     onScreenshotClick: () -> Unit,
-    onFlashlightClick: () -> Unit,
     onSettingsClick: () -> Unit,
-    flashlightOn: Boolean,
     isRecording: Boolean = false,
     recordingLabel: String = "",
     onStartRecording: () -> Unit = {},
@@ -52,6 +49,21 @@ fun TrackpadTopBar(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        // Hide button — top-left corner; moves PortalPad back to the previous app
+        // (or wherever the user launched the floating button from) without sending
+        // a Home command to the external display.
+        IconBubble(
+            onClick = onHideClick,
+            modifier = Modifier.testTag("top_bar_hide_button"),
+        ) {
+            Icon(
+                Icons.Default.ArrowDropDown,
+                contentDescription = stringResource(com.portalpad.app.R.string.hide_to_previous_app),
+                tint = PhoneOnSurfaceMuted,
+                modifier = Modifier.size(28.dp),
+            )
+        }
+
         Row(
             Modifier
                 .weight(1f)
@@ -82,18 +94,6 @@ fun TrackpadTopBar(
             )
         }
 
-        // Flashlight — quick toggle for AR-glasses users in dark rooms. Icon
-        // and tint flip with state so the on/off state is unambiguous at a
-        // glance. Requires CAMERA permission (requested on first tap by the
-        // caller; if denied, an explainer briefly appears).
-        IconBubble(onClick = onFlashlightClick) {
-            Icon(
-                if (flashlightOn) Icons.Default.FlashlightOn else Icons.Default.FlashlightOff,
-                contentDescription = if (flashlightOn) "Flashlight on" else "Flashlight off",
-                tint = if (flashlightOn) PhonePrimaryBright else PhoneOnSurfaceMuted,
-            )
-        }
-
         // Screenshot / record. Tap = screenshot of the external display.
         // Long-press = start recording. While recording, the icon becomes a red
         // pulsing stop-square, a plain tap stops it (finalizes the MP4), and an
@@ -111,6 +111,7 @@ fun TrackpadTopBar(
         IconBubble(
             onClick = { if (isRecording) onStopRecording() else onScreenshotClick() },
             onLongClick = if (isRecording) null else onStartRecording,
+            modifier = Modifier.testTag("top_bar_capture_button"),
         ) {
             if (isRecording) {
                 val infinite = androidx.compose.animation.core.rememberInfiniteTransition(label = "rec")
@@ -141,7 +142,10 @@ fun TrackpadTopBar(
             }
         }
 
-        IconBubble(onClick = onSettingsClick) {
+        IconBubble(
+            onClick = onSettingsClick,
+            modifier = Modifier.testTag("top_bar_settings_button"),
+        ) {
             Icon(Icons.Default.Settings, contentDescription = "Open settings", tint = PhoneOnSurfaceMuted)
         }
     }
@@ -189,11 +193,12 @@ private fun SegmentButton(
 @Composable
 private fun IconBubble(
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
     onLongClick: (() -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
     Box(
-        Modifier
+        modifier
             .size(44.dp)
             .clip(RoundedCornerShape(22.dp))
             .background(PhoneSurfaceElevated)

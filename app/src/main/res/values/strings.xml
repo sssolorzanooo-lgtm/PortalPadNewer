@@ -48,6 +48,7 @@
     <string name="mode_trackpad">Trackpad</string>
     <string name="mode_media">Media</string>
     <string name="hdmi_screen">HDMI Screen (%1$dx%2$d)</string>
+    <string name="hide_to_previous_app">Hide to previous app</string>
 
 
     <!-- Dock settings -->
@@ -60,6 +61,10 @@
     <!-- Trackpad & Air Mouse Home intercept -->
     <string name="pref_phone_home_external_home_label">Phone Home controls external Home</string>
     <string name="pref_phone_home_external_home_desc">While using Touchpad or Air Mouse, pressing or gesturing Home once triggers your external display Home action. Press or gesture Home twice within 1.5 seconds to exit to your phone.</string>
+
+    <!-- Trackpad multi-finger gestures -->
+    <string name="pref_three_finger_tap_enabled_label">Three-finger tap</string>
+    <string name="pref_three_finger_tap_enabled_desc">Tap the touchpad or air-mouse surface with three fingers to trigger the selected action (Play / pause media by default).</string>
 
     <!-- Accessibility service: auto-open the typing relay on field focus -->
     <string name="accessibility_service_description">Lets PortalPad notice when a text field on the glasses is tapped or focused — including when you tap something that opens one, like a search icon — and automatically open the phone typing page, so you can type into apps on the external display without reaching for the keyboard button. PortalPad watches only editable fields on the external display, and reads the focused field\'s current text solely to show it in the typing page for editing. It does not store or transmit your content.</string>
