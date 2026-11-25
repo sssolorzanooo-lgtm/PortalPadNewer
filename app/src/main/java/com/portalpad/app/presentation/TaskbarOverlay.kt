@@ -337,11 +337,11 @@ class TaskbarOverlay(
         androidx.compose.material3.AlertDialog(
             modifier = Modifier.border(
                 1.dp,
-                com.portalpad.app.ui.theme.AbPrimaryDim,
+                com.portalpad.app.ui.theme.PhonePrimary,
                 androidx.compose.foundation.shape.RoundedCornerShape(28.dp),
             ),
             onDismissRequest = onDismiss,
-            containerColor = Color(0xFF1A1A20),
+            containerColor = Color(0xFF16161B),
             title = {
                 androidx.compose.material3.Text(
                     "Window limit reached",
@@ -377,7 +377,7 @@ class TaskbarOverlay(
             confirmButton = {},
             dismissButton = {
                 androidx.compose.material3.TextButton(onClick = onDismiss) {
-                    androidx.compose.material3.Text("Cancel", color = AbPrimaryBright)
+                    androidx.compose.material3.Text("Cancel", color = Color.White)
                 }
             },
         )
@@ -408,14 +408,15 @@ class TaskbarOverlay(
             Modifier
                 .size(TASK_ICON_DP.dp)
                 .clip(RoundedCornerShape(14.dp))
-                .background(AbSurfaceElevated.copy(alpha = 0.45f))
+                .background(AbSurfaceElevated.copy(alpha = 0.55f))
+                .border(1.dp, com.portalpad.app.ui.theme.PhonePrimary.copy(alpha = 0.65f), RoundedCornerShape(14.dp))
                 .clickable { onClick() },
             contentAlignment = Alignment.Center,
         ) {
             Icon(
                 Icons.Default.Add,
                 contentDescription = "Open app",
-                tint = AbPrimaryBright,
+                tint = Color.White,
                 modifier = Modifier.size((TASK_ICON_DP * 0.5f).dp),
             )
         }

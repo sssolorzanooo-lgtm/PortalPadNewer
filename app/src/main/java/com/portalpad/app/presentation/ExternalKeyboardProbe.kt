@@ -289,9 +289,9 @@ private val CALC_OP_FG = androidx.compose.ui.graphics.Color(0xFFFFB43C)
  * relative palette inside the mark is preserved (the outer ring simply takes the
  * value the inner one used to have).
  */
-private val BRAND_TEXT = androidx.compose.ui.graphics.Color(0xFFA89BB8)
-private val BRAND_MARK_OUTER = androidx.compose.ui.graphics.Color(0xFF7A68B0)
-private val BRAND_MARK_RING = androidx.compose.ui.graphics.Color(0xFF9684C4)
+private val BRAND_TEXT = androidx.compose.ui.graphics.Color(0xFFB4B4C0)
+private val BRAND_MARK_OUTER = androidx.compose.ui.graphics.Color(0xFF991B1B)
+private val BRAND_MARK_RING = androidx.compose.ui.graphics.Color(0xFFDC2626)
 private val BRAND_MARK_ACCENT = androidx.compose.ui.graphics.Color(0xFFDFAF5E)
 private val CLOSE_HOVER = androidx.compose.ui.graphics.Color(0xFFE05A5A)
 
@@ -1533,7 +1533,7 @@ object ExternalKeyboardProbe : LifecycleOwner, SavedStateRegistryOwner, ViewMode
                         .clip(RoundedCornerShape(2.dp))
                         .background(
                             when {
-                                dragging -> AbPrimaryBright
+                                dragging -> com.portalpad.app.ui.theme.PhoneAccent
                                 hovered -> AbPrimary
                                 else -> AbPrimaryDim
                             },
@@ -1980,7 +1980,7 @@ object ExternalKeyboardProbe : LifecycleOwner, SavedStateRegistryOwner, ViewMode
             ) {
                 Text(
                     "CALC",
-                    color = if (calcOn) AbBackground else AbOnSurfaceMuted,
+                    color = if (calcOn) androidx.compose.ui.graphics.Color.White else AbOnSurfaceMuted,
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Medium,
                 )
@@ -2140,7 +2140,7 @@ object ExternalKeyboardProbe : LifecycleOwner, SavedStateRegistryOwner, ViewMode
             } else {
                 Text(
                     label,
-                    color = if (active) AbBackground else AbPrimaryBright,
+                    color = androidx.compose.ui.graphics.Color.White,
                     // 10/11 -> 11/12 (SH): the row read as fine print over
                     // full-size keys, even after the global density bump.
                     fontSize = fontSize ?: if (text) 11.sp else 12.sp,
@@ -2187,7 +2187,7 @@ object ExternalKeyboardProbe : LifecycleOwner, SavedStateRegistryOwner, ViewMode
         ) {
             Text(
                 label,
-                color = if (accent) AbBackground else LCD_ACTION_TEXT,
+                color = if (accent) androidx.compose.ui.graphics.Color.White else LCD_ACTION_TEXT,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Medium,
             )
@@ -2231,13 +2231,10 @@ object ExternalKeyboardProbe : LifecycleOwner, SavedStateRegistryOwner, ViewMode
                 .clip(RoundedCornerShape(8.dp))
                 .background(
                     when {
-                        pressed -> AbPrimaryBright
+                        pressed -> com.portalpad.app.ui.theme.PhoneAccent
                         // Shift-selected keys brighten ABOVE their active tint on
-                        // hover (SH): plain `hovered -> AbPrimaryDim` gave CAPS
-                        // (idle AbPrimary) a DARKER hover and SHIFT (idle
-                        // AbPrimaryDim) no change at all - so a selected shift
-                        // key looked inert under the cursor.
-                        hovered && shiftState == ShiftState.CAPS -> AbPrimaryBright
+                        // hover: CAPS uses PhoneAccent, SHIFT uses AbPrimary.
+                        hovered && shiftState == ShiftState.CAPS -> com.portalpad.app.ui.theme.PhoneAccent
                         hovered && shiftState == ShiftState.SHIFT -> AbPrimary
                         hovered -> AbPrimaryDim
                         accent -> AbPrimary
@@ -2289,9 +2286,8 @@ object ExternalKeyboardProbe : LifecycleOwner, SavedStateRegistryOwner, ViewMode
                 Text(
                     label,
                     color = when {
-                        accent || shiftState == ShiftState.CAPS -> AbBackground
                         calcOperator -> CALC_OP_FG
-                        else -> AbOnSurface
+                        else -> androidx.compose.ui.graphics.Color.White
                     },
                     // Size by CONTENT, not by key width. ⇧ ⌫ ↵ are single glyphs
                     // that happen to sit on wide keys; at the 16sp meant for text

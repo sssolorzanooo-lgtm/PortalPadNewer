@@ -845,12 +845,42 @@ class BluetoothMouseController(private val injector: InputInjector) {
         // Held modifier meta (Shift/Ctrl/Alt/Meta) for the keyboard relay — reset
         // per session so a modifier can't get "stuck" across reconnects.
         var heldMeta = 0
-        // Left-button click-vs-drag state (per session).
-        var leftHeld = false
-        var leftDragging = false
-        var dragResolved = false
-        var dragAccX = 0f
-        var dragAccY = 0f
+        // Left-button press-and-hold / click / drag state (per session).
+        val leftHoldTracker = MouseLeftHoldTracker(
+            actions = object : MouseLeftHoldTracker.Actions {
+                override fun onPointerMove(dx: Float, dy: Float) {
+                    injector.pointerMove(dx, dy)
+                }
+
+                override fun onLeftClick() {
+                    injector.leftClick()
+                }
+
+                override fun onRightClick() {
+                    injector.rightClick()
+                }
+
+                override fun onLongPressStart() {
+                    injector.kbSeekHoldStart()
+                }
+
+                override fun onLongPressEnd() {
+                    injector.kbSeekHoldEnd()
+                }
+
+                override fun onDragStart(captionMove: Boolean) {
+                    injector.dragStart(captionMove)
+                }
+
+                override fun onDragMove(dx: Float, dy: Float) {
+                    injector.dragMove(dx, dy)
+                }
+
+                override fun onDragEnd() {
+                    injector.dragEnd()
+                }
+            },
+        )
         try {
             while (currentCoroutineContext().isActive) {
                 var off = 0
@@ -913,6 +943,7 @@ class BluetoothMouseController(private val injector: InputInjector) {
                 val released = lastButtons and buttons.inv()
 
                 if (inputMode == MODE_REMOTE) {
+                    leftHoldTracker.cancel()
                     // REMOTE. Same vocabulary as the Remote tab's gesture pad, fed
                     // by a grabbed device instead of the touchscreen. No cursor
                     // moves and no clicks are injected: in this mode the device is
@@ -961,44 +992,34 @@ class BluetoothMouseController(private val injector: InputInjector) {
                 val sdx = dx * s
                 val sdy = dy * s
 
-                // Left DOWN: begin a pending press (click vs drag decided by
-                // movement). Right DOWN: immediate context tap. Middle: unmapped.
+                // Left DOWN: match touchpad hold semantics (quick click, stationary
+                // hold -> long-press/seek/select, edge/caption hold or move -> drag).
                 if (pressed and BTN_LEFT != 0) {
                     injector.notifyExternalMouseSourceActive(grabSucceeded)
-                    leftHeld = true; leftDragging = false; dragResolved = false
-                    dragAccX = 0f; dragAccY = 0f
+                    val curType = injector.cursorType.value
+                    val onEdge = curType != CursorType.ARROW && curType != CursorType.MOVE
+                    leftHoldTracker.onLeftDown(
+                        onResizeEdge = onEdge,
+                        onCaption = injector.cursorOnCaption.value,
+                        onHandle = injector.pressOnHandleNow(),
+                        onButton = injector.pressOnButtonNow(),
+                    )
                 }
                 if (pressed and BTN_RIGHT != 0) {
                     injector.notifyExternalMouseSourceActive(grabSucceeded)
                     injector.rightClick()
                 }
 
-                // Movement: while left is held, accumulate until it crosses the
-                // drag threshold, then promote to a real held touch-drag (window
-                // move, or resize when grabbing an edge); below threshold it's
-                // just cursor movement, so a quick press/release stays a click.
+                // Movement: move cursor below threshold, drag once promoted.
                 if (dx != 0 || dy != 0) {
                     injector.notifyExternalMouseSourceActive(grabSucceeded)
-                    if (leftHeld && leftDragging) {
-                        injector.dragMove(sdx, sdy)
-                    } else if (leftHeld && !dragResolved) {
-                        injector.pointerMove(sdx, sdy)
-                        dragAccX += sdx; dragAccY += sdy
-                        if (kotlin.math.hypot(dragAccX.toDouble(), dragAccY.toDouble()) > DRAG_THRESHOLD) {
-                            dragResolved = true
-                            leftDragging = true
-                            injector.dragStart()
-                        }
-                    } else {
-                        injector.pointerMove(sdx, sdy)
-                    }
+                    leftHoldTracker.onMove(sdx, sdy)
                 }
 
-                // Left UP: end the drag, or — if it never became one — click.
+                // Left UP: end drag, fire long-press release, or emit left click.
                 if (released and BTN_LEFT != 0) {
                     injector.notifyExternalMouseSourceActive(grabSucceeded)
-                    if (leftDragging) injector.dragEnd() else injector.leftClick()
-                    leftHeld = false; leftDragging = false; dragResolved = false
+                    leftHoldTracker.onLeftUp()
                 }
 
                 lastButtons = buttons
@@ -1023,6 +1044,7 @@ class BluetoothMouseController(private val injector: InputInjector) {
         } catch (t: Throwable) {
             Log.w(TAG, "mouse read loop ended", t)
         } finally {
+            leftHoldTracker.cancel()
             runCatching { input.close() }
             running = false
             isActivelyGrabbed = false

@@ -784,15 +784,13 @@ class TopWindowBarOverlay(
                 setPadding(pad, pad, pad, pad)
                 background = GradientDrawable().apply {
                     cornerRadius = 18f * density
-                    setColor("#F21A1226".toColorInt())
-                    // Standard popup hairline (SH): every display popup gets
-                    // the violet border the phone dialogs use (AbPrimaryDim).
-                    setStroke((1 * density).toInt(), "#5B3CAA".toColorInt())
+                    setColor("#F216161B".toColorInt())
+                    setStroke((1 * density).toInt(), "#DC2626".toColorInt())
                 }
             }
             val msg = TextView(displayContext).apply {
                 text = if (isDesktopMode) "Close windows?" else "Close all apps?"
-                setTextColor("#F2F2F5".toColorInt())
+                setTextColor("#FFFFFF".toColorInt())
                 setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, 18f * density)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 gravity = Gravity.CENTER
@@ -802,18 +800,18 @@ class TopWindowBarOverlay(
             fun pill(label: String, textColor: Int, fill: Int, onTap: () -> Unit): TextView =
                 confirmPill(label, textColor, fill, onTap)
             fun hgap() = TextView(displayContext).apply { width = (12 * density).toInt() }
-            val btnCancel = pill("Cancel", "#F2F2F5".toColorInt(), "#332A2140".toColorInt()) {
+            val btnCancel = pill("Cancel", "#FFFFFF".toColorInt(), "#33282832".toColorInt()) {
                 dismissConfirm()
             }
             // Destructive action — kept red, but sized to its text (not a full-width
             // bar) and set apart on its own centered row below the safe actions.
-            val btnCloseAll = pill("Close all windows", "#FFFFFFFF".toColorInt(), "#CCFF6B6B".toColorInt()) {
+            val btnCloseAll = pill("Close all windows", "#FFFFFFFF".toColorInt(), "#CCDC2626".toColorInt()) {
                 dismissConfirm()
                 closeAllExternalApps()
             }
             if (isDesktopMode) {
                 // Row 1: safe actions side by side.
-                val btnManage = pill("Manage Windows", "#FFC8A6FF".toColorInt(), "#332A2140".toColorInt()) {
+                val btnManage = pill("Manage Windows", "#FFFFFFFF".toColorInt(), "#59DC2626".toColorInt()) {
                     dismissConfirm()
                     launchManageOnPhone()
                 }
@@ -1705,7 +1703,7 @@ class TopWindowBarOverlay(
         hideTooltip()
         val tip = TextView(displayContext).apply {
             this.text = text
-            setTextColor("#F2F2F5".toColorInt())
+            setTextColor("#FFFFFF".toColorInt())
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, 13f * density)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
             gravity = Gravity.CENTER
@@ -1714,8 +1712,8 @@ class TopWindowBarOverlay(
             setPadding(padH, padV, padH, padV)
             background = GradientDrawable().apply {
                 cornerRadius = 10f * density
-                setColor("#E61A1226".toColorInt())   // dark, slightly translucent
-                setStroke((1 * density).toInt(), "#5B3CAA".toColorInt())
+                setColor("#E616161B".toColorInt())   // dark neutral charcoal, slightly translucent
+                setStroke((1 * density).toInt(), "#DC2626".toColorInt())
             }
         }
         // Measure to size the window and center it under the anchor.
@@ -1901,15 +1899,13 @@ class TopWindowBarOverlay(
                 setPadding(pad, pad, pad, pad)
                 background = GradientDrawable().apply {
                     cornerRadius = 18f * density
-                    setColor("#F21A1226".toColorInt())
-                    // Standard popup hairline (SH): every display popup gets
-                    // the violet border the phone dialogs use (AbPrimaryDim).
-                    setStroke((1 * density).toInt(), "#5B3CAA".toColorInt())
+                    setColor("#F216161B".toColorInt())
+                    setStroke((1 * density).toInt(), "#DC2626".toColorInt())
                 }
             }
             card.addView(TextView(displayContext).apply {
                 text = if (toDesktop) "Switch to desktop mode?" else "Switch to theater mode?"
-                setTextColor("#F2F2F5".toColorInt())
+                setTextColor("#FFFFFF".toColorInt())
                 setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, 18f * density)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 gravity = Gravity.CENTER
@@ -1923,7 +1919,7 @@ class TopWindowBarOverlay(
                 } else {
                     "Theater mode shows one app at a time, filling the external display."
                 }
-                setTextColor("#F2F2F5".toColorInt())
+                setTextColor("#FFFFFF".toColorInt())
                 setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, 14f * density)
                 gravity = Gravity.CENTER
                 setPadding(0, 0, 0, (8 * density).toInt())
@@ -1931,19 +1927,19 @@ class TopWindowBarOverlay(
             card.addView(TextView(displayContext).apply {
                 text = "This closes anything open on the external display. " +
                     "Reopen apps from the dock afterward."
-                setTextColor("#CCF2F2F5".toColorInt())
+                setTextColor("#CCFFFFFF".toColorInt())
                 setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, 14f * density)
                 gravity = Gravity.CENTER
                 setPadding(0, 0, 0, (14 * density).toInt())
             })
-            val btnCancel = confirmPill("Cancel", "#F2F2F5".toColorInt(), "#332A2140".toColorInt()) {
+            val btnCancel = confirmPill("Cancel", "#FFFFFF".toColorInt(), "#33282832".toColorInt()) {
                 Log.i(TAG, "MODE-SWITCH cancelled (toDesktop=$toDesktop)")
                 dismissConfirm()
             }
             val btnSwitch = confirmPill(
                 if (toDesktop) "Switch to desktop" else "Switch to theater",
-                "#FFC8A6FF".toColorInt(),
-                "#332A2140".toColorInt(),
+                "#FFFFFFFF".toColorInt(),
+                "#59DC2626".toColorInt(),
             ) {
                 dismissConfirm()
                 // scope is nulled in dismiss(); if the bar is being torn down at

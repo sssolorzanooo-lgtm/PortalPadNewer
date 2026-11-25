@@ -521,6 +521,60 @@ class DockOverlay(
                 }
             }.distinctUntilChanged()
         }
+        val recentExternalAppsFlow = remember {
+            kotlinx.coroutines.flow.combine(
+                app.windowMonitor.snapshot,
+                app.externalRecentApps,
+            ) { snap, recorded ->
+                val pm = app.packageManager
+                fun appLabel(pkg: String): String = runCatching {
+                    pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+                }.getOrDefault(pkg)
+
+                val liveTasks = snap.tasks.filter { rt ->
+                    app.isTrackableExternalPackage(rt.packageName) &&
+                        !app.isRecentlyForceClosed(rt.packageName)
+                }
+                val entries = linkedMapOf<String, com.portalpad.app.ui.dock.DockRecentAppEntry>()
+                liveTasks.sortedByDescending { if (it.visible) 1 else 0 }.forEach { rt ->
+                    val pkg = rt.packageName
+                    val recComp = recorded.firstOrNull {
+                        it.packageName.equals(pkg, ignoreCase = true)
+                    }?.component
+                    val comp = rt.topActivity?.takeIf { it.isNotBlank() } ?: recComp
+                    val key = pkg.lowercase()
+                    val existing = entries[key]
+                    if (existing == null) {
+                        entries[key] = com.portalpad.app.ui.dock.DockRecentAppEntry(
+                            packageName = pkg,
+                            component = comp,
+                            label = appLabel(pkg),
+                            taskId = rt.taskId,
+                            isOpen = true,
+                        )
+                    } else if (existing.component == null && comp != null) {
+                        entries[key] = existing.copy(component = comp)
+                    }
+                }
+                recorded.forEach { rec ->
+                    val pkg = rec.packageName
+                    if (!app.isTrackableExternalPackage(pkg) || app.isRecentlyForceClosed(pkg)) {
+                        return@forEach
+                    }
+                    val key = pkg.lowercase()
+                    if (!entries.containsKey(key)) {
+                        entries[key] = com.portalpad.app.ui.dock.DockRecentAppEntry(
+                            packageName = pkg,
+                            component = rec.component,
+                            label = appLabel(pkg),
+                            taskId = null,
+                            isOpen = false,
+                        )
+                    }
+                }
+                entries.values.toList()
+            }.distinctUntilChanged()
+        }
         DockBar(
             dockFlow = app.prefs.dockConfig,
             onLaunchEntry = { entry ->
@@ -558,6 +612,7 @@ class DockOverlay(
                         val opts = android.app.ActivityOptions.makeBasic()
                             .setLaunchDisplayId(display.displayId).toBundle()
                         app.startActivity(intent, opts)
+                        app.recordExternalApp(component, force = true)
                         Log.d(TAG, "dock launch via ActivityOptions (no privilege): $component")
                     }.onFailure { Log.w(TAG, "privilege-less dock launch failed", it) }
                 }
@@ -658,6 +713,63 @@ class DockOverlay(
                     com.portalpad.app.presentation.GlassesToast.show(
                         app, display, "Need at least 2 windows to arrange", 3000L,
                     )
+                }
+            },
+            recentExternalAppsFlow = recentExternalAppsFlow,
+            onSwitchRecentApp = { entry ->
+                restoreScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val desktop = runCatching {
+                        app.prefs.bool(
+                            com.portalpad.app.data.PreferencesRepository.Keys.DESKTOP_MODE_ENABLED,
+                            default = false,
+                        ).first()
+                    }.getOrDefault(false)
+                    val component = entry.component?.takeIf { it.isNotBlank() }
+                        ?: app.packageManager.getLaunchIntentForPackage(entry.packageName)
+                            ?.component?.flattenToString()
+                    if (entry.isOpen && entry.taskId != null && desktop) {
+                        val liveTask = runCatching {
+                            app.freeform.listTasks(display.displayId)
+                                .firstOrNull { it.taskId == entry.taskId }
+                        }.getOrNull()
+                        if (liveTask != null) {
+                            app.recordExternalApp(component ?: entry.packageName, force = true)
+                            runCatching { app.freeform.bringToFront(liveTask) }
+                            return@launch
+                        }
+                    }
+                    if (component != null) {
+                        if (app.access.isReady) {
+                            launchFromDock(app, component)
+                        } else {
+                            runCatching {
+                                val intent = app.packageManager
+                                    .getLaunchIntentForPackage(entry.packageName)
+                                    ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    ?: return@runCatching
+                                val opts = android.app.ActivityOptions.makeBasic()
+                                    .setLaunchDisplayId(display.displayId).toBundle()
+                                app.startActivity(intent, opts)
+                                app.recordExternalApp(component, force = true)
+                            }
+                        }
+                    }
+                }
+            },
+            onForceCloseRecentApp = { entry ->
+                restoreScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching {
+                        app.freeform.forceCloseExternalApp(entry.packageName, entry.taskId)
+                    }
+                }
+            },
+            onForceCloseAllRecentApps = { entries ->
+                restoreScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching {
+                        app.freeform.forceCloseAllExternalApps(
+                            entries.map { it.packageName to it.taskId },
+                        )
+                    }
                 }
             },
         )
@@ -863,6 +975,7 @@ class DockOverlay(
      *  enforces it, so the second window counts and the limit popup still fires. */
     private fun launchNewWindowFromDock(app: PortalPadApp, component: String) {
         app.markExternalLaunch()
+        app.recordExternalApp(component, force = true)
         val metrics = android.util.DisplayMetrics().also {
             @Suppress("DEPRECATION") display.getRealMetrics(it)
         }
@@ -890,7 +1003,7 @@ class DockOverlay(
 
     private fun launchFromDock(app: PortalPadApp, component: String) {
         app.markExternalLaunch()
-        app.recordExternalApp(component)
+        app.recordExternalApp(component, force = true)
         val desktop = runCatching {
             runBlocking {
                 app.prefs.bool(

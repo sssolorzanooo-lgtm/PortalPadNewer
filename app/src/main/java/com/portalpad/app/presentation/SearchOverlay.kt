@@ -339,7 +339,7 @@ class SearchOverlay(
                             Icon(
                                 Icons.Default.Mic,
                                 contentDescription = "Voice search",
-                                tint = if (listening) Color.White else AbPrimaryBright,
+                                tint = Color.White,
                             )
                         }
                         Spacer(Modifier.width(4.dp))

@@ -83,6 +83,8 @@ class PortalPadApp : Application() {
         }
 
     @Volatile private var currentAccessMode: AccessMode = AccessMode.NONE
+    @Volatile var autoOpenMainOnDisplayConnectEnabled: Boolean = false
+    @Volatile private var lastAutoOpenMainAtMs: Long = 0L
 
     /** Shared Shizuku UserService binder (lazy — only binds when needed). */
     val shizukuClickBackend: com.portalpad.app.service.ShizukuClickBackend by lazy {
@@ -310,30 +312,123 @@ class PortalPadApp : Application() {
     @Volatile
     var activeExternalApp: com.portalpad.app.data.LastDisconnectedApp? = null
 
-    fun recordExternalApp(component: String) {
+    data class ExternalRecentApp(
+        val packageName: String,
+        val component: String? = null,
+        val lastUsedAtMs: Long = System.currentTimeMillis(),
+    )
+
+    private val _externalRecentApps = MutableStateFlow<List<ExternalRecentApp>>(emptyList())
+    val externalRecentApps: StateFlow<List<ExternalRecentApp>> = _externalRecentApps.asStateFlow()
+
+    private val recentlyForceClosedUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    fun isTrackableExternalPackage(pkg: String): Boolean {
+        val lower = pkg.trim().lowercase()
+        if (lower.isEmpty()) return false
+        if (lower.contains("launcher") || lower.contains("nexuslauncher")) return false
+        if (lower.startsWith("com.portalpad") || lower == BuildConfig.APPLICATION_ID.lowercase()) {
+            return false
+        }
+        if (lower == "com.android.permissioncontroller" ||
+            lower == "com.google.android.permissioncontroller" ||
+            lower == "com.android.packageinstaller" ||
+            lower == "com.google.android.packageinstaller"
+        ) {
+            return false
+        }
+        return true
+    }
+
+    fun markForceClosedRecently(packageName: String, durationMs: Long = 4000L) {
+        if (packageName.isBlank()) return
+        recentlyForceClosedUntil[packageName] = android.os.SystemClock.elapsedRealtime() + durationMs
+    }
+
+    fun clearForceClosedCooldown(packageName: String) {
+        if (packageName.isNotBlank()) recentlyForceClosedUntil.remove(packageName)
+    }
+
+    fun isRecentlyForceClosed(packageName: String): Boolean {
+        val until = recentlyForceClosedUntil[packageName] ?: return false
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now <= until) return true
+        recentlyForceClosedUntil.remove(packageName, until)
+        return false
+    }
+
+    fun recordExternalApp(
+        component: String,
+        force: Boolean = false,
+        updateActive: Boolean = true,
+    ) {
+        val pkg = component.substringBefore('/')
+        if (!isTrackableExternalPackage(pkg)) return
+        if (force) {
+            clearForceClosedCooldown(pkg)
+        } else if (isRecentlyForceClosed(pkg)) {
+            return
+        }
         synchronized(externalAppComponents) {
-            externalAppComponents.remove(component) // re-insert at end = most recent
-            externalAppComponents.add(component)
-            while (externalAppComponents.size > 8) {
-                val it = externalAppComponents.iterator()
-                if (it.hasNext()) { it.next(); it.remove() } else break
+            if (updateActive || externalAppComponents.none { it == pkg || it.startsWith("$pkg/") }) {
+                externalAppComponents.removeAll { it == pkg || it.startsWith("$pkg/") }
+                externalAppComponents.add(component)
+                while (externalAppComponents.size > 16) {
+                    val it = externalAppComponents.iterator()
+                    if (it.hasNext()) { it.next(); it.remove() } else break
+                }
             }
         }
-        val pkg = component.substringBefore('/')
-        if (pkg.isNotBlank() &&
-            !pkg.contains("launcher", ignoreCase = true) &&
-            !pkg.contains("nexuslauncher", ignoreCase = true) &&
-            !pkg.startsWith("com.portalpad")
-        ) {
+        val now = System.currentTimeMillis()
+        synchronized(_externalRecentApps) {
+            val current = _externalRecentApps.value
+            val existing = current.firstOrNull { it.packageName == pkg }
+            if (updateActive) {
+                val resolvedComp = component.takeIf { it.contains('/') } ?: existing?.component
+                val filtered = current.filterNot { it.packageName == pkg }
+                val entry = ExternalRecentApp(
+                    packageName = pkg,
+                    component = resolvedComp,
+                    lastUsedAtMs = now,
+                )
+                _externalRecentApps.value = (listOf(entry) + filtered).take(16)
+            } else if (existing == null) {
+                val entry = ExternalRecentApp(
+                    packageName = pkg,
+                    component = component.takeIf { it.contains('/') },
+                    lastUsedAtMs = now,
+                )
+                _externalRecentApps.value = (current + entry).take(16)
+            } else if (existing.component.isNullOrBlank() && component.contains('/')) {
+                _externalRecentApps.value = current.map {
+                    if (it.packageName == pkg) it.copy(component = component) else it
+                }
+            }
+        }
+        if (updateActive) {
             val prev = activeExternalApp
             if (prev == null || prev.packageName != pkg) {
                 activeExternalApp = com.portalpad.app.data.LastDisconnectedApp(
                     packageName = pkg,
                     component = component,
                 )
-            } else if (prev.component.isNullOrBlank()) {
+            } else if (prev.component.isNullOrBlank() && component.contains('/')) {
                 activeExternalApp = prev.copy(component = component)
             }
+        }
+    }
+
+    fun removeExternalRecentApp(packageName: String) {
+        if (packageName.isBlank()) return
+        markForceClosedRecently(packageName)
+        synchronized(externalAppComponents) {
+            externalAppComponents.removeAll { it == packageName || it.startsWith("$packageName/") }
+        }
+        synchronized(_externalRecentApps) {
+            _externalRecentApps.value = _externalRecentApps.value.filterNot { it.packageName == packageName }
+        }
+        if (activeExternalApp?.packageName == packageName) {
+            activeExternalApp = null
         }
     }
 
@@ -468,7 +563,7 @@ class PortalPadApp : Application() {
         val displayId = externalDisplayId.value ?: return
         if (!access.isReady) return
         markExternalLaunch()
-        recordExternalApp(component)
+        recordExternalApp(component, force = true)
         appScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val desktop = runCatching {
                 prefs.bool(com.portalpad.app.data.PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, default = false).first()
@@ -922,7 +1017,67 @@ class PortalPadApp : Application() {
             }
         }
 
+        appScope.launch {
+            prefs.autoOpenMainOnDisplayConnect.collectLatest {
+                autoOpenMainOnDisplayConnectEnabled = it
+            }
+        }
+
+        registerExternalDisplayConnectAutoOpener()
         registerActivityLifecycleCallbacks(LifecycleTracker())
+    }
+
+    private fun registerExternalDisplayConnectAutoOpener() {
+        val dm = runCatching {
+            getSystemService(android.hardware.display.DisplayManager::class.java)
+        }.getOrNull() ?: return
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val listener = object : android.hardware.display.DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {
+                val d = runCatching { dm.getDisplay(displayId) }.getOrNull() ?: return
+                val now = android.os.SystemClock.elapsedRealtime()
+                val elapsed = if (lastAutoOpenMainAtMs == 0L) Long.MAX_VALUE else (now - lastAutoOpenMainAtMs)
+                if (!shouldAutoOpenMainOnConnect(
+                        enabled = autoOpenMainOnDisplayConnectEnabled,
+                        serviceRunning = serviceRunning.value,
+                        startPageForeground = startPageForeground,
+                        isRealExternalDisplay = DisplayUtil.isRealExternalDisplay(d),
+                        elapsedSinceLastMs = elapsed,
+                    )
+                ) {
+                    return
+                }
+                lastAutoOpenMainAtMs = now
+                openMainScreenOnPhoneDisplay()
+            }
+
+            override fun onDisplayRemoved(displayId: Int) = Unit
+            override fun onDisplayChanged(displayId: Int) = Unit
+        }
+        runCatching { dm.registerDisplayListener(listener, handler) }
+    }
+
+    private fun openMainScreenOnPhoneDisplay() {
+        val intent = android.content.Intent(this, MainActivity::class.java).addFlags(
+            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP,
+        )
+        val opts = android.app.ActivityOptions.makeBasic().apply {
+            runCatching { launchDisplayId = android.view.Display.DEFAULT_DISPLAY }
+            if (android.os.Build.VERSION.SDK_INT >= 34) {
+                runCatching {
+                    pendingIntentBackgroundActivityStartMode =
+                        android.app.ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED
+                }
+            }
+        }.toBundle()
+        val launcherCtx = com.portalpad.app.service.PortalPadAccessibilityService.instance ?: this
+        runCatching {
+            launcherCtx.startActivity(intent, opts)
+        }.onFailure {
+            runCatching { startActivity(intent) }
+        }
     }
 
     /**
@@ -991,6 +1146,19 @@ class PortalPadApp : Application() {
          *  string formatting + logcat I/O is real work during dock interaction).
          *  Flip on via the Diagnostics page only when chasing a hover/tooltip bug. */
         @Volatile var verboseHoverLog: Boolean = false
+
+        internal fun shouldAutoOpenMainOnConnect(
+            enabled: Boolean,
+            serviceRunning: Boolean,
+            startPageForeground: Boolean,
+            isRealExternalDisplay: Boolean,
+            elapsedSinceLastMs: Long,
+        ): Boolean =
+            enabled &&
+                !serviceRunning &&
+                !startPageForeground &&
+                isRealExternalDisplay &&
+                elapsedSinceLastMs >= 3_000L
     }
 
     /**

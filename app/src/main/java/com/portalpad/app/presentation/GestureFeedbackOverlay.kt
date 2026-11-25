@@ -259,7 +259,7 @@ object GestureFeedbackOverlay {
 
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         // Remote / Preset violet palette
-        private val cardFill = "#F21A1326".toColorInt()
+        private val cardFill = "#F216161B".toColorInt()
         private val ringTrack = "#5A554F68".toColorInt()
         private val accent = "#A465FF".toColorInt()
         private val accentBright = "#D0ACFF".toColorInt()

@@ -1097,6 +1097,9 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         }
         val ok = runCatching { access.startActivityOnDisplay(launchComp, disp) }
             .getOrDefault(false)
+        if (ok) {
+            PortalPadApp.instance.recordExternalApp(task.topActivity ?: launchComp, force = true, updateActive = true)
+        }
         Log.d(TAG, "bringToFront(${task.taskId}) $launchComp disp=$disp ok=$ok")
         PortalPadApp.instance.signalWindowsChanged()
     }
@@ -1250,20 +1253,157 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
                 return
             }
         }
+        var shellClosed = false
         runCatching {
             val out = access.execShell("am task $taskId remove")
-            if (out.containsError() || out.contains("Unknown", ignoreCase = true) ||
+            val failed = out.containsError() || out.contains("Unknown", ignoreCase = true) ||
                 out.contains("Error", ignoreCase = true)
-            ) {
+            if (!failed) {
+                shellClosed = true
+            } else {
                 Log.d(TAG, "close: 'am task remove' spelling failed, trying alternates")
                 // Alternate spellings seen across builds.
                 val alt = access.execShell("am stack remove $taskId")
-                if (alt.containsError() || alt.contains("Unknown", ignoreCase = true)) {
-                    access.execShell("am force-stop-task $taskId")
+                val altFailed = alt.containsError() || alt.contains("Unknown", ignoreCase = true) ||
+                    alt.contains("Error", ignoreCase = true)
+                if (!altFailed) {
+                    shellClosed = true
+                } else {
+                    val fs = access.execShell("am force-stop-task $taskId")
+                    shellClosed = !fs.containsError() && !fs.contains("Unknown", ignoreCase = true)
                 }
             }
         }.onFailure { Log.e(TAG, "close($taskId) failed", it) }
+        if (!shellClosed) {
+            runCatching {
+                val b = PortalPadApp.instance.activeBoundBackend
+                if (b?.isReady == true) b.removeTask(taskId)
+            }
+        }
         PortalPadApp.instance.signalWindowsChanged()
+    }
+
+    /**
+     * Force close an app opened on the external display: removes its tasks,
+     * force-stops its package, purges it from the Recent Apps session list,
+     * and restores the wallpaper if no other real app remains open.
+     */
+    fun forceCloseExternalApp(packageName: String, taskId: Int? = null) {
+        val app = PortalPadApp.instance
+        app.removeExternalRecentApp(packageName)
+        clearMaximizedPackage(packageName)
+        if (taskId != null && taskId > 0) {
+            clearMinimized(taskId)
+            preMaximizeBounds.remove(taskId)
+            if (maximizedTaskId == taskId) maximizedTaskId = null
+        }
+        val matchingTasks = runCatching {
+            listExternalTasks().filter { it.packageName == packageName }
+        }.getOrDefault(emptyList())
+        val idsToClose = buildSet {
+            if (taskId != null && taskId > 0) add(taskId)
+            matchingTasks.forEach { if (it.taskId > 0) add(it.taskId) }
+        }
+        for (id in idsToClose) {
+            clearMinimized(id)
+            runCatching {
+                val b = app.activeBoundBackend
+                if (b?.isReady == true) b.removeTask(id)
+            }
+            runCatching { close(id) }
+        }
+        if (isReady) {
+            runCatching { access.execShell("am force-stop $packageName") }
+        } else {
+            runCatching {
+                val am = app.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                    as? android.app.ActivityManager
+                am?.killBackgroundProcesses(packageName)
+            }
+        }
+        app.signalWindowsChanged()
+        val extId = app.externalDisplayId.value
+        if (extId != null) {
+            val anyVisibleRemaining = runCatching {
+                listExternalTasks().any { rt ->
+                    rt.visible &&
+                        rt.packageName != packageName &&
+                        app.isTrackableExternalPackage(rt.packageName)
+                }
+            }.getOrDefault(false)
+            if (!anyVisibleRemaining) {
+                PortalPadForegroundService.showWallpaper()
+            }
+        }
+    }
+
+    /**
+     * Force close all apps in the Recent Apps switcher (plus any live user
+     * tasks remaining on the external display) and restore the wallpaper.
+     */
+    fun forceCloseAllExternalApps(entries: List<Pair<String, Int?>> = emptyList()) {
+        val app = PortalPadApp.instance
+        val liveExternal = runCatching { listExternalTasks() }.getOrDefault(emptyList())
+        val targets = linkedMapOf<String, Int?>()
+        entries.forEach { (pkg, tid) ->
+            if (app.isTrackableExternalPackage(pkg)) {
+                targets.putIfAbsent(pkg, tid)
+            }
+        }
+        liveExternal.forEach { rt ->
+            if (app.isTrackableExternalPackage(rt.packageName)) {
+                targets.putIfAbsent(rt.packageName, rt.taskId)
+            }
+        }
+        targets.forEach { (pkg, tid) ->
+            app.removeExternalRecentApp(pkg)
+            clearMaximizedPackage(pkg)
+            if (tid != null && tid > 0) {
+                clearMinimized(tid)
+                preMaximizeBounds.remove(tid)
+                if (maximizedTaskId == tid) maximizedTaskId = null
+            }
+            val matching = liveExternal.filter { it.packageName == pkg }
+            val ids = buildSet {
+                if (tid != null && tid > 0) add(tid)
+                matching.forEach { if (it.taskId > 0) add(it.taskId) }
+            }
+            for (id in ids) {
+                clearMinimized(id)
+                runCatching {
+                    val b = app.activeBoundBackend
+                    if (b?.isReady == true) b.removeTask(id)
+                }
+                runCatching { close(id) }
+            }
+            if (isReady) {
+                runCatching { access.execShell("am force-stop $pkg") }
+            } else {
+                runCatching {
+                    val am = app.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                        as? android.app.ActivityManager
+                    am?.killBackgroundProcesses(pkg)
+                }
+            }
+        }
+        app.signalWindowsChanged()
+        if (app.externalDisplayId.value != null) {
+            PortalPadForegroundService.showWallpaper()
+        }
+    }
+
+    /**
+     * Find active Picture-in-Picture (pinned) tasks on the phone display (display 0).
+     * Combines `am stack list` / `cmd activity stack list` with `dumpsys activity activities`
+     * so PiP windows are detected even when another app is focused behind the PiP overlay.
+     */
+    fun findPhonePipTasks(): List<RunningTask> {
+        if (!isReady) return emptyList()
+        val stackOut = runCatching { access.execShell("am stack list") }.getOrDefault("")
+            .ifBlank { runCatching { access.execShell("cmd activity stack list") }.getOrDefault("") }
+        val actOut = runCatching { access.execShell("dumpsys activity activities") }.getOrDefault("")
+        return (parsePhonePipTasks(stackOut) + parsePhonePipTasks(actOut))
+            .distinctBy { if (it.taskId > 0) "t:${it.taskId}" else "p:${it.packageName}" }
     }
 
     /**
@@ -2057,6 +2197,81 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
 
     private fun String.containsError(): Boolean =
         contains("Error:", ignoreCase = true) || contains("Exception", ignoreCase = true)
+
+    internal fun parsePhonePipTasks(rawDump: String): List<RunningTask> {
+        if (rawDump.isBlank()) return emptyList()
+        val out = mutableListOf<RunningTask>()
+        var currentDisplay = -1
+        var currentPinnedSection = false
+        var sectionDepth = 0
+        for (line in rawDump.lineSequence()) {
+            ANY_DISPLAY.find(line)?.let {
+                val d = it.groupValues[1].toIntOrNull()
+                if (d != null) {
+                    currentDisplay = d
+                    currentPinnedSection = false
+                }
+            }
+            val lower = line.lowercase()
+            if (lower.contains("mpinnedtaskcontroller") ||
+                lower.contains("windowingmode=2") ||
+                lower.contains("mode=pinned") ||
+                lower.contains("windowing_mode_pinned") ||
+                Regex("""\btype=\w+\s+mode=pinned\b""").containsMatchIn(lower) ||
+                Regex("""\broottask\b.*\bpinned\b""").containsMatchIn(lower)
+            ) {
+                currentPinnedSection = true
+                sectionDepth = 12
+            } else if (sectionDepth > 0) {
+                sectionDepth--
+                if (sectionDepth == 0) currentPinnedSection = false
+            }
+
+            val isPinnedLine = currentPinnedSection ||
+                lower.contains("windowingmode=2") ||
+                lower.contains("mode=pinned") ||
+                lower.contains("pinned")
+            if (!isPinnedLine) continue
+
+            val parsed = parseTaskLine(line)
+            if (parsed != null) {
+                val effDisplay = if (parsed.displayId != -1) parsed.displayId else currentDisplay
+                if (effDisplay <= 0) {
+                    out += parsed.copy(displayId = 0)
+                }
+                continue
+            }
+
+            // Some `dumpsys activity activities` lines list `realActivity=pkg/.Act` or
+            // `ActivityRecord{... pkg/.Act t123}` without `taskId=` prefix.
+            val actComp = COMPONENT.find(line)?.value
+            if (actComp != null && currentDisplay <= 0 &&
+                !actComp.startsWith("com.portalpad") &&
+                !actComp.contains("launcher", ignoreCase = true) &&
+                !actComp.contains("systemui", ignoreCase = true)
+            ) {
+                val tid = Regex("""\bt(\d+)\b""").find(line)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: Regex("""\bid=(\d+)\b""").find(line)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: -1
+                val pkg = actComp.substringBefore('/')
+                out += RunningTask(
+                    taskId = tid,
+                    packageName = pkg,
+                    topActivity = actComp,
+                    displayId = 0,
+                    bounds = null,
+                    visible = true,
+                )
+            }
+        }
+        return out
+            .filter { rt ->
+                !rt.packageName.startsWith("com.portalpad") &&
+                    !rt.packageName.contains("launcher", ignoreCase = true) &&
+                    rt.packageName != "com.android.systemui"
+            }
+            .distinctBy { if (it.taskId > 0) "t:${it.taskId}" else "p:${it.packageName}" }
+    }
 
     companion object {
         private const val TAG = "FreeformManager"

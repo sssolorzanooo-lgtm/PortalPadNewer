@@ -384,7 +384,7 @@ class QuickSettingsOverlay(
             android.util.DisplayMetrics().also { display.getRealMetrics(it) }
         }
         val density = LocalDensity.current
-        val accent = com.portalpad.app.ui.theme.AbPrimaryBright
+        val accent = com.portalpad.app.ui.theme.PhonePrimary
 
         // Compact menu, RIGHT-aligned just above the dock so it reads as integrated
         // at the dock's bottom-right. The gap between the menu's bottom and the
@@ -673,7 +673,7 @@ class QuickSettingsOverlay(
             Spacer(Modifier.height(2.dp))
             Text(
                 status,
-                color = if (on) accent else muted,
+                color = if (on) strong else muted,
                 fontSize = statusSize,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

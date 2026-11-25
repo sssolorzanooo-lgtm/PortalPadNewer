@@ -6,25 +6,25 @@ import androidx.compose.ui.graphics.Color
 // Distinct from the reference implementation (which is blue-dark with teal primary). Names keep the
 // "Ab" prefix purely as a stable internal identifier — no relation to color hue.
 
-val AbBackground = Color(0xFF0F0A1A)        // very dark warm purple-black
-val AbSurface = Color(0xFF1A1326)           // surface (cards, top bar)
-val AbSurfaceVariant = Color(0xFF1F1830)    // alt surface
-val AbSurfaceElevated = Color(0xFF2A2140)   // elevated tiles, buttons
+val AbBackground = Color(0xFF0E0E12)        // deep obsidian charcoal
+val AbSurface = Color(0xFF16161B)           // surface (cards, top bar)
+val AbSurfaceVariant = Color(0xFF1E1E25)    // alt surface
+val AbSurfaceElevated = Color(0xFF282832)   // elevated tiles, buttons
 
-val AbPrimary = Color(0xFF9B5BFF)           // vibrant violet
-val AbPrimaryBright = Color(0xFFC8A6FF)     // lighter violet (highlights)
-val AbPrimaryDim = Color(0xFF5B3CAA)        // darker violet
+val AbPrimary = Color(0xFFDC2626)           // deep crimson red
+val AbPrimaryBright = Color(0xFFDC2626)     // crimson highlight matching primary buttons
+val AbPrimaryDim = Color(0xFF7F1D1D)        // darker crimson border / subtle container
 
 val AbAccent = Color(0xFFFFB547)            // warm amber — complementary
 val AbAccentSoft = Color(0xFFFFCB7A)        // soft amber
 
-val AbOnSurface = Color(0xFFF0EBF5)         // primary text
-val AbOnSurfaceMuted = Color(0xFFA89BB8)    // secondary text
-val AbOnSurfaceDim = Color(0xFF6C5F7F)      // tertiary text / inactive
+val AbOnSurface = Color(0xFFFFFFFF)         // crisp white primary text
+val AbOnSurfaceMuted = Color(0xFFB4B4C0)    // neutral readable secondary text
+val AbOnSurfaceDim = Color(0xFF787886)      // tertiary text / inactive
 
-val AbGridLine = Color(0xFF221A2F)          // subtle grid lines on trackpad
-val AbDanger = Color(0xFFFF6B6B)            // warm red
-val AbMicTint = Color(0xFF38305E)           // muted violet — mic button at rest (voice)
+val AbGridLine = Color(0xFF24242E)          // subtle grid lines
+val AbDanger = Color(0xFFFF5A5A)            // alert red
+val AbMicTint = Color(0xFF3A1C21)           // muted crimson — mic button at rest
 val AbClearTint = Color(0xFF3D2632)         // muted red — clear button at rest (destructive)
 val AbClearIcon = Color(0xFFE89A94)         // soft red — trash glyph
 val AbWarning = Color(0xFFE6B85C)           // soft amber — caveats / "heads up" notes

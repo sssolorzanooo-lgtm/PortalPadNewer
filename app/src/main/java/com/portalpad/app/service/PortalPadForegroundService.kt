@@ -683,25 +683,43 @@ class PortalPadForegroundService : Service() {
             // can restore it in its original state and bounds.
             val disconnectSnapshot = run {
                 val nowWallMs = System.currentTimeMillis()
-                val base = tdApp.activeExternalApp ?: tdApp.windowMonitor.snapshot.value.tasks
-                    .firstOrNull { rt ->
-                        rt.visible &&
-                            !rt.packageName.contains("launcher", ignoreCase = true) &&
-                            !rt.packageName.contains("nexuslauncher", ignoreCase = true) &&
-                            !rt.packageName.startsWith("com.portalpad")
-                    }?.let { rt ->
-                        val b = rt.bounds
+                val liveVisible = tdApp.windowMonitor.snapshot.value.tasks
+                    .filter { rt -> rt.visible && tdApp.isTrackableExternalPackage(rt.packageName) }
+                val active = tdApp.activeExternalApp
+                val matchingLive = if (active != null) {
+                    liveVisible.firstOrNull { it.packageName == active.packageName }
+                } else {
+                    liveVisible.firstOrNull()
+                }
+                val base = when {
+                    active != null && matchingLive != null -> {
+                        val b = matchingLive.bounds
+                        active.copy(
+                            component = matchingLive.topActivity ?: active.component,
+                            left = b?.left ?: active.left,
+                            top = b?.top ?: active.top,
+                            right = b?.right ?: active.right,
+                            bottom = b?.bottom ?: active.bottom,
+                            isFreeform = b != null && tdApp.windowMonitor.snapshot.value.desktop,
+                            taskId = if (matchingLive.taskId > 0) matchingLive.taskId else active.taskId,
+                        )
+                    }
+                    active != null -> active
+                    matchingLive != null -> {
+                        val b = matchingLive.bounds
                         com.portalpad.app.data.LastDisconnectedApp(
-                            packageName = rt.packageName,
-                            component = rt.topActivity,
+                            packageName = matchingLive.packageName,
+                            component = matchingLive.topActivity,
                             left = b?.left ?: 0,
                             top = b?.top ?: 0,
                             right = b?.right ?: 0,
                             bottom = b?.bottom ?: 0,
                             isFreeform = b != null && tdApp.windowMonitor.snapshot.value.desktop,
-                            taskId = rt.taskId,
+                            taskId = matchingLive.taskId,
                         )
                     }
+                    else -> null
+                }
                 base?.copy(disconnectedAtMillis = nowWallMs)
             }
             tdApp.activeExternalApp = null
@@ -1532,6 +1550,88 @@ class PortalPadForegroundService : Service() {
         // with headroom) so it doesn't ask a question we've already answered.
         app.flapRecoveryUntilMs = android.os.SystemClock.elapsedRealtime() + 25_000L
         scope.launch {
+            val desktopMode = runCatching {
+                app.prefs.bool(PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, default = false).first()
+            }.getOrDefault(false)
+            if (!desktopMode) {
+                // Theater Mode: strictly single-app fullscreen (or wallpaper) — never
+                // enable freeform or restore multi-window desktop sessions on reconnect.
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { app.freeform.disableFreeform() }
+                    kotlinx.coroutines.delay(1_200L)
+                    val injectDisp = app.injector.displayId.takeIf { it > 0 } ?: newDisplayId
+                    val forwardEnabled = runCatching { app.prefs.forwardVideoOnConnect.first() }.getOrDefault(true)
+                    val videoSnap = pendingVideoForward
+                    val targetPkg: String? = if (
+                        forwardEnabled && videoSnap != null &&
+                        android.os.SystemClock.elapsedRealtime() - videoSnap.capturedAtElapsedMs <= 12_000L
+                    ) {
+                        pendingVideoForward = null
+                        tryForwardPlayingVideoApp(app, videoSnap, injectDisp, desktopMode = false)
+                    } else {
+                        val liveTasks = runCatching { app.freeform.listExternalTasks() }
+                            .getOrDefault(emptyList())
+                            .filter { app.isTrackableExternalPackage(it.packageName) }
+                        val activeComp = app.activeExternalApp?.component
+                            ?: synchronized(app.externalAppComponents) { app.externalAppComponents.lastOrNull() }
+                        val candidatePkg = app.activeExternalApp?.packageName
+                            ?: liveTasks.firstOrNull { it.visible }?.packageName
+                            ?: liveTasks.firstOrNull()?.packageName
+                            ?: activeComp?.substringBefore('/')
+                        if (candidatePkg != null) {
+                            val onExt = liveTasks.any { it.packageName.equals(candidatePkg, ignoreCase = true) }
+                            if (!onExt) {
+                                val comp = activeComp?.takeIf {
+                                    it.substringBefore('/').equals(candidatePkg, ignoreCase = true)
+                                } ?: runCatching {
+                                    app.packageManager.getLaunchIntentForPackage(candidatePkg)
+                                        ?.component?.flattenToString()
+                                }.getOrNull()
+                                if (comp != null) {
+                                    app.markExternalLaunch()
+                                    runCatching { app.access.startActivityOnDisplay(comp, injectDisp) }
+                                    kotlinx.coroutines.delay(400L)
+                                }
+                            }
+                            candidatePkg
+                        } else {
+                            // Fall back to Auto Launch setting when no prior Theater app survived.
+                            val mode = runCatching { app.prefs.autoLaunchOnStart.first() }
+                                .getOrDefault(com.portalpad.app.data.AutoLaunch.Wallpaper)
+                            val entry = when (mode) {
+                                com.portalpad.app.data.AutoLaunch.Wallpaper -> null
+                                com.portalpad.app.data.AutoLaunch.LastApp ->
+                                    runCatching { app.prefs.lastForegroundApp.first() }.getOrNull()
+                                is com.portalpad.app.data.AutoLaunch.Launch -> mode.entry
+                            }
+                            if (entry != null) {
+                                val comp = if (entry.componentName != null) {
+                                    "${entry.packageName}/${entry.componentName}"
+                                } else {
+                                    runCatching {
+                                        app.packageManager.getLaunchIntentForPackage(entry.packageName)
+                                            ?.component?.flattenToString()
+                                    }.getOrNull() ?: entry.packageName
+                                }
+                                app.markExternalLaunch()
+                                runCatching { app.access.startActivityOnDisplay(comp, injectDisp) }
+                                kotlinx.coroutines.delay(400L)
+                                entry.packageName
+                            } else {
+                                null
+                            }
+                        }
+                    }
+                    enforceSingleTheaterApp(app, injectDisp, keepPackage = targetPkg)
+                    if (targetPkg == null) {
+                        ensureBackdrop(injectDisp, "theater-flap-recover")
+                    }
+                }
+                returnToPortalPadIfAlive()
+                return@launch
+            }
+
+            // Desktop Mode recovery:
             // Show the black "Restoring your windows…" cover on the GLASSES for
             // the duration of recovery — but ONLY if there's actually a saved
             // layout to bring back. With nothing to restore (clean state) there's
@@ -1739,10 +1839,7 @@ class PortalPadForegroundService : Service() {
                     }
                     val dispId = app.externalDisplayId.value ?: return@collect
                     val topReal = snap.tasks.firstOrNull { rt ->
-                        rt.visible &&
-                            !rt.packageName.contains("launcher", ignoreCase = true) &&
-                            !rt.packageName.contains("nexuslauncher", ignoreCase = true) &&
-                            !rt.packageName.startsWith("com.portalpad")
+                        rt.visible && app.isTrackableExternalPackage(rt.packageName)
                     }
                     if (topReal == null) {
                         if (!app.launchedRecently(4000L)) {
@@ -1772,6 +1869,11 @@ class PortalPadForegroundService : Service() {
                         canvasWidth = cw,
                         canvasHeight = ch,
                     )
+                    app.recordExternalApp(
+                        topReal.topActivity ?: topReal.packageName,
+                        force = false,
+                        updateActive = true,
+                    )
                 }
             }
             while (true) {
@@ -1782,12 +1884,25 @@ class PortalPadForegroundService : Service() {
                     val tasks = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                         app.freeform.listExternalTasks()
                     }
-                    for (rt in tasks) {
+                    // Iterate oldest-to-newest with updateActive = false so background tasks
+                    // enrich history without overwriting activeExternalApp with a non-front app.
+                    for (rt in tasks.reversed()) {
                         val pkg = rt.packageName
-                        if (pkg.contains("launcher", ignoreCase = true)) continue
-                        if (pkg.startsWith("com.portalpad")) continue
+                        if (!app.isTrackableExternalPackage(pkg)) continue
                         val comp = rt.topActivity ?: continue
-                        app.recordExternalApp(comp)
+                        app.recordExternalApp(comp, force = false, updateActive = false)
+                    }
+                    if (app.activeExternalApp == null) {
+                        val topVisible = tasks.firstOrNull { rt ->
+                            rt.visible && app.isTrackableExternalPackage(rt.packageName)
+                        }
+                        if (topVisible != null) {
+                            app.recordExternalApp(
+                                topVisible.topActivity ?: topVisible.packageName,
+                                force = false,
+                                updateActive = true,
+                            )
+                        }
                     }
                 }
             }
@@ -1799,6 +1914,13 @@ class PortalPadForegroundService : Service() {
     fun restoreSavedSession() {
         val app = applicationContext as PortalPadApp
         scope.launch {
+            val desktopMode = runCatching {
+                app.prefs.bool(PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, default = false).first()
+            }.getOrDefault(false)
+            if (!desktopMode) {
+                Log.d(TAG, "restoreSavedSession skipped (Theater Mode)")
+                return@launch
+            }
             val displayId = app.externalDisplayId.value ?: return@launch
             // Gate: only proceed if there's any saved layout at all.
             val hasAnything = runCatching { app.prefs.lastSession.first() }.getOrNull()
@@ -2781,6 +2903,12 @@ class PortalPadForegroundService : Service() {
             // overlays (idempotent; runs off the main thread since it shells out).
             scope.launch { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching { app.freeform.enableFreeform() }
+            } }
+        } else {
+            // Theater Mode: keep freeform OFF so Android doesn't attach/restore
+            // separate windowed apps on top of single-app fullscreen.
+            scope.launch { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { app.freeform.disableFreeform() }
             } }
         }
         // Top window-control bar now shows in BOTH modes. In desktop mode it
@@ -4388,6 +4516,10 @@ class PortalPadForegroundService : Service() {
             Log.d(TAG, "captureSessionNow SKIPPED (recovery in progress)")
             return
         }
+        val desktopMode = runCatching {
+            app.prefs.bool(PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, default = false).first()
+        }.getOrDefault(false)
+        if (!desktopMode) return
         val displayId = app.externalDisplayId.value ?: return
         runCatching {
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -5542,6 +5674,7 @@ class PortalPadForegroundService : Service() {
             val hasMovieAudio: Boolean,
             val playingSessionPackages: List<String>,
             val foregroundPhonePackage: String?,
+            val pipPackages: List<String> = emptyList(),
         )
 
         @Volatile private var pendingVideoForward: VideoForwardCandidate? = null
@@ -5613,21 +5746,26 @@ class PortalPadForegroundService : Service() {
             }.getOrDefault(false)
             val playingSessions = runCatching { app.media.getPlayingPackageNames() }
                 .getOrDefault(emptyList())
+            val pipPackages = runCatching {
+                PortalPadAccessibilityService.instance?.findPhonePipWindowPackages().orEmpty()
+            }.getOrDefault(emptyList())
+                .filter { !isExcludedSystemPackage(it) }
             val fgPkg = runCatching {
                 PortalPadAccessibilityService.instance?.rootInActiveWindow?.packageName?.toString()
             }.getOrNull()
-            if (isMusicActive || hasMovieAudio || playingSessions.isNotEmpty()) {
+            if (pipPackages.isNotEmpty() || isMusicActive || hasMovieAudio || playingSessions.isNotEmpty()) {
                 pendingVideoForward = VideoForwardCandidate(
                     capturedAtElapsedMs = android.os.SystemClock.elapsedRealtime(),
                     isMusicActive = isMusicActive,
                     hasMovieAudio = hasMovieAudio,
                     playingSessionPackages = playingSessions,
                     foregroundPhonePackage = fgPkg,
+                    pipPackages = pipPackages,
                 )
                 Log.d(
                     TAG,
-                    "capturePhoneVideoCandidate: activeMusic=$isMusicActive movieAudio=$hasMovieAudio " +
-                        "sessions=$playingSessions fg=$fgPkg",
+                    "capturePhoneVideoCandidate: pip=$pipPackages activeMusic=$isMusicActive " +
+                        "movieAudio=$hasMovieAudio sessions=$playingSessions fg=$fgPkg",
                 )
             } else {
                 pendingVideoForward = null
@@ -5669,19 +5807,99 @@ class PortalPadForegroundService : Service() {
             app: PortalPadApp,
             snap: VideoForwardCandidate,
             targetDisplayId: Int,
+            desktopMode: Boolean,
         ): String? {
             if (!app.access.isReady) return null
             val phoneTasks = runCatching { app.freeform.listTasks(Display.DEFAULT_DISPLAY) }
                 .getOrDefault(emptyList())
                 .filter { !isExcludedSystemPackage(it.packageName) }
+            val pipTasks = runCatching { app.freeform.findPhonePipTasks() }
+                .getOrDefault(emptyList())
+                .filter { !isExcludedSystemPackage(it.packageName) }
 
             val sessionPkgs = snap.playingSessionPackages.ifEmpty {
-                if (snap.isMusicActive || snap.hasMovieAudio) {
+                if (snap.isMusicActive || snap.hasMovieAudio || snap.pipPackages.isNotEmpty() || pipTasks.isNotEmpty()) {
                     parsePlayingPackagesFromDumpsys(app)
                 } else emptyList()
             }.filter { pkg ->
                 !isExcludedSystemPackage(pkg) &&
                     (snap.hasMovieAudio || pkg !in AUDIO_ONLY_PACKAGES)
+            }
+
+            val allPipPackages = (snap.pipPackages + pipTasks.map { it.packageName })
+                .filter { !isExcludedSystemPackage(it) && it !in AUDIO_ONLY_PACKAGES }
+                .distinct()
+
+            // 0) Highest priority: active Picture-in-Picture video on phone -> promote to FULLSCREEN on external display.
+            if (allPipPackages.isNotEmpty()) {
+                val chosenPipPkg = allPipPackages.firstOrNull { it in sessionPkgs }
+                    ?: allPipPackages.first()
+                val pipTask = pipTasks.firstOrNull { it.packageName == chosenPipPkg && it.taskId > 0 }
+                    ?: phoneTasks.firstOrNull { it.packageName == chosenPipPkg && it.taskId > 0 }
+                val pipComp = pipTask?.topActivity?.takeIf { it.isNotBlank() }
+                    ?: runCatching {
+                        app.packageManager.getLaunchIntentForPackage(chosenPipPkg)?.component?.flattenToString()
+                    }.getOrNull()
+
+                if (pipTask != null && pipTask.taskId > 0) {
+                    val moved = runCatching {
+                        app.freeform.moveTaskToDisplay(pipTask.taskId, targetDisplayId)
+                    }.getOrDefault(false)
+                    if (moved) {
+                        val fullscreenOk = runCatching {
+                            app.freeform.setWindowingModeFullscreen(pipTask.taskId)
+                        }.getOrDefault(false)
+                        val dm = app.getSystemService(android.hardware.display.DisplayManager::class.java)
+                        val disp = dm?.getDisplay(targetDisplayId)
+                        val metrics = android.util.DisplayMetrics()
+                            .also { @Suppress("DEPRECATION") disp?.getRealMetrics(it) }
+                        val dispW = metrics.widthPixels.coerceAtLeast(1)
+                        val afterMoved = runCatching {
+                            app.freeform.listTasks(targetDisplayId)
+                                .firstOrNull { it.taskId == pipTask.taskId || it.packageName == chosenPipPkg }
+                        }.getOrNull()
+                        val stillSmallOrPinned = afterMoved?.bounds != null &&
+                            afterMoved.bounds.width < dispW * 0.70f
+                        if ((!fullscreenOk || stillSmallOrPinned) && pipComp != null) {
+                            runCatching {
+                                app.access.execShell(
+                                    "am start --display $targetDisplayId --windowingMode 1 -n '$pipComp'",
+                                )
+                            }
+                        }
+                        runCatching { app.activeBoundBackend?.refocusTopTaskOnDisplay(targetDisplayId) }
+                        app.markExternalLaunch()
+                        app.recordExternalApp(pipComp ?: chosenPipPkg, force = true, updateActive = true)
+                        Log.i(TAG, "forwardPlayingVideo[PiP]: moved task=${pipTask.taskId} ($chosenPipPkg) fullscreen=$fullscreenOk -> display=$targetDisplayId")
+                        return chosenPipPkg
+                    }
+                }
+                if (pipComp != null) {
+                    val fsOut = runCatching {
+                        app.access.execShell(
+                            "am start --display $targetDisplayId --windowingMode 1 -n '$pipComp'",
+                        )
+                    }.getOrDefault("")
+                    val launchedFullscreen = (!fsOut.contains("Error:", ignoreCase = true) &&
+                        !fsOut.contains("Exception", ignoreCase = true)) ||
+                        runCatching { app.access.startActivityOnDisplay(pipComp, targetDisplayId) }.getOrDefault(false)
+                    if (launchedFullscreen) {
+                        if (pipTask != null && pipTask.taskId > 0) {
+                            runCatching {
+                                val movedTask = app.freeform.listTasks(targetDisplayId)
+                                    .firstOrNull { it.packageName == chosenPipPkg }
+                                if (movedTask != null) {
+                                    app.freeform.setWindowingModeFullscreen(movedTask.taskId)
+                                }
+                            }
+                        }
+                        runCatching { app.activeBoundBackend?.refocusTopTaskOnDisplay(targetDisplayId) }
+                        app.markExternalLaunch()
+                        app.recordExternalApp(pipComp, force = true, updateActive = true)
+                        Log.i(TAG, "forwardPlayingVideo[PiP]: started $pipComp fullscreen on display=$targetDisplayId")
+                        return chosenPipPkg
+                    }
+                }
             }
 
             // 1) Prefer an actively playing video session that has a live task on the phone.
@@ -5720,9 +5938,14 @@ class PortalPadForegroundService : Service() {
                     app.freeform.moveTaskToDisplay(targetTask.taskId, targetDisplayId)
                 }.getOrDefault(false)
                 if (moved) {
+                    if (!desktopMode) {
+                        runCatching { app.freeform.setWindowingModeFullscreen(targetTask.taskId) }
+                    }
                     runCatching { app.activeBoundBackend?.refocusTopTaskOnDisplay(targetDisplayId) }
                     app.markExternalLaunch()
-                    (targetTask.topActivity ?: targetPkg).let { app.recordExternalApp(it) }
+                    (targetTask.topActivity ?: targetPkg).let {
+                        app.recordExternalApp(it, force = true, updateActive = true)
+                    }
                     Log.i(TAG, "forwardPlayingVideo: moved task=${targetTask.taskId} ($targetPkg) to display=$targetDisplayId")
                     return targetPkg
                 }
@@ -5738,7 +5961,7 @@ class PortalPadForegroundService : Service() {
                 .getOrDefault(false)
             if (started) {
                 app.markExternalLaunch()
-                app.recordExternalApp(component)
+                app.recordExternalApp(component, force = true, updateActive = true)
                 Log.i(TAG, "forwardPlayingVideo: started $component on display=$targetDisplayId")
                 return targetPkg
             }
@@ -5771,20 +5994,63 @@ class PortalPadForegroundService : Service() {
                 ensureBackdrop(displayId, "autoLaunchOnStart")
                 if (!app.access.isReady) return@launch
 
-                // Priority 1: If a video app was actively playing on the phone before connect
-                // and Forward-playing-video is enabled, move/open it first and keep it playing
+                val desktop = runCatching {
+                    app.prefs.bool(PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, false).first()
+                }.getOrDefault(false)
+                if (!desktop) {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        runCatching { app.freeform.disableFreeform() }
+                    }
+                }
+
+                // Priority 1: If a video app (including phone PiP) was actively playing before connect
+                // and Forward-playing-video is enabled, move/open it first in fullscreen and keep it playing
                 // (takes priority over 30-minute Auto-resume and normal Auto-launch).
                 val forwardVideoEnabled = runCatching { app.prefs.forwardVideoOnConnect.first() }
                     .getOrDefault(true)
-                if (forwardVideoEnabled && videoSnap != null &&
+                val resolvedVideoSnap = if (!forwardVideoEnabled) {
+                    null
+                } else if (videoSnap != null &&
                     android.os.SystemClock.elapsedRealtime() - videoSnap.capturedAtElapsedMs <= 12_000L
                 ) {
+                    videoSnap
+                } else {
+                    val shellPipPkgs = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        runCatching { app.freeform.findPhonePipTasks() }
+                            .getOrDefault(emptyList())
+                            .map { it.packageName }
+                            .filter { !isExcludedSystemPackage(it) && it !in AUDIO_ONLY_PACKAGES }
+                            .distinct()
+                    }
+                    if (shellPipPkgs.isNotEmpty()) {
+                        VideoForwardCandidate(
+                            capturedAtElapsedMs = android.os.SystemClock.elapsedRealtime(),
+                            isMusicActive = runCatching {
+                                (app.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager)
+                                    ?.isMusicActive == true
+                            }.getOrDefault(false),
+                            hasMovieAudio = false,
+                            playingSessionPackages = runCatching { app.media.getPlayingPackageNames() }
+                                .getOrDefault(emptyList()),
+                            foregroundPhonePackage = null,
+                            pipPackages = shellPipPkgs,
+                        )
+                    } else null
+                }
+                if (resolvedVideoSnap != null) {
                     val forwardedPkg = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        tryForwardPlayingVideoApp(app, videoSnap, displayId)
+                        tryForwardPlayingVideoApp(app, resolvedVideoSnap, displayId, desktopMode = desktop)
                     }
                     if (forwardedPkg != null) {
                         runCatching { app.prefs.setLastDisconnectedApp(null) }
-                        kotlinx.coroutines.delay(450L)
+                        if (!desktop) {
+                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                kotlinx.coroutines.delay(250L)
+                                enforceSingleTheaterApp(app, displayId, keepPackage = forwardedPkg)
+                            }
+                        } else {
+                            kotlinx.coroutines.delay(450L)
+                        }
                         val stillPlaying = runCatching {
                             if (app.media.hasNotificationAccess) app.media.isPackagePlaying(forwardedPkg)
                             else (app.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager)?.isMusicActive == true
@@ -5809,8 +6075,7 @@ class PortalPadForegroundService : Service() {
 
                 // 30-minute auto-resume: if enabled and the external display reconnected
                 // within 30 minutes of disconnect, reopen the last active app in its
-                // original window state and bounds. Otherwise clear stale state and
-                // fall back to the normal Auto-launch setting.
+                // original window state and bounds (or strictly single fullscreen in Theater Mode).
                 val autoResumeEnabled = runCatching { app.prefs.autoResumeLastApp30m.first() }
                     .getOrDefault(true)
                 val savedDisconnect = runCatching { app.prefs.lastDisconnectedApp.first() }
@@ -5831,9 +6096,6 @@ class PortalPadForegroundService : Service() {
                                 .also { @Suppress("DEPRECATION") disp?.getRealMetrics(it) }
                             val dispW = m.widthPixels.let { if (it <= 1) 1920 else it }
                             val dispH = m.heightPixels.let { if (it <= 1) 1080 else it }
-                            val desktop = runCatching {
-                                app.prefs.bool(PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, false).first()
-                            }.getOrDefault(false)
 
                             val rawBounds = savedDisconnect.bounds
                             val targetBounds = if (rawBounds != null &&
@@ -5864,10 +6126,16 @@ class PortalPadForegroundService : Service() {
                                     if (savedDisconnect.isFreeform && desktop && targetBounds != null) {
                                         app.freeform.setWindowingModeFreeform(liveRefugee.taskId)
                                         app.freeform.resize(liveRefugee.taskId, targetBounds)
+                                    } else if (!desktop) {
+                                        runCatching { app.freeform.setWindowingModeFullscreen(liveRefugee.taskId) }
                                     }
                                     app.markExternalLaunch()
                                     (savedDisconnect.component ?: liveRefugee.topActivity)?.let {
-                                        app.recordExternalApp(it)
+                                        app.recordExternalApp(it, force = true)
+                                    }
+                                    if (!desktop) {
+                                        kotlinx.coroutines.delay(250L)
+                                        enforceSingleTheaterApp(app, displayId, keepPackage = savedDisconnect.packageName)
                                     }
                                     Log.d(TAG, "autoResume30m: moved live task ${liveRefugee.taskId} (${savedDisconnect.packageName}) back to display=$displayId")
                                     return@withContext true
@@ -5875,7 +6143,7 @@ class PortalPadForegroundService : Service() {
                             }
 
                             // 2) Otherwise relaunch the component on the external display and
-                            //    restore its original windowing mode & bounds.
+                            //    restore its original windowing mode & bounds (fullscreen in Theater).
                             val launchComp = savedDisconnect.component?.takeIf { it.isNotBlank() }
                                 ?: runCatching {
                                     app.packageManager
@@ -5885,7 +6153,7 @@ class PortalPadForegroundService : Service() {
                                 ?: return@withContext false
 
                             app.markExternalLaunch()
-                            app.recordExternalApp(launchComp)
+                            app.recordExternalApp(launchComp, force = true)
                             if (savedDisconnect.isFreeform && desktop && targetBounds != null) {
                                 val ok = runCatching {
                                     app.freeform.launchFreeform(launchComp, displayId, targetBounds)
@@ -5910,6 +6178,10 @@ class PortalPadForegroundService : Service() {
                                 if (ok) {
                                     runCatching {
                                         app.freeform.armDialogShellWatch(launchComp, displayId, freeform = false)
+                                    }
+                                    if (!desktop) {
+                                        kotlinx.coroutines.delay(300L)
+                                        enforceSingleTheaterApp(app, displayId, keepPackage = savedDisconnect.packageName)
                                     }
                                 }
                                 Log.d(TAG, "autoResume30m: launched fullscreen $launchComp ok=$ok")
@@ -5941,8 +6213,16 @@ class PortalPadForegroundService : Service() {
                         runCatching { app.prefs.lastForegroundApp.first() }.getOrNull()
                     is com.portalpad.app.data.AutoLaunch.Launch -> mode.entry
                 }
-                // Wallpaper-only mode: nothing else to launch on top.
-                if (entry == null) return@launch
+                // Wallpaper-only mode: close any stray/residual windows in Theater Mode so
+                // separate windows from earlier sessions never linger over the home screen.
+                if (entry == null) {
+                    if (!desktop) {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            enforceSingleTheaterApp(app, displayId, keepPackage = null)
+                        }
+                    }
+                    return@launch
+                }
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     if (!app.access.isReady) return@withContext
                     // Launch the configured auto-start app ON TOP of the backdrop.
@@ -5955,9 +6235,80 @@ class PortalPadForegroundService : Service() {
                         }.getOrNull() ?: entry.packageName
                     }
                     app.markExternalLaunch()
+                    app.recordExternalApp(component, force = true)
                     runCatching { app.access.startActivityOnDisplay(component, displayId) }
+                    if (!desktop) {
+                        kotlinx.coroutines.delay(350L)
+                        enforceSingleTheaterApp(app, displayId, keepPackage = entry.packageName)
+                    }
                 }
             }
+        }
+
+        private suspend fun enforceSingleTheaterApp(
+            app: PortalPadApp,
+            displayId: Int,
+            keepPackage: String?,
+        ) {
+            if (!app.access.isReady) return
+            val physicalId = app.physicalExternalDisplayId.value
+            val ids = listOfNotNull(displayId, physicalId).distinct()
+            val dm = app.getSystemService(android.hardware.display.DisplayManager::class.java)
+            val disp = dm?.getDisplay(displayId) ?: physicalId?.let { dm?.getDisplay(it) }
+            val m = android.util.DisplayMetrics().also { @Suppress("DEPRECATION") disp?.getRealMetrics(it) }
+            val dw = m.widthPixels
+            val dh = m.heightPixels
+
+            val tasks = ids.flatMap { id ->
+                runCatching { app.freeform.listTasks(id) }.getOrDefault(emptyList())
+            }.distinctBy { it.taskId }
+                .filter { app.isTrackableExternalPackage(it.packageName) }
+
+            val keptTask = if (!keepPackage.isNullOrBlank()) {
+                tasks.firstOrNull {
+                    it.packageName.equals(keepPackage, ignoreCase = true) && it.visible
+                } ?: tasks.firstOrNull {
+                    it.packageName.equals(keepPackage, ignoreCase = true)
+                }
+            } else {
+                null
+            }
+
+            for (t in tasks) {
+                if (keptTask != null && t.taskId == keptTask.taskId) continue
+                runCatching { app.freeform.close(t.taskId) }
+                Log.d(TAG, "TheaterMode: closed extra task=${t.taskId} pkg=${t.packageName}")
+            }
+
+            if (keptTask != null) {
+                val b = keptTask.bounds
+                val isWindowed = b != null && dw > 10 && dh > 10 &&
+                    (b.left > 4 || b.top > 4 || b.right < dw - 4 || b.bottom < dh - 4)
+                if (isWindowed) {
+                    runCatching { app.freeform.setWindowingModeFullscreen(keptTask.taskId) }
+                    kotlinx.coroutines.delay(180L)
+                    val after = ids.flatMap { id ->
+                        runCatching { app.freeform.listTasks(id) }.getOrDefault(emptyList())
+                    }.firstOrNull { it.taskId == keptTask.taskId }?.bounds
+                    val stillWindowed = after != null && dw > 10 && dh > 10 &&
+                        (after.left > 4 || after.top > 4 || after.right < dw - 4 || after.bottom < dh - 4)
+                    if (stillWindowed) {
+                        val comp = keptTask.topActivity?.takeIf { it.isNotBlank() }
+                            ?: runCatching {
+                                app.packageManager.getLaunchIntentForPackage(keptTask.packageName)
+                                    ?.component?.flattenToString()
+                            }.getOrNull()
+                        if (comp != null) {
+                            Log.d(TAG, "TheaterMode: relaunching windowed pkg=${keptTask.packageName} as fullscreen")
+                            runCatching { app.freeform.close(keptTask.taskId) }
+                            kotlinx.coroutines.delay(180L)
+                            app.markExternalLaunch()
+                            runCatching { app.access.startActivityOnDisplay(comp, displayId) }
+                        }
+                    }
+                }
+            }
+            app.signalWindowsChanged()
         }
 
         /**

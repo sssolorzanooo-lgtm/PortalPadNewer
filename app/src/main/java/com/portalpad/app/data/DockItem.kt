@@ -164,6 +164,9 @@ data class DockConfig(
     /** Hide dock automatically when scrolling down inside apps or on wallpaper,
      *  and restore it when scrolling back up. Default ON. */
     val hideOnScroll: Boolean = true,
+    /** Show the Recent Apps switcher button to the right of Home on the dock.
+     *  Default ON. */
+    val showRecentAppsButton: Boolean = true,
 ) {
     fun addShortcut(shortcut: DockItem.Shortcut) = copy(items = items + shortcut)
 

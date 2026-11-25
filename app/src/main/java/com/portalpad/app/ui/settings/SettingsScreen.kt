@@ -129,47 +129,27 @@ fun SettingsScreen(
     val tabs = remember {
         listOf(
             TabSpec("Start", Icons.Default.PlayArrow),
+            TabSpec("Display", Icons.Default.Devices),
             TabSpec("Workspace", Icons.Default.GridView),
             TabSpec("Controls", Icons.Default.Tune),
         )
     }
-    // Index 2 = Controls (see `tabs` above), where the keyboard section lives.
-    var selectedTab by remember { mutableIntStateOf(if (openToControls) 2 else 0) }
+    // Index 3 = Controls (see `tabs` above), where the keyboard section lives.
+    var selectedTab by remember { mutableIntStateOf(if (openToControls) 3 else 0) }
     val pickerCtx = androidx.compose.ui.platform.LocalContext.current
-    // Top-level section switch shown as a small edge-to-edge strip above the
-    // tab row: "Settings" (the Start/Workspace/Controls tabbed UI) vs
-    // "Permissions" (a transparency page listing every Android permission).
-    // Permissions sub-page. Reached only via the 3-dot menu → Privilege Source,
-    // then the "Permissions" link on the strip. The Settings|Permissions strip
-    // only appears in this 3-dot sub-area (Privilege Source page + Permissions),
-    // never on the main Start/Workspace/Controls tabs.
     var showPermissions by remember { mutableStateOf(false) }
-    // Bumped when the user taps an already-active nav item (a main tab, or a
-    // strip section they're already on) to signal that page to scroll to top.
     var scrollToTopTick by remember { mutableIntStateOf(0) }
-    // Resources sub-page (reached from a note in the System tab). When true it
-    // replaces the tab content with a full Resources screen + back arrow.
     var showResources by remember { mutableStateOf(false) }
     var showDiagnostics by remember { mutableStateOf(false) }
     var showSystem by remember { mutableStateOf(openToPrivilege) }
-    var showDisplay by remember { mutableStateOf(false) }
     var showWallpaperPicker by remember { mutableStateOf(false) }
     var showFolderManager by remember { mutableStateOf(false) }
     var showDockCustomization by remember { mutableStateOf(false) }
     var showTopBarCustomization by remember { mutableStateOf(false) }
     var showFolderWindowCustomization by remember { mutableStateOf(false) }
     var showWidgetOverlayCustomization by remember { mutableStateOf(false) }
-    // Button-actions page (the same ControlsSubpage the trackpad/remote/air-mouse
-    // interfaces open) launched from the Start tab's Home/Back buttons. "Back"
-    // returns to Start.
     var showControlsSubpage by remember { mutableStateOf(false) }
-    // Full Display tuning page shared with the display pill above the
-    // Trackpad/Remote/Air Mouse interfaces.
     var showDisplaySubpage by remember { mutableStateOf(false) }
-    // Start-setup subpage: a focused checklist (overlay, privilege, and an
-    // optional notification-access question) gating a Continue button that
-    // actually starts the service. Reached when the user taps Start Service while
-    // requirements aren't met.
     var showStartSetup by remember { mutableStateOf(openToSetup) }
     val tabScroll = rememberScrollState()
     val tabScope = rememberCoroutineScope()
@@ -186,9 +166,9 @@ fun SettingsScreen(
         containerColor = PhoneBackground,
     ) { pad ->
         if (showControlsSubpage) {
-            // Full-screen button-actions page launched from the Start tab's
-            // Home/Back buttons. Same page the trackpad/remote opens; "← Back"
-            // returns to Start (Main) here.
+            androidx.activity.compose.BackHandler {
+                showControlsSubpage = false
+            }
             Box(Modifier.padding(pad)) {
                 ControlsSubpage(
                     isAirMouse = false,
@@ -196,35 +176,56 @@ fun SettingsScreen(
                 )
             }
         } else if (showDisplaySubpage) {
+            androidx.activity.compose.BackHandler {
+                showDisplaySubpage = false
+            }
             Box(Modifier.padding(pad)) {
                 DisplaySubpage(onBack = { showDisplaySubpage = false })
             }
         } else {
+        val hasNestedSubPage = showDiagnostics ||
+            showWallpaperPicker ||
+            showFolderManager ||
+            showDockCustomization ||
+            showTopBarCustomization ||
+            showFolderWindowCustomization ||
+            showWidgetOverlayCustomization ||
+            showStartSetup
+        androidx.activity.compose.BackHandler(enabled = hasNestedSubPage) {
+            showDiagnostics = false
+            showWallpaperPicker = false
+            showFolderManager = false
+            showDockCustomization = false
+            showTopBarCustomization = false
+            showFolderWindowCustomization = false
+            showWidgetOverlayCustomization = false
+            showStartSetup = false
+        }
+        androidx.activity.compose.BackHandler(
+            enabled = !hasNestedSubPage &&
+                (showSystem || showPermissions || showResources || selectedTab != 0),
+        ) {
+            showSystem = false
+            showPermissions = false
+            showResources = false
+            selectedTab = 0
+        }
         Column(Modifier.padding(pad).fillMaxSize()) {
             ModeDebugStrip(
                 onDebugPage = showDiagnostics,
                 onOpenDebug = { showResources = false; showSystem = false; showDiagnostics = true },
                 onFixPrivilege = { showResources = false; showDiagnostics = false; showSystem = false; showStartSetup = true },
             )
-            // ── Main nav (Start | Workspace | Controls) — ALWAYS visible across
-            // all Settings views, including every sub-page. Only the trackpad /
-            // air-mouse / remote control surfaces omit it. No tab is highlighted
-            // while on a sub-page (you're in a sub-area, not "on" a tab).
-            // Centered when it fits; SCROLLS horizontally when it doesn't
-            // (small screens / large font scales), instead of letting the last
-            // label wrap to a second line and grow the bar (field, second
-            // device: bold selected "Workspace" widened the row and "Controls"
-            // wrapped — but only on that tab, because bolding the shorter
-            // labels didn't overflow).
+            // ── Main nav (Start | Display | Workspace | Controls) ──
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Row(
                     Modifier
                         .horizontalScroll(tabScroll)
-                        .padding(horizontal = 8.dp),
+                        .padding(horizontal = 6.dp),
                     horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    val onSubPage = showResources || showDiagnostics || showSystem || showDisplay || showWallpaperPicker || showFolderManager || showPermissions || showDockCustomization || showTopBarCustomization || showFolderWindowCustomization || showWidgetOverlayCustomization || showStartSetup
+                    val onSubPage = showResources || showDiagnostics || showSystem || showWallpaperPicker || showFolderManager || showPermissions || showDockCustomization || showTopBarCustomization || showFolderWindowCustomization || showWidgetOverlayCustomization || showStartSetup
                     tabs.forEachIndexed { i, spec ->
                         if (i > 0) {
                             VerticalDivider(
@@ -232,26 +233,19 @@ fun SettingsScreen(
                                 modifier = Modifier.height(20.dp),
                             )
                         }
-                        // Start (tab 0) stays highlighted on the setup sub-page too,
-                        // so it reads as part of the Start flow (you got there from
-                        // Start Service). Other sub-pages highlight nothing.
                         val active = (selectedTab == i && !onSubPage) || (i == 0 && showStartSetup)
                         Row(
                             Modifier
-                                .padding(horizontal = 4.dp)
+                                .testTag("settings_tab_${spec.label.lowercase()}")
+                                .padding(horizontal = 2.dp)
                                 .clip(RoundedCornerShape(10.dp))
                                 .clickable {
-                                    // Tapping a main tab leaves any sub-page and
-                                    // shows that tab's real content. If already on
-                                    // this tab (and not on a sub-page), scroll its
-                                    // content back to the top.
                                     if (selectedTab == i && !onSubPage) {
                                         scrollToTopTick++
                                     }
                                     showResources = false
                                     showDiagnostics = false
                                     showSystem = false
-                                    showDisplay = false
                                     showWallpaperPicker = false
                                     showFolderManager = false
                                     showDockCustomization = false
@@ -262,20 +256,16 @@ fun SettingsScreen(
                                     showStartSetup = false
                                     selectedTab = i
                                 }
-                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                                .padding(horizontal = 10.dp, vertical = 12.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Icon(
                                 spec.icon, contentDescription = null,
                                 tint = if (active) PhonePrimary else PhoneOnSurfaceMuted,
+                                modifier = Modifier.size(19.dp),
                             )
-                            Spacer(Modifier.width(8.dp))
+                            Spacer(Modifier.width(6.dp))
                             Box(contentAlignment = Alignment.Center) {
-                                // Invisible SemiBold twin reserves the BOLD
-                                // width, so selecting a tab never changes the
-                                // row's total width — no reflow, ever. Labels
-                                // are hard single-line; overflow scrolls (see
-                                // container) instead of wrapping the bar taller.
                                 Text(
                                     spec.label,
                                     fontWeight = FontWeight.SemiBold,
@@ -324,7 +314,7 @@ fun SettingsScreen(
                         if (showSystem && !showPermissions) scrollToTopTick++
                         showPermissions = false
                         showResources = false; showDiagnostics = false
-                        showDisplay = false; showWallpaperPicker = false; showFolderManager = false
+                        showWallpaperPicker = false; showFolderManager = false
                         showDockCustomization = false; showTopBarCustomization = false; showFolderWindowCustomization = false
                         showSystem = true
                     }
@@ -332,7 +322,7 @@ fun SettingsScreen(
                     sectionLabel("Permissions", showPermissions) {
                         if (showPermissions) scrollToTopTick++
                         showSystem = false; showResources = false; showDiagnostics = false
-                        showDisplay = false; showWallpaperPicker = false; showFolderManager = false
+                        showWallpaperPicker = false; showFolderManager = false
                         showDockCustomization = false; showTopBarCustomization = false; showFolderWindowCustomization = false
                         showPermissions = true
                     }
@@ -340,7 +330,7 @@ fun SettingsScreen(
                     sectionLabel("Resources", showResources) {
                         if (showResources) scrollToTopTick++
                         showSystem = false; showPermissions = false; showDiagnostics = false
-                        showDisplay = false; showWallpaperPicker = false; showFolderManager = false
+                        showWallpaperPicker = false; showFolderManager = false
                         showDockCustomization = false; showTopBarCustomization = false; showFolderWindowCustomization = false
                         showResources = true
                     }
@@ -385,23 +375,6 @@ fun SettingsScreen(
                         onRestoreFromFile = onRestoreFromFile,
                         onScheduleBackup = onScheduleBackup,
                     )
-                }
-            } else if (showDisplay) {
-                Column(Modifier.fillMaxSize()) {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            "Display",
-                            color = PhoneOnSurface,
-                            fontWeight = FontWeight.SemiBold,
-                            style = MaterialTheme.typography.titleLarge,
-                        )
-                    }
-                    DisplayTab(onOpenDisplaySettings = { showDisplaySubpage = true })
                 }
             } else if (showWallpaperPicker) {
                 Column(Modifier.fillMaxSize()) {
@@ -461,8 +434,8 @@ fun SettingsScreen(
                         else showStartSetup = true
                     },
                     onGoToSystemTab = { showSystem = true },
-                    onGoToControls = { selectedTab = 2 },
-                    onGoToDisplay = { showDisplay = true },
+                    onGoToControls = { selectedTab = 3 },
+                    onGoToDisplay = { selectedTab = 1 },
                     onLaunchTrackpad = onLaunchTrackpad,
                     onOpenButtonActions = { showControlsSubpage = true },
                     onOpenAutoLaunch = { com.portalpad.app.ui.dock.launchDockPickerOnPhone(pickerCtx, "autolaunch") },
@@ -470,7 +443,11 @@ fun SettingsScreen(
                     onPickBack = onPickBack,
                     onOpenStartSetup = { showStartSetup = true },
                 )
-                1 -> WorkspaceTab(
+                1 -> DisplayTab(
+                    onOpenDisplaySettings = { showDisplaySubpage = true },
+                    scrollToTopSignal = scrollToTopTick,
+                )
+                2 -> WorkspaceTab(
                     onPickDock,
                     onOpenWallpaperPicker = { showWallpaperPicker = true },
                     onOpenFolderManager = { showFolderManager = true },
@@ -480,15 +457,15 @@ fun SettingsScreen(
                     onOpenWidgetOverlayCustomization = { showWidgetOverlayCustomization = true },
                     scrollToTopSignal = scrollToTopTick,
                 )
-                2 -> ButtonsTab(onPickHome, onPickBack, scrollToTopSignal = scrollToTopTick)
+                3 -> ButtonsTab(onPickHome, onPickBack, scrollToTopSignal = scrollToTopTick)
                 else -> StartTab(
                     onEnableClick = {
                         if (startRequirementsMet(pickerCtx)) onEnableClick()
                         else showStartSetup = true
                     },
                     onGoToSystemTab = { showSystem = true },
-                    onGoToControls = { selectedTab = 2 },
-                    onGoToDisplay = { showDisplay = true },
+                    onGoToControls = { selectedTab = 3 },
+                    onGoToDisplay = { selectedTab = 1 },
                     onLaunchTrackpad = onLaunchTrackpad,
                     onOpenButtonActions = { showControlsSubpage = true },
                     onOpenAutoLaunch = { com.portalpad.app.ui.dock.launchDockPickerOnPhone(pickerCtx, "autolaunch") },
@@ -899,6 +876,9 @@ private fun FolderManagerPage(onBack: () -> Unit = {}) {
     }.getOrDefault(0L)
 
     val currentFolder = stack.lastOrNull()?.let { cfg.items.findFolder(it) }
+    androidx.activity.compose.BackHandler(enabled = stack.isNotEmpty()) {
+        stack = stack.dropLast(1)
+    }
     // Mirror the folder being managed onto the external display (real contents,
     // live) so reordering / edits are visible there as you make them. Clears when
     // you leave the folder or close the screen.
@@ -4307,17 +4287,6 @@ private fun StartTab(onEnableClick: () -> Unit, onGoToSystemTab: () -> Unit, onG
                     )
                 }
             }
-            androidx.compose.material3.HorizontalDivider(
-                modifier = Modifier.padding(vertical = 3.dp),
-                thickness = 1.dp,
-                color = PhoneOnSurfaceDim.copy(alpha = 0.5f),
-            )
-            ToggleRowWithDesc(
-                label = "Auto-resume last app (30 min)",
-                desc = "Automatically reopen the last active app in its original window state and bounds if reconnected within 30 minutes.",
-                key = PreferencesRepository.Keys.AUTO_RESUME_LAST_APP_30M,
-                default = true,
-            )
             androidx.compose.material3.HorizontalDivider(
                 modifier = Modifier.padding(vertical = 3.dp),
                 thickness = 1.dp,
@@ -9155,96 +9124,6 @@ private fun WorkspaceTab(
             Icon(Icons.Default.ChevronRight, contentDescription = "Open home backdrop picker", tint = PhoneOnSurfaceMuted)
         }
 
-        SectionCard(title = "Display mode (beta)", tightSpacing = true) {
-            // One bullet per mode, both always visible, replacing a paragraph plus a
-            // swapping per-mode text under the dropdown. Both modes on screen at
-            // once is what lets you compare before choosing; the dynamic text could
-            // only describe the mode you had already picked.
-            // No "Requires Shizuku or Root" in prose: RequirementBadge below the
-            // dropdown says it in the pill styling the rest of the page uses.
-            Text(
-                // Dim, one step below the bullets (SH's call): this line is a
-                // lead-in, the bullets are the content, and same-color meant the
-                // eye had no reason to land on the bullets first.
-                "How apps fill the external display.",
-                color = PhoneOnSurfaceDim, style = MaterialTheme.typography.bodyMedium,
-            )
-            Text(
-                text = androidx.compose.ui.text.buildAnnotatedString {
-                    append("• ")
-                    withStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold)) { append("Theater mode") }
-                    append(": one app at a time, filling the display. Best for video and reading.")
-                },
-                color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
-            )
-            Text(
-                text = androidx.compose.ui.text.buildAnnotatedString {
-                    append("• ")
-                    withStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold)) { append("Desktop mode") }
-                    append(
-                        ": apps open in resizable, movable windows with a taskbar at the " +
-                            "bottom and window controls at the top edge.",
-                    )
-                },
-                color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
-            )
-            DisplayModeSelector()
-            Text(
-                text = androidx.compose.ui.text.buildAnnotatedString {
-                    withStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold)) { append("Note:") }
-                    append(" Each floating desktop window has a system tab bar at the top, but its split button opens the split on the phone, not the external display (an Android limitation). Instead, hover to the top of the display — top-center by default, or wherever you've set the top bar — to reveal PortalPad's top bar, then tap the grid icon to tile all windows evenly across the external display.")
-                },
-                color = PhoneDanger,
-                style = MaterialTheme.typography.bodySmall,
-            )
-            ToggleRowWithDesc(
-                label = "Open dock apps in a window",
-                desc = "In desktop mode, tapping a dock app opens it as a window instead of filling the display.",
-                key = PreferencesRepository.Keys.DOCK_OPENS_FREEFORM,
-                default = true,
-            )
-            ToggleRowWithDesc(
-                label = "Handle permission prompts on the phone",
-                desc = "When an app opened on the external display asks for a permission (notifications, camera, etc.), Android shows the prompt there as an unusable black window. With this on, PortalPad closes the app, shows an Allow/Deny popup on the trackpad screen, applies your choices via Shizuku or Root, and reopens the app on the external display. Turn off to leave the system prompt as-is.",
-                key = PreferencesRepository.Keys.PERM_DIALOG_KEEP_ON_EXTERNAL,
-                default = true,
-                requirement = Requirement.ROOT_OR_SHIZUKU,
-            )
-            ToggleRowWithDesc(
-                label = "Closing a window also removes it from Recents",
-                desc = "Closing a window — from Close all, Manage windows, PortalPad's window controls, or the window's own close (X) button — fully ends the task, so it no longer appears in the phone's Recents. When off, closed apps may remain as a Recents card.",
-                key = PreferencesRepository.Keys.CLOSE_REMOVES_FROM_RECENTS,
-                default = true,
-                requirement = Requirement.ROOT_OR_SHIZUKU,
-            )
-            ToggleRowWithDesc(
-                label = "Forward playing video on connect",
-                desc = "When an app is actively playing video on the phone right before you connect an external display, PortalPad opens that app first on the external display and keeps playback going. Takes priority over 30-minute Auto-resume.",
-                key = PreferencesRepository.Keys.FORWARD_VIDEO_ON_CONNECT,
-                default = true,
-                requirement = Requirement.ROOT_OR_SHIZUKU,
-                testTag = "workspace_forward_video_toggle",
-            )
-            val maxWin by prefs.int(PreferencesRepository.Keys.MAX_WINDOWS, default = 5)
-                .collectAsState(initial = 5)
-            Text(
-                "Maximum open windows: $maxWin",
-                color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
-            )
-            Text(
-                "Limits how many windows can be open at once for performance. At the limit, you'll be asked to close one before opening another.",
-                color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
-            )
-            Slider(
-                value = maxWin.toFloat(),
-                onValueChange = { n ->
-                    scope.launch { prefs.setInt(PreferencesRepository.Keys.MAX_WINDOWS, n.toInt()) }
-                },
-                valueRange = 3f..6f,
-                steps = 2,
-                colors = sliderColors(),
-            )
-        }
         SectionCard(title = "Dock") {
             Row(
                 Modifier.fillMaxWidth(),
@@ -9408,7 +9287,7 @@ private fun WorkspaceTab(
         if (showResetConfirm) {
             ResetConfirmDialog(
                 title = "Reset Workspace to defaults?",
-                message = "This resets the dock layout & style, top bar, folder windows, widget overlay background, video forwarding, audio routing, app-search, and wallpaper to their defaults. Your dock apps, folders, and widgets are kept.",
+                message = "This resets the dock layout & style, top bar, folder windows, widget overlay background, audio routing, app-search, and wallpaper to their defaults. Your dock apps, folders, and widgets are kept.",
                 onConfirm = {
                     showResetConfirm = false
                     scope.launch {
@@ -9426,7 +9305,6 @@ private fun WorkspaceTab(
                         )
                         prefs.setBool(PreferencesRepository.Keys.DOCK_ENABLED, true)
                         prefs.setBool(PreferencesRepository.Keys.SEARCH_KEYBOARD_ON_PHONE, true)
-                        prefs.setBool(PreferencesRepository.Keys.FORWARD_VIDEO_ON_CONNECT, true)
                         prefs.setAudioOutputMode(AudioOutputMode.AUTO)
                         prefs.resetHomeWallpapers()
                     }
@@ -9722,6 +9600,39 @@ private fun DockCustomizationPage(onBack: () -> Unit) {
                     )
                 }
                 Spacer(Modifier.height(4.dp))
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text(
+                            "Show Recent Apps button",
+                            color = PhoneOnSurface,
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        Text(
+                            "Places a Recent Apps button to the right of Home on the dock to switch between or force-close apps opened on the external display.",
+                            color = PhoneOnSurfaceMuted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Switch(
+                        checked = dockCfg.showRecentAppsButton,
+                        onCheckedChange = { show ->
+                            scope.launch { prefs.setDockConfig(dockCfg.copy(showRecentAppsButton = show)) }
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedTrackColor = PhonePrimary,
+                            checkedThumbColor = PhonePrimaryBright,
+                            uncheckedTrackColor = PhoneSurfaceElevated,
+                            uncheckedThumbColor = PhoneOnSurfaceDim,
+                        ),
+                        modifier = Modifier.testTag("dock_show_recent_apps_switch"),
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
                 Text("Icon size: ${dockCfg.iconSizeDp} dp", color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium)
                 Slider(
                     value = dockCfg.iconSizeDp.toFloat(),
@@ -9757,6 +9668,7 @@ private fun DockCustomizationPage(onBack: () -> Unit) {
                             prefs.setDockConfig(
                                 dockCfg.copy(
                                     showLabels = true,
+                                    showRecentAppsButton = true,
                                     iconSizeDp = 60,
                                     labelSizeSp = 13,
                                     dockWidthPct = 92,
@@ -10290,7 +10202,10 @@ private fun FolderWindowCustomizationPage(onBack: () -> Unit) {
 // ─────────────────────────── Tab 4: Display ───────────────────────────
 
 @Composable
-private fun DisplayTab(onOpenDisplaySettings: () -> Unit) {
+private fun DisplayTab(
+    onOpenDisplaySettings: () -> Unit,
+    scrollToTopSignal: Int = 0,
+) {
     val app = PortalPadApp.instance
     val prefs = app.prefs
     val scope = rememberCoroutineScope()
@@ -10312,7 +10227,7 @@ private fun DisplayTab(onOpenDisplaySettings: () -> Unit) {
         }
     }
 
-    TabBody {
+    TabBody(spacing = 16.dp, scrollToTopSignal = scrollToTopSignal) {
         SectionCard(title = "Connected external display") {
             val displayConnected = labelDisplayId != null
             val displaySettingsAvailable = serviceRunning && displayConnected
@@ -10323,13 +10238,13 @@ private fun DisplayTab(onOpenDisplaySettings: () -> Unit) {
             )
             val statusMessage = when {
                 !serviceRunning && !displayConnected ->
-                    "Start the PortalPad service and connect an external display to access display settings."
+                    "Start the PortalPad service and connect an external display to tune DPI, aspect ratio, or color."
                 serviceRunning && !displayConnected ->
-                    "Connect an external display to access display settings."
+                    "Connect an external display to tune DPI, aspect ratio, or color."
                 !serviceRunning ->
-                    "Start the PortalPad service to apply display changes live."
+                    "Start the PortalPad service to apply live resolution, DPI, and color changes."
                 else ->
-                    "Tap the display above to open its settings."
+                    "Tap the display above to adjust DPI, aspect ratio, screen size, and color."
             }
             var statusIsSingleLine by remember(statusMessage) { mutableStateOf(true) }
             Text(
@@ -10348,20 +10263,21 @@ private fun DisplayTab(onOpenDisplaySettings: () -> Unit) {
             )
             HorizontalDivider(
                 color = PhonePrimaryDim.copy(alpha = 0.45f),
-                modifier = Modifier.padding(vertical = 4.dp),
+                modifier = Modifier.padding(vertical = 6.dp),
             )
             val forceSeparateDisplay by prefs.forceSeparateDisplay.collectAsState(initial = false)
             Row(
-                Modifier.fillMaxWidth(),
+                Modifier.fillMaxWidth().padding(vertical = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f).padding(end = 12.dp)) {
                     Text(
                         "Force separate display",
                         color = PhoneOnSurface,
-                        style = MaterialTheme.typography.bodyMedium,
+                        style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.Medium,
                     )
+                    Spacer(Modifier.height(2.dp))
                     Text(
                         "Lock Pixel external display preference to Separate Display and automatically switch out of Mirror when connected.",
                         color = PhoneOnSurfaceMuted,
@@ -10395,6 +10311,128 @@ private fun DisplayTab(onOpenDisplaySettings: () -> Unit) {
                 )
             }
         }
+
+        SectionCard(title = "Display connect & session resume") {
+            ToggleRowWithDesc(
+                label = "Auto-open PortalPad when display connects",
+                desc = "Automatically open PortalPad's Start screen on your phone when an external display plugs in while Start Service is off, so you can tap Start Service right away. When the service is already running, normal connect behavior runs unchanged.",
+                key = PreferencesRepository.Keys.AUTO_OPEN_MAIN_ON_DISPLAY_CONNECT,
+                default = false,
+                testTag = "display_tab_auto_open_main_switch",
+            )
+            HorizontalDivider(
+                color = PhonePrimaryDim.copy(alpha = 0.45f),
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+            ToggleRowWithDesc(
+                label = "Auto-resume last app (30 min)",
+                desc = "Automatically reopen the last active app in its original window state and bounds if reconnected within 30 minutes.",
+                key = PreferencesRepository.Keys.AUTO_RESUME_LAST_APP_30M,
+                default = true,
+                testTag = "display_tab_auto_resume_toggle",
+            )
+            HorizontalDivider(
+                color = PhonePrimaryDim.copy(alpha = 0.45f),
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+            ToggleRowWithDesc(
+                label = "Forward playing video on connect",
+                desc = "When an app is actively playing video (including Picture-in-Picture) on the phone right before you connect an external display, PortalPad opens that app first in fullscreen on the external display and keeps playback going. Takes priority over 30-minute Auto-resume.",
+                key = PreferencesRepository.Keys.FORWARD_VIDEO_ON_CONNECT,
+                default = true,
+                requirement = Requirement.ROOT_OR_SHIZUKU,
+                testTag = "display_tab_forward_video_toggle",
+            )
+        }
+
+        SectionCard(title = "Display mode (beta)") {
+            Text(
+                "How apps fill the external display.",
+                color = PhoneOnSurfaceDim,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                text = androidx.compose.ui.text.buildAnnotatedString {
+                    append("• ")
+                    withStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold)) { append("Theater mode") }
+                    append(": one app at a time, filling the display. Best for video and reading.")
+                },
+                color = PhoneOnSurfaceMuted,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                text = androidx.compose.ui.text.buildAnnotatedString {
+                    append("• ")
+                    withStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold)) { append("Desktop mode") }
+                    append(
+                        ": apps open in resizable, movable windows with a taskbar at the " +
+                            "bottom and window controls at the top edge.",
+                    )
+                },
+                color = PhoneOnSurfaceMuted,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(2.dp))
+            DisplayModeSelector()
+            Text(
+                text = androidx.compose.ui.text.buildAnnotatedString {
+                    withStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold)) { append("Note:") }
+                    append(" Each floating desktop window has a system tab bar at the top, but its split button opens the split on the phone, not the external display (an Android limitation). Instead, hover to the top of the display — top-center by default, or wherever you've set the top bar — to reveal PortalPad's top bar, then tap the grid icon to tile all windows evenly across the external display.")
+                },
+                color = PhoneDanger,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            HorizontalDivider(
+                color = PhonePrimaryDim.copy(alpha = 0.45f),
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+            ToggleRowWithDesc(
+                label = "Open dock apps in a window",
+                desc = "In desktop mode, tapping a dock app opens it as a window instead of filling the display.",
+                key = PreferencesRepository.Keys.DOCK_OPENS_FREEFORM,
+                default = true,
+            )
+            ToggleRowWithDesc(
+                label = "Handle permission prompts on the phone",
+                desc = "When an app opened on the external display asks for a permission (notifications, camera, etc.), Android shows the prompt there as an unusable black window. With this on, PortalPad closes the app, shows an Allow/Deny popup on the trackpad screen, applies your choices via Shizuku or Root, and reopens the app on the external display. Turn off to leave the system prompt as-is.",
+                key = PreferencesRepository.Keys.PERM_DIALOG_KEEP_ON_EXTERNAL,
+                default = true,
+                requirement = Requirement.ROOT_OR_SHIZUKU,
+            )
+            ToggleRowWithDesc(
+                label = "Closing a window also removes it from Recents",
+                desc = "Closing a window — from Close all, Manage windows, PortalPad's window controls, or the window's own close (X) button — fully ends the task, so it no longer appears in the phone's Recents. When off, closed apps may remain as a Recents card.",
+                key = PreferencesRepository.Keys.CLOSE_REMOVES_FROM_RECENTS,
+                default = true,
+                requirement = Requirement.ROOT_OR_SHIZUKU,
+            )
+            HorizontalDivider(
+                color = PhonePrimaryDim.copy(alpha = 0.45f),
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+            val maxWin by prefs.int(PreferencesRepository.Keys.MAX_WINDOWS, default = 5)
+                .collectAsState(initial = 5)
+            Text(
+                "Maximum open windows: $maxWin",
+                color = PhoneOnSurface,
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            Text(
+                "Limits how many windows can be open at once for performance. At the limit, you'll be asked to close one before opening another.",
+                color = PhoneOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Slider(
+                value = maxWin.toFloat(),
+                onValueChange = { n ->
+                    scope.launch { prefs.setInt(PreferencesRepository.Keys.MAX_WINDOWS, n.toInt()) }
+                },
+                valueRange = 3f..6f,
+                steps = 2,
+                colors = sliderColors(),
+            )
+        }
+
         SectionCard(title = "Mirroring keep-awake") {
             Text(
                 "Choose how your phone screen stays awake during display mirroring so screen timeout doesn't turn off the external display.",
@@ -10461,22 +10499,27 @@ private fun DisplayTab(onOpenDisplaySettings: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
             )
         }
-        SectionCard(title = "Lock screen") {
-            Text(
-                "Control whether PortalPad's interface can appear over your phone's lock screen.",
-                color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
-            )
+
+        SectionCard(title = "Lock screen & orientation") {
             ToggleRowWithDesc(
                 label = "Show controls over the lock screen",
                 desc = "Let the PortalPad controls (trackpad / remote / air mouse) open over your phone's lock screen, so you can drive the external display without unlocking. Leaving PortalPad to other apps still requires unlocking.",
                 key = PreferencesRepository.Keys.ALLOW_LOCKSCREEN,
                 default = true,
             )
-        }
-        SectionCard(title = "App orientation") {
+            HorizontalDivider(
+                color = PhonePrimaryDim.copy(alpha = 0.45f),
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+            Text(
+                "App orientation",
+                color = PhoneOnSurface,
+                style = MaterialTheme.typography.bodyLarge,
+            )
             Text(
                 "Locks PortalPad's phone screens to a fixed orientation so they don't auto-rotate. Affects only PortalPad — never apps shown on the external display. Pick Auto-rotate if you use a tablet.",
-                color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
+                color = PhoneOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
             )
             val orientationFlow = remember {
                 prefs.string(PreferencesRepository.Keys.FORCE_ORIENTATION, OrientationLock.DEFAULT)
@@ -10526,7 +10569,8 @@ private fun DisplayTab(onOpenDisplaySettings: () -> Unit) {
             }
             Text(
                 "Changes apply when you return to a PortalPad screen.",
-                color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
+                color = PhoneOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
             )
         }
     }

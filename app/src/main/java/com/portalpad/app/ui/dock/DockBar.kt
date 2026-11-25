@@ -35,7 +35,9 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowLeft
@@ -117,9 +119,19 @@ import kotlinx.coroutines.launch
  * the same regardless of the Display DPI the user picks.
  */
 private const val BASELINE_DENSITY = 1.33f
+private const val TOPBAR_TO_DOCK_RATIO = 2.25f / BASELINE_DENSITY
 
 /** Pixels scrolled per chevron tap on the dock. */
 private const val SCROLL_STEP_PX = 360f
+
+/** Entry rendered in the dock's external-display Recent Apps switcher. */
+data class DockRecentAppEntry(
+    val packageName: String,
+    val component: String?,
+    val label: String,
+    val taskId: Int?,
+    val isOpen: Boolean,
+)
 
 /** Resolved sizing metrics for a rendered dock bar. */
 internal data class DockChromeMetrics(
@@ -225,6 +237,10 @@ fun DockBar(
     onCloseOpenTask: (RunningTask) -> Unit = {},
     onArrangeWindows: () -> Unit = {},
     onArrangeBlocked: () -> Unit = {},
+    recentExternalAppsFlow: Flow<List<DockRecentAppEntry>>? = null,
+    onSwitchRecentApp: (DockRecentAppEntry) -> Unit = {},
+    onForceCloseRecentApp: (DockRecentAppEntry) -> Unit = {},
+    onForceCloseAllRecentApps: (List<DockRecentAppEntry>) -> Unit = {},
 ) {
     val rawConfig = dockFlow.collectAsState(initial = DockConfig()).value
     // BOTTOM is now the only supported position. TOP collided with the top bar;
@@ -240,6 +256,7 @@ fun DockBar(
         .take(8)
     val openTasks = (openWindowsFlow?.collectAsState(initial = emptyList())?.value ?: emptyList())
         .take(12)
+    val recentExternalApps = recentExternalAppsFlow?.collectAsState(initial = emptyList())?.value ?: emptyList()
     var openFolderStack by remember { mutableStateOf<List<String>>(emptyList()) }
     // Tracks the last managed-folder id we opened (so closing targets the right one).
     var managedFolderIdPrev by remember { mutableStateOf<String?>(null) }
@@ -264,10 +281,11 @@ fun DockBar(
     // popup real space to float up above the bar.
     var openMenuExpanded by remember { mutableStateOf(false) }
     var minMenuExpanded by remember { mutableStateOf(false) }
+    var recentAppsExpanded by remember { mutableStateOf(false) }
     // Tell the host (DockOverlay) to expand its window to full-screen while any
     // modal is open — the menu/folder/rename use fillMaxSize and need room.
     val modalOpen = editingItem != null || openFolderStack.isNotEmpty() || reorderMode ||
-        removeMode || openMenuExpanded || minMenuExpanded
+        removeMode || openMenuExpanded || minMenuExpanded || recentAppsExpanded
     androidx.compose.runtime.LaunchedEffect(modalOpen) {
         com.portalpad.app.PortalPadApp.instance.injector.dockModalOpen = modalOpen
         onModalOpen(modalOpen)
@@ -428,6 +446,21 @@ fun DockBar(
         removeMode = removeMode,
         quickSettingsOpen = quickSettingsOpenNow,
     )
+    LaunchedEffect(
+        dockDisplayed,
+        quickSettingsOpenNow,
+        config.showRecentAppsButton,
+        editingItem,
+        openFolderStack,
+        reorderMode,
+        removeMode,
+    ) {
+        if (!dockDisplayed || quickSettingsOpenNow || !config.showRecentAppsButton ||
+            editingItem != null || openFolderStack.isNotEmpty() || reorderMode || removeMode
+        ) {
+            recentAppsExpanded = false
+        }
+    }
 
     // Auto-hide loop: every second, check if we've been idle past the threshold.
     // widgetOverlayOpen is a KEY so the effect re-evaluates on layer open/close —
@@ -849,7 +882,7 @@ fun DockBar(
         DockMenuTheme(
             brush = brush,
             solid = dockAvgColor.copy(alpha = 1f),
-            content = if (dockBgDark) Color(0xFFF3F1F7) else Color(0xFF15131A),
+            content = if (dockBgDark) Color(0xFFF4F4F6) else Color(0xFF15131A),
             danger = if (dockBgDark) Color(0xFFFF6B6B) else Color(0xFFC62828),
         )
     }
@@ -1081,6 +1114,7 @@ fun DockBar(
                             SearchTile(
                                 iconSizeDp * 0.88f, Icons.Default.KeyboardArrowDown, "Hide dock",
                                 onClick = {
+                                    recentAppsExpanded = false
                                     manualHideController.hideManually()
                                     manualHidden = true
                                     visible = false
@@ -1097,6 +1131,7 @@ fun DockBar(
                             SearchTile(
                                 iconSizeDp * 0.88f, Icons.Default.Home, "Home",
                                 onClick = {
+                                    recentAppsExpanded = false
                                     lastInteraction = System.currentTimeMillis()
                                     com.portalpad.app.service.PortalPadForegroundService.goHomeWallpaper()
                                 },
@@ -1108,6 +1143,31 @@ fun DockBar(
                                 tooltipHolder = dockTooltip,
                                 tooltipId = "home",
                             )
+                            if (config.showRecentAppsButton) {
+                                SearchTile(
+                                    iconSizeDp * 0.88f,
+                                    Icons.Default.History,
+                                    "Recent external apps",
+                                    onClick = {
+                                        lastInteraction = System.currentTimeMillis()
+                                        if (!recentAppsExpanded) {
+                                            openMenuExpanded = false
+                                            minMenuExpanded = false
+                                            com.portalpad.app.service.PortalPadForegroundService.dismissQuickSettingsPanel()
+                                            com.portalpad.app.service.PortalPadForegroundService.dismissNotificationPanel()
+                                        }
+                                        recentAppsExpanded = !recentAppsExpanded
+                                    },
+                                    hoverCursorPx = cursorAxisInWindowPx,
+                                    hoverOnBand = cursorOnControlsBand,
+                                    hoverHorizontal = isHorizontalDock,
+                                    tooltip = if (recentAppsExpanded) null else "Recent apps",
+                                    tintColor = if (recentAppsExpanded) com.portalpad.app.ui.theme.PhonePrimary else statusStrong,
+                                    tooltipHolder = dockTooltip,
+                                    tooltipId = "recent_apps",
+                                    modifier = Modifier.testTag("recent_apps_button"),
+                                )
+                            }
                         }
                         // The app lane and its left/right boundary slots (separators
                         // or scroll chevrons) only exist when apps are pinned — an
@@ -1774,6 +1834,7 @@ fun DockBar(
                     color = AbSurface,
                     shape = RoundedCornerShape(16.dp),
                     shadowElevation = 8.dp,
+                    border = BorderStroke(1.dp, com.portalpad.app.ui.theme.PhonePrimary),
                 ) {
                     Row(
                         Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
@@ -1785,11 +1846,11 @@ fun DockBar(
                                 "Reorder mode — tap an app to pick it up"
                             else
                                 "Tap a spot to drop it",
-                            color = AbOnSurface,
+                            color = Color.White,
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Surface(
-                            color = AbPrimaryBright,
+                            color = com.portalpad.app.ui.theme.PhonePrimary,
                             shape = RoundedCornerShape(10.dp),
                             modifier = Modifier.clickable {
                                 reorderMode = false
@@ -1798,7 +1859,7 @@ fun DockBar(
                         ) {
                             Text(
                                 "Done",
-                                color = Color.Black,
+                                color = Color.White,
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
                             )
@@ -1978,6 +2039,31 @@ fun DockBar(
             // Folder vanished (e.g. dissolved/deleted) — close.
             openFolderStack = emptyList()
         }
+
+        if (recentAppsExpanded) {
+            androidx.activity.compose.BackHandler(enabled = recentAppsExpanded) {
+                recentAppsExpanded = false
+            }
+            RecentAppsS5Modal(
+                apps = recentExternalApps,
+                onSwitch = { entry ->
+                    lastInteraction = System.currentTimeMillis()
+                    recentAppsExpanded = false
+                    onSwitchRecentApp(entry)
+                },
+                onForceClose = { entry ->
+                    lastInteraction = System.currentTimeMillis()
+                    onForceCloseRecentApp(entry)
+                },
+                onForceCloseAll = {
+                    lastInteraction = System.currentTimeMillis()
+                    val snapshot = recentExternalApps.toList()
+                    recentAppsExpanded = false
+                    onForceCloseAllRecentApps(snapshot)
+                },
+                onDismiss = { recentAppsExpanded = false },
+            )
+        }
     }
 }
 
@@ -2068,12 +2154,9 @@ private fun SearchTile(
         if (tooltip != null) {
             val showTip = rememberTooltipSlot(tooltipHolder, tooltipId ?: tooltip, hover)
             DockTooltip(
-                tooltip, visible = showTip, labelSizeSp = 11f,
-                // The "+" pill is shorter than this icon tile, so its tooltip sits
-                // higher. Pull this tooltip up a little to match the "Add apps"
-                // spacing — but only modestly, so it keeps a visible gap below the
-                // icon (a larger raise put it touching the icon's bottom edge).
-                gapDp = 7f - (iconSizeDp * 0.20f),
+                tooltip, visible = showTip, labelSizeSp = 13f,
+                // Keep a clean positive gap matching TopWindowBarOverlay's 8dp spacing.
+                gapDp = (8f * TOPBAR_TO_DOCK_RATIO - iconSizeDp * 0.14f).coerceAtLeast(6f),
             )
         }
     }
@@ -2574,19 +2657,18 @@ private fun PinnedDockDensity(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun DockTooltip(text: String, visible: Boolean, labelSizeSp: Float, gapDp: Float = 7f, anchorWidthDp: Float = 0f, above: Boolean = false) {
+private fun DockTooltip(
+    text: String,
+    visible: Boolean,
+    @Suppress("UNUSED_PARAMETER") labelSizeSp: Float,
+    gapDp: Float = 8f * TOPBAR_TO_DOCK_RATIO,
+    anchorWidthDp: Float = 0f,
+    above: Boolean = false,
+) {
     if (!visible) return
     val density = androidx.compose.ui.platform.LocalDensity.current
     val gapPx = with(density) { gapDp.dp.roundToPx() }
-    // The Popup placeholder is a zero-size node, so its anchorBounds collapses to
-    // the parent's top-start point (zero width) rather than the glyph's full box.
-    // Centering on a zero-width anchor shifts the tooltip LEFT of the glyph by
-    // half its width. Add half the real glyph width back so it centers on the
-    // glyph itself.
     val anchorHalfPx = with(density) { (anchorWidthDp / 2f).dp.roundToPx() }
-    // Custom positioner: center the tooltip horizontally on the anchor and place
-    // its TOP just below the anchor's BOTTOM edge + a small gap. Deterministic —
-    // uses the real anchor bounds and popup size rather than a guessed offset.
     val positioner = remember(gapPx, anchorHalfPx, above) {
         object : androidx.compose.ui.window.PopupPositionProvider {
             override fun calculatePosition(
@@ -2597,39 +2679,33 @@ private fun DockTooltip(text: String, visible: Boolean, labelSizeSp: Float, gapD
             ): androidx.compose.ui.unit.IntOffset {
                 val anchorCenterX = anchorBounds.left + anchorBounds.width / 2 + anchorHalfPx
                 val x = anchorCenterX - popupContentSize.width / 2
-                // Below the anchor by default; ABOVE it when there's no room below
-                // (e.g. the bell, pinned to the band bottom near the display edge,
-                // where a below-tooltip would clamp against the screen and lose its
-                // gap). Above places the tooltip's BOTTOM a gap above the anchor TOP.
                 val y = if (above) anchorBounds.top - gapPx - popupContentSize.height
                 else anchorBounds.bottom + gapPx
                 return androidx.compose.ui.unit.IntOffset(x, y)
             }
         }
     }
+    // Exact parity with TopWindowBarOverlay.showTooltip (pinned 2.25 density):
+    // 13sp -> 29.25px white normal text, #E616161B fill, 10dp corner radius,
+    // 10dp H / 5dp V padding, 1dp #DC2626 outline.
+    val corner = (10f * TOPBAR_TO_DOCK_RATIO).dp
+    val borderW = (1f * TOPBAR_TO_DOCK_RATIO).dp
+    val padH = (10f * TOPBAR_TO_DOCK_RATIO).dp
+    val padV = (5f * TOPBAR_TO_DOCK_RATIO).dp
     androidx.compose.ui.window.Popup(popupPositionProvider = positioner) {
         PinnedDockDensity {
             Box(
                 Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color.Black.copy(alpha = 0.55f))
-                    .border(0.5.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(8.dp))
-                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                    .clip(RoundedCornerShape(corner))
+                    .background(Color(0xE616161B))
+                    .border(borderW, Color(0xFFDC2626), RoundedCornerShape(corner))
+                    .padding(horizontal = padH, vertical = padV),
             ) {
                 Text(
                     text = text,
-                    color = AbOnSurfaceMuted,
-                    // Sized to match the TOP BAR's tooltip, which reads better than the
-                    // dock's old size. Top bar: setTextSize(PX, 13f * 2.25) ≈ 29.3px
-                    // (its pinned density). Dock renders at BASELINE_DENSITY (1.33), so
-                    // to land on the same ~29.2px from the default labelSizeSp of 13:
-                    //   13 × 1.69 × 1.33 ≈ 29.2px
-                    // (the old 0.95 gave 13 × 0.95 × 1.33 ≈ 16.4px — ~1.78× smaller).
-                    // Still DERIVED from labelSizeSp, so the dock's label-size slider
-                    // under Workspace continues to scale tooltips with it, and the
-                    // pinned density above keeps this fixed at any DPI. The pill is
-                    // wrap-content, so it grows around the larger text on its own.
-                    fontSize = nonScalingSp(labelSizeSp * 1.69f),
+                    color = Color.White,
+                    fontWeight = FontWeight.Normal,
+                    fontSize = nonScalingSp(13f * TOPBAR_TO_DOCK_RATIO),
                     maxLines = 1,
                 )
             }
@@ -2808,12 +2884,12 @@ private fun MinimizedWindowsBar(
             Modifier
                 .clip(barShape)
                 .background(barBrush)
-                .background(if (expanded) AbPrimaryBright.copy(alpha = 0.12f) else Color.Transparent)
+                .background(if (expanded) com.portalpad.app.ui.theme.PhonePrimary.copy(alpha = 0.18f) else Color.Transparent)
                 .border(
                     if (expanded) 1.5.dp else 1.dp,
                     // Non-active edge matches the dock band's own border tint, so the
                     // bar edges + dock edge read as one material (the "shared edge").
-                    if (expanded) AbPrimaryBright else Color.White.copy(alpha = 0.18f),
+                    if (expanded) com.portalpad.app.ui.theme.PhonePrimary else Color.White.copy(alpha = 0.18f),
                     barShape,
                 )
                 .clickable {
@@ -2833,7 +2909,7 @@ private fun MinimizedWindowsBar(
             MinimizedGlyph(sizeDp = glyphSize, color = contentColor)
             Text(
                 "$count",
-                color = AbPrimaryBright,
+                color = Color.White,
                 fontSize = nonScalingSp(13f),
                 fontWeight = FontWeight.Bold,
                 maxLines = 1,
@@ -3125,12 +3201,12 @@ private fun OpenWindowsBar(
             Modifier
                 .clip(barShape)
                 .background(barBrush)
-                .background(if (expanded) AbPrimaryBright.copy(alpha = 0.12f) else Color.Transparent)
+                .background(if (expanded) com.portalpad.app.ui.theme.PhonePrimary.copy(alpha = 0.18f) else Color.Transparent)
                 .border(
                     if (expanded) 1.5.dp else 1.dp,
                     // Non-active edge matches the dock band's own border tint, so the
                     // bar edges + dock edge read as one material (the "shared edge").
-                    if (expanded) AbPrimaryBright else Color.White.copy(alpha = 0.18f),
+                    if (expanded) com.portalpad.app.ui.theme.PhonePrimary else Color.White.copy(alpha = 0.18f),
                     barShape,
                 )
                 .clickable {
@@ -3148,7 +3224,7 @@ private fun OpenWindowsBar(
             OpenWindowsGlyph(sizeDp = glyphSize, color = contentColor)
             Text(
                 "$count / $maxWindows",
-                color = if (count >= maxWindows) Color(0xFFE6B800) else AbPrimaryBright,
+                color = if (count >= maxWindows) Color(0xFFE6B800) else Color.White,
                 fontSize = nonScalingSp(13f),
                 fontWeight = FontWeight.Bold,
                 maxLines = 1,
@@ -3398,6 +3474,329 @@ private fun OpenWindowRow(
     }
 }
 
+/**
+ * Samsung Galaxy S5 TouchWiz-inspired Recent Apps switcher rendered inline inside
+ * DockBar's full-screen modal layer (avoiding Popup focus churn on virtual
+ * displays). Shows an overlapping vertical card stack with dedicated card
+ * headers, separated crimson X force-close buttons, and a bottom "Close all"
+ * bar.
+ */
+@Composable
+private fun RecentAppsS5Modal(
+    apps: List<DockRecentAppEntry>,
+    onSwitch: (DockRecentAppEntry) -> Unit,
+    onForceClose: (DockRecentAppEntry) -> Unit,
+    onForceCloseAll: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    PinnedDockDensity {
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.56f))
+                .clickable(
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                    indication = null,
+                ) { onDismiss() },
+            contentAlignment = Alignment.BottomCenter,
+        ) {
+            val maxStackH = (maxHeight - 150.dp).coerceIn(220.dp, 540.dp)
+            Column(
+                modifier = Modifier
+                    .testTag("recent_apps_window")
+                    .padding(horizontal = 20.dp)
+                    .padding(bottom = 78.dp)
+                    .widthIn(min = 340.dp, max = 460.dp)
+                    .fillMaxWidth(0.46f)
+                    .clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null,
+                    ) {},
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Recent apps",
+                        color = Color.White,
+                        fontSize = nonScalingSp(14f),
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(Color(0xFFDC2626).copy(alpha = 0.28f))
+                            .border(1.dp, Color(0xFFDC2626), RoundedCornerShape(999.dp))
+                            .padding(horizontal = 8.dp, vertical = 2.dp),
+                    ) {
+                        Text(
+                            "${apps.size}",
+                            color = Color.White,
+                            fontSize = nonScalingSp(11f),
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Box(
+                        modifier = Modifier
+                            .testTag("recent_apps_dismiss")
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xCC18181F))
+                            .border(1.dp, Color.White.copy(alpha = 0.22f), CircleShape)
+                            .clickable { onDismiss() },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Dismiss recent apps",
+                            tint = Color.White,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+
+                if (apps.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(Color(0xEE181920))
+                            .border(1.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(18.dp))
+                            .padding(horizontal = 20.dp, vertical = 28.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            "No apps opened on external display yet",
+                            color = Color.White.copy(alpha = 0.72f),
+                            fontSize = nonScalingSp(13f),
+                        )
+                    }
+                } else {
+                    // Render oldest-to-newest top-to-bottom so newer cards cascade
+                    // forward at the bottom of the TouchWiz stack with every card's
+                    // 54dp header fully uncovered for safe tapping or closing.
+                    val ordered = remember(apps) { apps.asReversed() }
+                    val stackState = rememberLazyListState(
+                        initialFirstVisibleItemIndex = (ordered.size - 1).coerceAtLeast(0),
+                    )
+                    LazyColumn(
+                        state = stackState,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = maxStackH),
+                        verticalArrangement = Arrangement.spacedBy((-66).dp),
+                        contentPadding = PaddingValues(vertical = 4.dp),
+                    ) {
+                        items(
+                            items = ordered,
+                            key = { "${it.packageName}:${it.taskId ?: -1}" },
+                        ) { entry ->
+                            TouchWizRecentCard(
+                                entry = entry,
+                                onSwitch = { onSwitch(entry) },
+                                onForceClose = { onForceClose(entry) },
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+
+                    Row(
+                        modifier = Modifier
+                            .testTag("recent_apps_close_all")
+                            .fillMaxWidth()
+                            .heightIn(min = 50.dp)
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(
+                                Brush.horizontalGradient(
+                                    listOf(Color(0xFFDC2626), Color(0xFFB91C1C)),
+                                ),
+                            )
+                            .border(1.dp, Color.White.copy(alpha = 0.24f), RoundedCornerShape(16.dp))
+                            .clickable { onForceCloseAll() }
+                            .padding(horizontal = 18.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Close all recent apps",
+                            tint = Color.White,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "Close all",
+                            color = Color.White,
+                            fontSize = nonScalingSp(14f),
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TouchWizRecentCard(
+    entry: DockRecentAppEntry,
+    onSwitch: () -> Unit,
+    onForceClose: () -> Unit,
+) {
+    val cardShape = RoundedCornerShape(16.dp)
+    val borderColor = if (entry.isOpen) Color(0xFFDC2626) else Color.White.copy(alpha = 0.22f)
+    Column(
+        modifier = Modifier
+            .testTag("recent_app_card_${entry.packageName}")
+            .fillMaxWidth()
+            .height(158.dp)
+            .shadow(14.dp, cardShape, clip = false)
+            .clip(cardShape)
+            .background(Color(0xFF17181E))
+            .border(1.5.dp, borderColor, cardShape),
+    ) {
+        // Dedicated 54dp TouchWiz card header (stays uncovered in the stack overlap).
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(54.dp)
+                .background(if (entry.isOpen) Color(0xFF28191D) else Color(0xFF23252E))
+                .padding(start = 10.dp, end = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(
+                modifier = Modifier
+                    .testTag("recent_app_switch_${entry.packageName}")
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { onSwitch() }
+                    .padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                AppIcon(packageName = entry.packageName, sizeDp = 32, reflect = false)
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        entry.label,
+                        color = Color.White,
+                        fontSize = nonScalingSp(13.5f),
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        if (entry.isOpen) "Open on display" else "Recent session",
+                        color = if (entry.isOpen) Color(0xFFFCA5A5) else Color.White.copy(alpha = 0.65f),
+                        fontSize = nonScalingSp(10.5f),
+                        maxLines = 1,
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Box(
+                Modifier
+                    .width(1.dp)
+                    .height(30.dp)
+                    .background(Color.White.copy(alpha = 0.16f)),
+            )
+            Spacer(Modifier.width(8.dp))
+            Box(
+                modifier = Modifier
+                    .testTag("force_close_${entry.packageName}")
+                    .size(width = 52.dp, height = 48.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFFDC2626).copy(alpha = 0.24f))
+                    .border(1.dp, Color(0xFFDC2626), RoundedCornerShape(10.dp))
+                    .clickable { onForceClose() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Default.Close,
+                    contentDescription = "Force close ${entry.label}",
+                    tint = Color.White,
+                    modifier = Modifier.size(19.dp),
+                )
+            }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(Color.White.copy(alpha = 0.10f)),
+        )
+        // TouchWiz card preview body (tapping opens/focuses the app).
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(Color(0xFF1A1C24), Color(0xFF111218)),
+                    ),
+                )
+                .clickable { onSwitch() }
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+        ) {
+            Row(
+                modifier = Modifier.align(Alignment.CenterStart),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(46.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color.White.copy(alpha = 0.06f))
+                        .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(12.dp)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    AppIcon(packageName = entry.packageName, sizeDp = 34, reflect = false)
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Box(
+                        Modifier
+                            .width(120.dp)
+                            .height(8.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(Color.White.copy(alpha = 0.14f)),
+                    )
+                    Box(
+                        Modifier
+                            .width(84.dp)
+                            .height(6.dp)
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(Color.White.copy(alpha = 0.08f)),
+                    )
+                }
+            }
+            if (entry.isOpen) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFFDC2626).copy(alpha = 0.22f))
+                        .border(1.dp, Color(0xFFDC2626).copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 8.dp, vertical = 3.dp),
+                ) {
+                    Text(
+                        "ACTIVE",
+                        color = Color.White,
+                        fontSize = nonScalingSp(9.5f),
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+        }
+    }
+}
+
 @OptIn(
     androidx.compose.foundation.ExperimentalFoundationApi::class,
     androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
@@ -3468,7 +3867,7 @@ private fun FolderPopup(
                 (cA.green + cB.green) / 2f,
                 (cA.blue + cB.blue) / 2f,
             ),
-            content = if (dark) Color(0xFFF3F1F7) else Color(0xFF15131A),
+            content = if (dark) Color(0xFFF4F4F6) else Color(0xFF15131A),
             danger = if (dark) Color(0xFFFF6B6B) else Color(0xFFC62828),
         )
     }
@@ -4029,11 +4428,11 @@ internal fun SortControl(
                 Modifier
                     .clip(RoundedCornerShape(12.dp))
                     .background(colors.chip)
-                    .border(1.dp, colors.chipBorder, RoundedCornerShape(12.dp))
+                    .border(1.dp, com.portalpad.app.ui.theme.PhonePrimary, RoundedCornerShape(12.dp))
                     .clickable { onChange(sort, !ascending) }
                     .padding(horizontal = 12.dp, vertical = 8.dp),
             ) {
-                Text(arrow, color = AbPrimaryBright, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                Text(arrow, color = Color.White, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -4131,10 +4530,10 @@ private fun folderControlColors(a: Color, b: Color): FolderControlColors {
     return if (lum < 0.5f) {
         // Dark background → light controls.
         FolderControlColors(
-            content = Color(0xFFF3F1F7),
+            content = Color(0xFFF4F4F6),
             chip = Color.White.copy(alpha = 0.14f),
             chipBorder = Color.White.copy(alpha = 0.22f),
-            surface = Color(0xFF221C33),
+            surface = Color(0xFF1E1E25),
             surfaceBrush = matchBrush,
         )
     } else {
@@ -4143,7 +4542,7 @@ private fun folderControlColors(a: Color, b: Color): FolderControlColors {
             content = Color(0xFF15131A),
             chip = Color.Black.copy(alpha = 0.10f),
             chipBorder = Color.Black.copy(alpha = 0.18f),
-            surface = Color(0xFFF3F1F7),
+            surface = Color(0xFFF4F4F6),
             surfaceBrush = matchBrush,
         )
     }
@@ -4160,10 +4559,10 @@ private fun FolderToolbarButton(
     Box(
         Modifier
             .clip(RoundedCornerShape(12.dp))
-            .background(if (selected) AbPrimary else colors.chip)
+            .background(if (selected) com.portalpad.app.ui.theme.PhonePrimary else colors.chip)
             .border(
                 1.dp,
-                if (selected) AbPrimaryBright else colors.chipBorder,
+                if (selected) com.portalpad.app.ui.theme.PhonePrimary else colors.chipBorder,
                 RoundedCornerShape(12.dp),
             )
             .clickable { onClick() }
@@ -4171,7 +4570,7 @@ private fun FolderToolbarButton(
     ) {
         Text(
             label,
-            color = if (selected) AbPrimaryBright else if (danger) AbAccent else colors.content,
+            color = if (selected) Color.White else if (danger) AbAccent else colors.content,
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
         )
@@ -4853,21 +5252,28 @@ private fun IconPackPicker(
                         onDismissRequest = { packMenuOpen = false },
                         modifier = Modifier
                             .background(AbSurfaceElevated)
-                            .border(1.dp, com.portalpad.app.ui.theme.AbPrimaryDim, RoundedCornerShape(10.dp))
+                            .border(1.dp, com.portalpad.app.ui.theme.PhonePrimary, RoundedCornerShape(10.dp))
                             .width(with(packDensity) { packAnchorWidthPx.toDp() })
                             .heightIn(max = 280.dp),
                     ) {
                         packs.forEachIndexed { pi, p ->
                             if (pi > 0) {
                                 androidx.compose.material3.HorizontalDivider(
-                                    color = com.portalpad.app.ui.theme.AbPrimaryDim.copy(alpha = 0.5f),
+                                    color = com.portalpad.app.ui.theme.PhonePrimary.copy(alpha = 0.35f),
                                 )
                             }
+                            val isSelectedPack = p.packageName == selectedPack
                             androidx.compose.material3.DropdownMenuItem(
+                                modifier = if (isSelectedPack) {
+                                    Modifier.background(com.portalpad.app.ui.theme.PhonePrimary.copy(alpha = 0.22f))
+                                } else {
+                                    Modifier
+                                },
                                 text = {
                                     Text(
                                         p.label,
-                                        color = if (p.packageName == selectedPack) AbPrimaryBright else AbOnSurface,
+                                        color = Color.White,
+                                        fontWeight = if (isSelectedPack) FontWeight.SemiBold else FontWeight.Normal,
                                         maxLines = 1,
                                         overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                                     )

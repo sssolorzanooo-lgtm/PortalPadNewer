@@ -156,7 +156,7 @@ class ShizukuWarningOverlay(
             gravity = Gravity.CENTER_HORIZONTAL
             background = GradientDrawable().apply {
                 cornerRadius = 24f * density
-                setColor("#1A1326".toColorInt())
+                setColor("#16161B".toColorInt())
                 setStroke((2f * density).toInt(), "#FFB547".toColorInt())
             }
             elevation = 24f * density
@@ -184,7 +184,7 @@ class ShizukuWarningOverlay(
             TextView(displayContext).apply {
                 text = "Please open the Shizuku app to view connection " +
                     "status and restart the service."
-                setTextColor("#F0EBF5".toColorInt())
+                setTextColor("#FFFFFF".toColorInt())
                 setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, bodyPx)
                 gravity = Gravity.CENTER
                 setPadding(0, (bodyPx * 0.8f).toInt(), 0, 0)

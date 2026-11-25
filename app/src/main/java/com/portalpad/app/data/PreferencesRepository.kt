@@ -384,6 +384,7 @@ class PreferencesRepository(private val context: Context) {
         val AUTO_LAUNCH_AFTER_MOVE = booleanPreferencesKey("auto_after_move")
         val AUTO_LAUNCH_WHEN_ENABLED = booleanPreferencesKey("auto_when_enabled")
         val AUTO_ACTIVATE_EXTERNAL = booleanPreferencesKey("auto_external")
+        val AUTO_OPEN_MAIN_ON_DISPLAY_CONNECT = booleanPreferencesKey("auto_open_main_on_display_connect")
         /** Set true by a DELIBERATE user stop (companion stop()), cleared by a
          *  deliberate start (companion start()). A START_STICKY relaunch checks
          *  this in onCreate: true → the user said stop, stay stopped (stopSelf);
@@ -519,6 +520,13 @@ class PreferencesRepository(private val context: Context) {
     }.distinctUntilChanged()
     suspend fun setForwardVideoOnConnect(enabled: Boolean) = context.dataStore.edit {
         it[Keys.FORWARD_VIDEO_ON_CONNECT] = enabled
+    }
+    /** Automatically open PortalPad's main Start screen on external display connect when service is stopped. */
+    val autoOpenMainOnDisplayConnect: Flow<Boolean> = context.dataStore.data.map { p ->
+        p[Keys.AUTO_OPEN_MAIN_ON_DISPLAY_CONNECT] ?: false
+    }.distinctUntilChanged()
+    suspend fun setAutoOpenMainOnDisplayConnect(enabled: Boolean) = context.dataStore.edit {
+        it[Keys.AUTO_OPEN_MAIN_ON_DISPLAY_CONNECT] = enabled
     }
     /** Enforced media audio output policy while an external display is connected. */
     val audioOutputMode: Flow<AudioOutputMode> = context.dataStore.data.map { p ->

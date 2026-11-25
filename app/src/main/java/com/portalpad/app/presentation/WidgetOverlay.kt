@@ -227,10 +227,10 @@ class WidgetOverlay(
         val onBg = if (bgLum > 0.5f) Color(0xFF14121A) else Color(0xFFF0EBF5)
         val onBgMuted = if (bgLum > 0.5f) Color(0xCC14121A) else Color(0xCCF0EBF5)
         val chipBg = if (bgLum > 0.5f) Color(0x22000000) else Color(0x33FFFFFF)
-        // Edit-chrome accent (border + resize dots): darker violet on light
-        // backdrops, the bright theme violet on dark ones.
-        val editAccent = if (bgLum > 0.5f) Color(0xFF6B3FA0)
-        else com.portalpad.app.ui.theme.AbPrimaryBright
+        // Edit-chrome accent (border + resize dots): deeper crimson on light
+        // backdrops, primary crimson on dark ones.
+        val editAccent = if (bgLum > 0.5f) Color(0xFFB91C1C)
+        else com.portalpad.app.ui.theme.PhonePrimary
 
         BoxWithConstraints(
             Modifier
@@ -623,7 +623,7 @@ class WidgetOverlay(
                             )
                             .border(
                                 2.dp,
-                                if (free) com.portalpad.app.ui.theme.AbPrimaryBright
+                                if (free) Color.White
                                 else Color(0xFFD84A4A),
                                 RoundedCornerShape(14.dp),
                             ),
@@ -1644,7 +1644,7 @@ class WidgetOverlay(
 
     @Composable
     private fun SectionLabel(text: String) {
-        Text(text, color = com.portalpad.app.ui.theme.AbPrimaryBright,
+        Text(text, color = Color.White,
             fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
             modifier = Modifier.padding(top = 10.dp, bottom = 6.dp))
     }

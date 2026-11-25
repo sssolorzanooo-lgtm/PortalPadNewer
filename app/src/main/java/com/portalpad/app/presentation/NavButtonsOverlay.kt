@@ -51,8 +51,8 @@ class NavButtonsOverlay(
             orientation = LinearLayout.HORIZONTAL
             background = GradientDrawable().apply {
                 cornerRadius = 34f * density
-                setColor("#E61A1326".toColorInt())
-                setStroke((1 * density).toInt(), "#3A2D55".toColorInt())
+                setColor("#E616161B".toColorInt())
+                setStroke((1 * density).toInt(), "#DC2626".toColorInt())
             }
             elevation = 12f * density
             setPadding(

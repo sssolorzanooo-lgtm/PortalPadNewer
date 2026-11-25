@@ -100,13 +100,13 @@ object PixelDesktopGuardOverlay {
         val density = ctx.resources.displayMetrics.density.takeIf { it > 0.1f } ?: 2f
 
         val title = TextView(ctx).apply {
-                setTextColor("#F2F2F5".toColorInt())
+                setTextColor("#FFFFFF".toColorInt())
                 setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, widthPx * 0.038f)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 gravity = Gravity.CENTER
             }
             val detail = TextView(ctx).apply {
-                setTextColor("#B9B4C3".toColorInt())
+                setTextColor("#E2E2E8".toColorInt())
                 setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, widthPx * 0.024f)
                 gravity = Gravity.CENTER
                 setPadding(0, (widthPx * 0.018f).toInt(), 0, 0)
@@ -126,8 +126,8 @@ object PixelDesktopGuardOverlay {
                 setPadding(padH, padV, padH, padV)
                 background = android.graphics.drawable.GradientDrawable().apply {
                     cornerRadius = 24f * density
-                    setColor("#F21A1326".toColorInt())
-                    setStroke((2f * density).toInt(), "#7E63D8".toColorInt())
+                    setColor("#F216161B".toColorInt())
+                    setStroke((2f * density).toInt(), "#DC2626".toColorInt())
                 }
                 elevation = 24f * density
                 addView(

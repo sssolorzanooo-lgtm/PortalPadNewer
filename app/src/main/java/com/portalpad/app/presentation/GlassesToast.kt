@@ -82,7 +82,7 @@ object GlassesToast {
                     setPadding(padPx, padPx, padPx, padPx)
                     background = GradientDrawable().apply {
                         cornerRadius = 24f * density
-                        setColor("#F21A1326".toColorInt())
+                        setColor("#F216161B".toColorInt())
                         setStroke((2f * density).toInt(), "#FFB547".toColorInt())
                     }
                     elevation = 24f * density
@@ -104,7 +104,7 @@ object GlassesToast {
                 card.addView(
                     TextView(ctx).apply {
                         setText(message)
-                        setTextColor("#F0EBF5".toColorInt())
+                        setTextColor("#FFFFFF".toColorInt())
                         setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, bodyPx)
                         gravity = Gravity.CENTER
                         setPadding(0, (bodyPx * 0.6f).toInt(), 0, 0)
@@ -120,16 +120,16 @@ object GlassesToast {
                 val padVpx = (w * 0.03f).toInt()
                 rootView = TextView(ctx).apply {
                     setText(message)
-                    setTextColor("#F2F2F5".toColorInt())
+                    setTextColor("#FFFFFF".toColorInt())
                     setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, textPx)
                     gravity = Gravity.CENTER
                     setPadding(padHpx, padVpx, padHpx, padVpx)
                     background = GradientDrawable().apply {
                         cornerRadius = 24f * density
-                        setColor("#F21B1B20".toColorInt())
-                        // Violet like every other display popup (SH); the
-                        // titled card keeps its deliberate amber warning stroke.
-                        setStroke((2 * density).toInt(), "#5B3CAA".toColorInt())
+                        setColor("#F216161B".toColorInt())
+                        // Crimson red matching the app theme; the titled card
+                        // keeps its deliberate amber warning stroke.
+                        setStroke((2 * density).toInt(), "#DC2626".toColorInt())
                     }
                     elevation = 24f * density
                 }

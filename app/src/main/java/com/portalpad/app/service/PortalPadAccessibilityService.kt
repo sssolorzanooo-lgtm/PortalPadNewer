@@ -331,6 +331,17 @@ class PortalPadAccessibilityService : AccessibilityService() {
             }
             if (wp != null && wp != packageName) {
                 lastWindowStateAt = SystemClock.elapsedRealtime()
+                runCatching {
+                    val app = applicationContext as? PortalPadApp
+                    val extId = app?.externalDisplayId?.value
+                    if (app != null && extId != null && app.isTrackableExternalPackage(wp)) {
+                        val onExt = windowsOnAllDisplays.get(extId)
+                            ?.any { it.root?.packageName?.toString() == wp } == true
+                        if (onExt) {
+                            app.recordExternalApp(wp, force = false, updateActive = true)
+                        }
+                    }
+                }
                 // Only count it as an app SWITCH when the package actually changed.
                 // A within-app navigation (Play Store home → its search activity) keeps
                 // the same package and must NOT be treated as a launch.
@@ -2726,6 +2737,55 @@ class PortalPadAccessibilityService : AccessibilityService() {
             Log.e(TAG, "a11y scroll dispatch failed", t)
             scrollInFlight = false
         }
+    }
+
+    /**
+     * Detect any active Picture-in-Picture (PiP) application window on the phone display (display 0).
+     * Uses AccessibilityWindowInfo.isInPictureInPictureMode (API 33+) and falls back to identifying
+     * compact floating TYPE_APPLICATION windows sitting above another full window on display 0.
+     */
+    fun findPhonePipWindowPackages(): List<String> {
+        val byDisplay = runCatching { windowsOnAllDisplays }.getOrNull() ?: return emptyList()
+        val phoneWindows = byDisplay.get(android.view.Display.DEFAULT_DISPLAY) ?: return emptyList()
+        val app = applicationContext as? PortalPadApp ?: return emptyList()
+        val dm = runCatching {
+            val wm = getSystemService(android.view.WindowManager::class.java)
+            wm?.maximumWindowMetrics?.bounds
+        }.getOrNull()
+        val dispW = dm?.width()?.coerceAtLeast(1) ?: resources.displayMetrics.widthPixels.coerceAtLeast(1)
+        val dispH = dm?.height()?.coerceAtLeast(1) ?: resources.displayMetrics.heightPixels.coerceAtLeast(1)
+        val dispArea = dispW.toLong() * dispH.toLong()
+
+        val found = linkedSetOf<String>()
+        val rect = android.graphics.Rect()
+        for (window in phoneWindows.sortedByDescending { it.layer }) {
+            if (window.type != android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            val root = runCatching { window.root }.getOrNull()
+            val pkg = root?.packageName?.toString()
+            if (root != null) runCatching { root.recycle() }
+            if (pkg.isNullOrBlank() || !app.isTrackableExternalPackage(pkg) || pkg == "com.android.systemui") {
+                continue
+            }
+            val isExplicitPip = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+                runCatching { window.isInPictureInPictureMode }.getOrDefault(false)
+            if (isExplicitPip) {
+                found += pkg
+                continue
+            }
+            runCatching { window.getBoundsInScreen(rect) }
+            val w = rect.width().coerceAtLeast(0)
+            val h = rect.height().coerceAtLeast(0)
+            val area = w.toLong() * h.toLong()
+            // Fallback for API 30-32 / OEMs omitting isInPictureInPictureMode:
+            // compact floating overlay-sized window above the main app stack.
+            if (w > 80 && h > 80 && area in 1L..(dispArea * 38L / 100L) &&
+                w <= (dispW * 0.70f) && h <= (dispH * 0.55f) &&
+                phoneWindows.count { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION } >= 2
+            ) {
+                found += pkg
+            }
+        }
+        return found.toList()
     }
 
     companion object {

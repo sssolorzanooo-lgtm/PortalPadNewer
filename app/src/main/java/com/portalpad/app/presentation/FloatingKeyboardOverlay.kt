@@ -30,6 +30,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.dp
@@ -326,12 +327,12 @@ object FloatingKeyboardOverlay : LifecycleOwner, SavedStateRegistryOwner, ViewMo
                                 .padding(horizontal = 14.dp, vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Text("★", color = AbPrimaryBright, fontSize = 13.sp)
+                            Text("★", color = com.portalpad.app.ui.theme.PhonePrimary, fontSize = 13.sp)
                             Spacer(Modifier.width(8.dp))
                             Text(
                                 "${suggestions.size} suggestion" +
                                     if (suggestions.size == 1) "" else "s",
-                                color = AbOnSurface,
+                                color = Color.White,
                                 modifier = Modifier.weight(1f),
                                 style = MaterialTheme.typography.bodyMedium,
                             )

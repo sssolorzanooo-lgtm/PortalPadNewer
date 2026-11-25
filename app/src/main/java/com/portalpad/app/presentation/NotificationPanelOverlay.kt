@@ -322,14 +322,15 @@ class NotificationPanelOverlay(
                 Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(12.dp))
-                    .background(frost)
+                    .background(com.portalpad.app.ui.theme.PhonePrimary.copy(alpha = 0.22f))
+                    .border(1.dp, com.portalpad.app.ui.theme.PhonePrimary, RoundedCornerShape(12.dp))
                     .clickable { onEnable() }
                     .padding(vertical = 12.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
                     "Enable on phone",
-                    color = AbPrimaryBright,
+                    color = Color.White,
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.SemiBold,
                 )
@@ -488,7 +489,7 @@ class NotificationPanelOverlay(
                     if (item.dismissable) {
                         androidx.compose.material3.HorizontalDivider(color = notifHairline)
                         androidx.compose.material3.DropdownMenuItem(
-                            text = { Text("Dismiss", color = AbPrimaryBright) },
+                            text = { Text("Dismiss", color = Color.White) },
                             onClick = {
                                 menuOpen = false
                                 PortalPadNotificationListenerService.instance?.dismiss(item.key)

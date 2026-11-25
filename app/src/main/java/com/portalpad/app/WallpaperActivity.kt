@@ -32,6 +32,85 @@ import kotlinx.coroutines.flow.first
  * NOT touch the Android system wallpaper in any way.
  */
 class WallpaperActivity : ComponentActivity() {
+    private var lastMouseX = Float.NaN
+    private var lastMouseY = Float.NaN
+    private var mouseHoldTracker: com.portalpad.app.service.MouseLeftHoldTracker? = null
+
+    private fun getOrCreateMouseHoldTracker(app: PortalPadApp): com.portalpad.app.service.MouseLeftHoldTracker {
+        mouseHoldTracker?.let { return it }
+        return com.portalpad.app.service.MouseLeftHoldTracker(
+            actions = object : com.portalpad.app.service.MouseLeftHoldTracker.Actions {
+                override fun onPointerMove(dx: Float, dy: Float) {
+                    if (!lastMouseX.isNaN() && !lastMouseY.isNaN()) {
+                        app.injector.syncExternalCursorPositionQuietly(lastMouseX, lastMouseY)
+                        app.injector.notifyExternalMouseMoving()
+                    }
+                }
+
+                override fun onLeftClick() {
+                    app.injector.leftClick()
+                }
+
+                override fun onRightClick() {
+                    app.injector.rightClick()
+                }
+
+                override fun onLongPressStart() {
+                    app.injector.kbSeekHoldStart()
+                }
+
+                override fun onLongPressEnd() {
+                    app.injector.kbSeekHoldEnd()
+                }
+
+                override fun onDragStart(captionMove: Boolean) {
+                    app.injector.dragStart(captionMove)
+                }
+
+                override fun onDragMove(dx: Float, dy: Float) {
+                    app.injector.dragMove(dx, dy)
+                }
+
+                override fun onDragEnd() {
+                    app.injector.dragEnd()
+                }
+            },
+        ).also { mouseHoldTracker = it }
+    }
+
+    private fun handleUncapturedLeftDown(app: PortalPadApp, ev: MotionEvent) {
+        val tracker = getOrCreateMouseHoldTracker(app)
+        if (tracker.isLeftHeld()) return
+        app.injector.syncExternalCursorPositionQuietly(ev.x, ev.y)
+        lastMouseX = ev.x
+        lastMouseY = ev.y
+        val curType = app.injector.cursorType.value
+        val onEdge = curType != com.portalpad.app.service.CursorType.ARROW &&
+            curType != com.portalpad.app.service.CursorType.MOVE
+        tracker.onLeftDown(
+            onResizeEdge = onEdge,
+            onCaption = app.injector.cursorOnCaption.value,
+            onHandle = app.injector.pressOnHandleNow(),
+            onButton = app.injector.pressOnButtonNow(),
+        )
+    }
+
+    private fun handleUncapturedMouseMove(app: PortalPadApp, ev: MotionEvent) {
+        val tracker = getOrCreateMouseHoldTracker(app)
+        if (tracker.isLeftHeld()) {
+            val dx = if (lastMouseX.isNaN()) 0f else ev.x - lastMouseX
+            val dy = if (lastMouseY.isNaN()) 0f else ev.y - lastMouseY
+            lastMouseX = ev.x
+            lastMouseY = ev.y
+            tracker.onMove(dx, dy)
+        } else if (!app.injector.isLikelyOwnInjectedHover(ev.x, ev.y)) {
+            lastMouseX = ev.x
+            lastMouseY = ev.y
+            app.injector.syncExternalCursorPositionQuietly(ev.x, ev.y)
+            app.injector.notifyExternalMouseMoving()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         instance = this
@@ -176,22 +255,25 @@ class WallpaperActivity : ComponentActivity() {
                         MotionEvent.ACTION_HOVER_MOVE,
                         MotionEvent.ACTION_MOVE,
                         -> {
-                            if (!app.injector.isLikelyOwnInjectedHover(ev.x, ev.y)) {
-                                app.injector.syncExternalCursorPositionQuietly(ev.x, ev.y)
-                                app.injector.notifyExternalMouseMoving()
-                            }
+                            handleUncapturedMouseMove(app, ev)
                         }
                         MotionEvent.ACTION_BUTTON_PRESS -> {
-                            app.injector.syncExternalCursorPositionQuietly(ev.x, ev.y)
                             when (ev.actionButton) {
                                 MotionEvent.BUTTON_PRIMARY -> {
-                                    app.injector.leftClick()
+                                    handleUncapturedLeftDown(app, ev)
                                     return true
                                 }
                                 MotionEvent.BUTTON_SECONDARY -> {
+                                    app.injector.syncExternalCursorPositionQuietly(ev.x, ev.y)
                                     app.injector.rightClick()
                                     return true
                                 }
+                            }
+                        }
+                        MotionEvent.ACTION_BUTTON_RELEASE -> {
+                            if (ev.actionButton == MotionEvent.BUTTON_PRIMARY) {
+                                getOrCreateMouseHoldTracker(app).onLeftUp()
+                                return true
                             }
                         }
                     }
@@ -199,6 +281,62 @@ class WallpaperActivity : ComponentActivity() {
             }
         }
         return super.dispatchGenericMotionEvent(ev)
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        val app = applicationContext as? PortalPadApp
+        if (app != null &&
+            (ev.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE &&
+            !app.btMouse.running && app.btMouse.isUserEnabled
+        ) {
+            val dev = InputDevice.getDevice(ev.deviceId)
+            val isRealExternal = dev != null && !dev.isVirtual
+            if (isRealExternal) {
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        if ((ev.buttonState and MotionEvent.BUTTON_SECONDARY) != 0 ||
+                            ev.actionButton == MotionEvent.BUTTON_SECONDARY
+                        ) {
+                            app.injector.syncExternalCursorPositionQuietly(ev.x, ev.y)
+                            app.injector.rightClick()
+                            return true
+                        }
+                        if ((ev.buttonState and MotionEvent.BUTTON_PRIMARY) != 0 ||
+                            ev.actionButton == MotionEvent.BUTTON_PRIMARY ||
+                            ev.buttonState == 0
+                        ) {
+                            handleUncapturedLeftDown(app, ev)
+                            return true
+                        }
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (mouseHoldTracker?.isLeftHeld() == true) {
+                            handleUncapturedMouseMove(app, ev)
+                            return true
+                        }
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (mouseHoldTracker?.isLeftHeld() == true) {
+                            handleUncapturedMouseMove(app, ev)
+                            mouseHoldTracker?.onLeftUp()
+                            return true
+                        }
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        if (mouseHoldTracker?.isLeftHeld() == true) {
+                            mouseHoldTracker?.cancel()
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    override fun onPause() {
+        mouseHoldTracker?.cancel()
+        super.onPause()
     }
 
     override fun onResume() {
@@ -209,6 +347,8 @@ class WallpaperActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        mouseHoldTracker?.cancel()
+        mouseHoldTracker = null
         super.onDestroy()
         val wasIntentional = intentionalFinish
         intentionalFinish = false
