@@ -281,11 +281,10 @@ fun DockBar(
     // popup real space to float up above the bar.
     var openMenuExpanded by remember { mutableStateOf(false) }
     var minMenuExpanded by remember { mutableStateOf(false) }
-    var recentAppsExpanded by remember { mutableStateOf(false) }
     // Tell the host (DockOverlay) to expand its window to full-screen while any
     // modal is open — the menu/folder/rename use fillMaxSize and need room.
     val modalOpen = editingItem != null || openFolderStack.isNotEmpty() || reorderMode ||
-        removeMode || openMenuExpanded || minMenuExpanded || recentAppsExpanded
+        removeMode || openMenuExpanded || minMenuExpanded
     androidx.compose.runtime.LaunchedEffect(modalOpen) {
         com.portalpad.app.PortalPadApp.instance.injector.dockModalOpen = modalOpen
         onModalOpen(modalOpen)
@@ -446,21 +445,6 @@ fun DockBar(
         removeMode = removeMode,
         quickSettingsOpen = quickSettingsOpenNow,
     )
-    LaunchedEffect(
-        dockDisplayed,
-        quickSettingsOpenNow,
-        config.showRecentAppsButton,
-        editingItem,
-        openFolderStack,
-        reorderMode,
-        removeMode,
-    ) {
-        if (!dockDisplayed || quickSettingsOpenNow || !config.showRecentAppsButton ||
-            editingItem != null || openFolderStack.isNotEmpty() || reorderMode || removeMode
-        ) {
-            recentAppsExpanded = false
-        }
-    }
 
     // Auto-hide loop: every second, check if we've been idle past the threshold.
     // widgetOverlayOpen is a KEY so the effect re-evaluates on layer open/close —
@@ -1114,7 +1098,6 @@ fun DockBar(
                             SearchTile(
                                 iconSizeDp * 0.88f, Icons.Default.KeyboardArrowDown, "Hide dock",
                                 onClick = {
-                                    recentAppsExpanded = false
                                     manualHideController.hideManually()
                                     manualHidden = true
                                     visible = false
@@ -1131,7 +1114,6 @@ fun DockBar(
                             SearchTile(
                                 iconSizeDp * 0.88f, Icons.Default.Home, "Home",
                                 onClick = {
-                                    recentAppsExpanded = false
                                     lastInteraction = System.currentTimeMillis()
                                     com.portalpad.app.service.PortalPadForegroundService.goHomeWallpaper()
                                 },
@@ -1143,31 +1125,6 @@ fun DockBar(
                                 tooltipHolder = dockTooltip,
                                 tooltipId = "home",
                             )
-                            if (config.showRecentAppsButton) {
-                                SearchTile(
-                                    iconSizeDp * 0.88f,
-                                    Icons.Default.History,
-                                    "Recent external apps",
-                                    onClick = {
-                                        lastInteraction = System.currentTimeMillis()
-                                        if (!recentAppsExpanded) {
-                                            openMenuExpanded = false
-                                            minMenuExpanded = false
-                                            com.portalpad.app.service.PortalPadForegroundService.dismissQuickSettingsPanel()
-                                            com.portalpad.app.service.PortalPadForegroundService.dismissNotificationPanel()
-                                        }
-                                        recentAppsExpanded = !recentAppsExpanded
-                                    },
-                                    hoverCursorPx = cursorAxisInWindowPx,
-                                    hoverOnBand = cursorOnControlsBand,
-                                    hoverHorizontal = isHorizontalDock,
-                                    tooltip = if (recentAppsExpanded) null else "Recent apps",
-                                    tintColor = if (recentAppsExpanded) com.portalpad.app.ui.theme.PhonePrimary else statusStrong,
-                                    tooltipHolder = dockTooltip,
-                                    tooltipId = "recent_apps",
-                                    modifier = Modifier.testTag("recent_apps_button"),
-                                )
-                            }
                         }
                         // The app lane and its left/right boundary slots (separators
                         // or scroll chevrons) only exist when apps are pinned — an
@@ -2038,31 +1995,6 @@ fun DockBar(
         } else if (openFolderStack.isNotEmpty()) {
             // Folder vanished (e.g. dissolved/deleted) — close.
             openFolderStack = emptyList()
-        }
-
-        if (recentAppsExpanded) {
-            androidx.activity.compose.BackHandler(enabled = recentAppsExpanded) {
-                recentAppsExpanded = false
-            }
-            RecentAppsS5Modal(
-                apps = recentExternalApps,
-                onSwitch = { entry ->
-                    lastInteraction = System.currentTimeMillis()
-                    recentAppsExpanded = false
-                    onSwitchRecentApp(entry)
-                },
-                onForceClose = { entry ->
-                    lastInteraction = System.currentTimeMillis()
-                    onForceCloseRecentApp(entry)
-                },
-                onForceCloseAll = {
-                    lastInteraction = System.currentTimeMillis()
-                    val snapshot = recentExternalApps.toList()
-                    recentAppsExpanded = false
-                    onForceCloseAllRecentApps(snapshot)
-                },
-                onDismiss = { recentAppsExpanded = false },
-            )
         }
     }
 }

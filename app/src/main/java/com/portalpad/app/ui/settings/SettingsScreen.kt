@@ -433,18 +433,12 @@ fun SettingsScreen(
                         if (startRequirementsMet(pickerCtx)) onEnableClick()
                         else showStartSetup = true
                     },
-                    onGoToSystemTab = { showSystem = true },
-                    onGoToControls = { selectedTab = 3 },
-                    onGoToDisplay = { selectedTab = 1 },
                     onLaunchTrackpad = onLaunchTrackpad,
-                    onOpenButtonActions = { showControlsSubpage = true },
-                    onOpenAutoLaunch = { com.portalpad.app.ui.dock.launchDockPickerOnPhone(pickerCtx, "autolaunch") },
-                    onPickHome = onPickHome,
-                    onPickBack = onPickBack,
                     onOpenStartSetup = { showStartSetup = true },
                 )
                 1 -> DisplayTab(
                     onOpenDisplaySettings = { showDisplaySubpage = true },
+                    onOpenAutoLaunch = { com.portalpad.app.ui.dock.launchDockPickerOnPhone(pickerCtx, "autolaunch") },
                     scrollToTopSignal = scrollToTopTick,
                 )
                 2 -> WorkspaceTab(
@@ -463,14 +457,7 @@ fun SettingsScreen(
                         if (startRequirementsMet(pickerCtx)) onEnableClick()
                         else showStartSetup = true
                     },
-                    onGoToSystemTab = { showSystem = true },
-                    onGoToControls = { selectedTab = 3 },
-                    onGoToDisplay = { selectedTab = 1 },
                     onLaunchTrackpad = onLaunchTrackpad,
-                    onOpenButtonActions = { showControlsSubpage = true },
-                    onOpenAutoLaunch = { com.portalpad.app.ui.dock.launchDockPickerOnPhone(pickerCtx, "autolaunch") },
-                    onPickHome = onPickHome,
-                    onPickBack = onPickBack,
                     onOpenStartSetup = { showStartSetup = true },
                 )
             }
@@ -3825,53 +3812,18 @@ private fun SetupChoiceChip(label: String, selected: Boolean, onClick: () -> Uni
 }
 
 @Composable
-private fun StartTab(onEnableClick: () -> Unit, onGoToSystemTab: () -> Unit, onGoToControls: () -> Unit, onGoToDisplay: () -> Unit = {}, onLaunchTrackpad: (() -> Unit)? = null, onOpenButtonActions: () -> Unit = {}, onOpenAutoLaunch: () -> Unit = {}, onPickHome: () -> Unit = {}, onPickBack: () -> Unit = {}, onOpenStartSetup: () -> Unit = {}) {
+private fun StartTab(
+    onEnableClick: () -> Unit,
+    onLaunchTrackpad: (() -> Unit)? = null,
+    onOpenStartSetup: () -> Unit = {},
+) {
     val app = PortalPadApp.instance
     val prefs = app.prefs
-    val scope = rememberCoroutineScope()
     val shizukuStatus by app.shizuku.status.collectAsState()
     val accessMode by prefs.accessMode.collectAsState(initial = AccessMode.NONE)
-    val foreground by app.appInForeground.collectAsState()
     val serviceRunning by app.serviceRunning.collectAsState()
     val externalDisplayId by app.externalDisplayId.collectAsState()
-    val physicalExternalDisplayId by app.physicalExternalDisplayId.collectAsState()
     val context = LocalContext.current
-
-    // Live external-display detection (independent of the service) so the Display
-    // button can show the connected display's name the moment glasses are plugged
-    // in, even before the service starts. Null name when none connected.
-    var detectedDisplayName by remember { mutableStateOf<String?>(null) }
-    DisposableEffect(Unit) {
-        val dm = context.getSystemService(android.content.Context.DISPLAY_SERVICE)
-            as android.hardware.display.DisplayManager
-        fun looksExternal(d: android.view.Display): Boolean {
-            if (d.displayId == android.view.Display.DEFAULT_DISPLAY) return false
-            if (d.name == "PortalPad Session") return false
-            val type = runCatching {
-                android.view.Display::class.java.getMethod("getType").invoke(d) as? Int
-            }.getOrNull()
-            if (type != null) return type == 2 || type == 4 // EXTERNAL or OVERLAY
-            val n = d.name.lowercase()
-            return !(n.contains("ghost") || n.contains("virtual") || n.contains("projection") ||
-                n.contains("componentinfo") || n.contains("scrcpy"))
-        }
-        fun rescan() {
-            val ext = runCatching { dm.displays.firstOrNull { looksExternal(it) } }.getOrNull()
-            detectedDisplayName = ext?.name?.takeIf { it.isNotBlank() }
-        }
-        rescan()
-        val listener = object : android.hardware.display.DisplayManager.DisplayListener {
-            override fun onDisplayAdded(displayId: Int) = rescan()
-            override fun onDisplayRemoved(displayId: Int) = rescan()
-            override fun onDisplayChanged(displayId: Int) = rescan()
-        }
-        dm.registerDisplayListener(listener, null)
-        onDispose { dm.unregisterDisplayListener(listener) }
-    }
-
-    val homeAction by prefs.homeAction.collectAsState(initial = null)
-    val backAction by prefs.backAction.collectAsState(initial = com.portalpad.app.data.BackAction.System)
-    val autoLaunch by prefs.autoLaunchOnStart.collectAsState(initial = com.portalpad.app.data.AutoLaunch.Wallpaper)
 
     // Last-used interface, for the Launch button label. Mode-switches persist
     // these; a display connect / fresh start resets them (applyAutoLaunchInterface),
@@ -4016,37 +3968,10 @@ private fun StartTab(onEnableClick: () -> Unit, onGoToSystemTab: () -> Unit, onG
         )
     }
     ScaleToFit(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
-      Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-        // DRM / HDCP warning — muted amber border (no background), above the
-        // primary actions so it's seen before launching anything. Calm "caution"
-        // styling rather than alarming red: it's a known limitation, not an error.
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .border(1.dp, Color(0xFF8A7A4D), RoundedCornerShape(12.dp))
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-        ) {
-            Column {
-                Text(
-                    "DRM-protected video may not play on the external display.\n" +
-                        "In streaming apps you may see a black screen, an HDCP error, or a copyright-protection notice.",
-                    color = Color(0xFFB8A66A),
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "Turning on System mirror (Display settings) may fix this for some DRM-protected streaming apps.",
-                    color = PhoneOnSurfaceMuted,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-        }
+      Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         // Two primary actions side by side: Start/Stop Service (left) and Launch
         // trackpad (right). Equal size, shorter height, each with a two-line label
-        // (action on top, hint underneath). The "No click path ready" banner was
-        // removed — the top strip already shows access state and the first-run
-        // popup covers setup, so it only added clutter/scroll here.
+        // (action on top, hint underneath).
         val canLaunchTrackpad = serviceRunning && externalDisplayId != null
         val greenStart = Color(0xFF2E9E5B)        // calm "go" green (not alarm-bright)
         val greenBorder = Color(0xFF49C77E)       // brighter green so the border reads on green
@@ -4154,165 +4079,20 @@ private fun StartTab(onEnableClick: () -> Unit, onGoToSystemTab: () -> Unit, onG
             }
         }
 
-        // Display settings — moved off the top nav. Full-width, distinct violet
-        // (accent) tonal/outlined treatment so it reads as a "go to a section"
-        // destination rather than a primary action button.
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .height(56.dp)
-                .clip(RoundedCornerShape(16.dp))
-                .background(PhoneAccent.copy(alpha = 0.14f))
-                .border(1.dp, PhoneAccent.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
-                .clickable { onGoToDisplay() }
-                .padding(horizontal = 16.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            // Icon + label centered in the button…
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(end = 28.dp),
-            ) {
-                Icon(Icons.Default.Devices, contentDescription = null, tint = PhoneAccent)
-                Spacer(Modifier.width(12.dp))
-                // Resolve a connected display's name: prefer the service's
-                // physical/external id, fall back to live-detected. When present,
-                // the label reads "Display – <name>".
-                val serviceDisplayName = remember(externalDisplayId, physicalExternalDisplayId) {
-                    val id = physicalExternalDisplayId ?: externalDisplayId
-                    id?.let {
-                        val dm = context.getSystemService(android.content.Context.DISPLAY_SERVICE)
-                            as android.hardware.display.DisplayManager
-                        runCatching { dm.getDisplay(it)?.name?.takeIf { n -> n.isNotBlank() } }.getOrNull()
-                    }
-                }
-                val shownName = serviceDisplayName ?: detectedDisplayName
-                Text(
-                    if (shownName != null) "Display \u2013 $shownName" else "Display",
-                    color = PhoneOnSurface,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                )
-            }
-            // …chevron pinned to the right edge.
-            Icon(
-                Icons.Default.ChevronRight,
-                contentDescription = "Open Display settings",
-                tint = PhoneAccent,
-                modifier = Modifier.align(Alignment.CenterEnd),
+        CollapsibleCard(title = "DRM & HDCP video notice", defaultExpanded = false) {
+            Text(
+                "DRM-protected video may not play on the external display. In streaming apps you may see a black screen, an HDCP error, or a copyright-protection notice.",
+                color = Color(0xFFB8A66A),
+                style = MaterialTheme.typography.bodySmall,
             )
-        }
-
-        // Home / Back buttons — same centered "Buttons" card layout these had
-        // when they lived on the Controls page: two columns (Home | Back) with a
-        // divider, the action label above and the assigned action name in
-        // smaller text below. Both open the button-actions page (returns here).
-        // The AppEntry behind each button (null = not an app/activity action).
-        val homeEntry: com.portalpad.app.data.AppEntry? = homeAction
-        val backEntry: com.portalpad.app.data.AppEntry? =
-            (backAction as? com.portalpad.app.data.BackAction.Launch)?.entry
-        val homeLabel = homeAction?.label ?: "Wallpaper (default)"
-        val backLabel = when (val b = backAction) {
-            is com.portalpad.app.data.BackAction.System -> "Back action (default)"
-            is com.portalpad.app.data.BackAction.Launch -> b.entry.label
-        }
-        val buttonActionColumn: @Composable RowScope.(String, String, com.portalpad.app.data.AppEntry?, () -> Unit) -> Unit = { title, value, entry, onClick ->
-            Column(
-                Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(10.dp))
-                    .clickable { onClick() }
-                    .padding(vertical = 4.dp, horizontal = 8.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                Text(
-                    title, color = PhoneOnSurfaceMuted,
-                    style = MaterialTheme.typography.bodyMedium,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center, maxLines = 1,
-                )
-                // For an app/activity action, show icon + app label (+ activity
-                // name) so it's clear which app it is. Otherwise plain value text.
-                if (entry != null) {
-                    com.portalpad.app.ui.common.AssignedActionLabel(
-                        entry = entry, fallback = value, iconSizeDp = 28,
-                    )
-                } else {
-                    Text(
-                        value, color = PhoneAccent,
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                        maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                    )
-                }
-            }
-        }
-        SectionCard(title = "", centeredTitleNoDot = true) {
-            // Auto Launch on Start — what appears on the glasses when a session
-            // starts (independent of the Home button). Yellow value, truncates.
-            val autoLaunchEntry = (autoLaunch as? com.portalpad.app.data.AutoLaunch.Launch)?.entry
-            val autoLaunchLabel = when (val a = autoLaunch) {
-                com.portalpad.app.data.AutoLaunch.Wallpaper -> "Wallpaper (default)"
-                com.portalpad.app.data.AutoLaunch.LastApp -> "Last app"
-                is com.portalpad.app.data.AutoLaunch.Launch -> a.entry.label
-            }
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
-                    .clickable { onOpenAutoLaunch() }
-                    .padding(vertical = 4.dp, horizontal = 8.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                Text(
-                    "Auto Launch on Start", color = PhoneOnSurfaceMuted,
-                    style = MaterialTheme.typography.bodyMedium,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center, maxLines = 1,
-                )
-                if (autoLaunchEntry != null) {
-                    com.portalpad.app.ui.common.AssignedActionLabel(
-                        entry = autoLaunchEntry, fallback = autoLaunchLabel, iconSizeDp = 28,
-                    )
-                } else {
-                    Text(
-                        autoLaunchLabel, color = PhoneAccent,
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                        maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                    )
-                }
-            }
-            androidx.compose.material3.HorizontalDivider(
-                modifier = Modifier.padding(vertical = 3.dp),
-                thickness = 1.dp,
-                color = PhoneOnSurfaceDim.copy(alpha = 0.5f),
+            Text(
+                "Turning on System mirror (Display tab) may fix this for some DRM-protected streaming apps.",
+                color = PhoneOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
             )
-            Row(
-                Modifier.fillMaxWidth().height(IntrinsicSize.Min),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                buttonActionColumn("Home button", homeLabel, homeEntry, onPickHome)
-                androidx.compose.material3.VerticalDivider(
-                    modifier = Modifier.fillMaxHeight().padding(horizontal = 4.dp),
-                    thickness = 1.dp,
-                    color = PhoneOnSurfaceDim.copy(alpha = 0.5f),
-                )
-                buttonActionColumn("Back button", backLabel, backEntry, onPickBack)
-            }
         }
 
         DeviceTakeoverNote()
-
-        // (Status card removed — Service state now shows in the top strip, and
-        // Shizuku/Root readiness is shown live by the strip's Mode indicator.)
-        // Accessibility companion button hidden — service de-registered; the dock
-        // long-press menu now works in-process via Shizuku, so accessibility is no
-        // longer needed. (Block removed from UI; restore from git if re-enabling.)
       }
     }
 }
@@ -6026,11 +5806,66 @@ private fun ButtonsTab(onPickHome: () -> Unit, onPickBack: () -> Unit, scrollToT
     val backAction by prefs.backAction.collectAsState(initial = BackAction.System)
 
     TabBody(scrollToTopSignal = scrollToTopSignal) {
-        SectionCard(title = "Controls") {
-            // Two parallel collapsible dropdowns, both collapsed by default to
-            // keep the card compact:
-            //   "Trackpad & Air Mouse" — surface settings shared by both modes.
-            //   "Air Mouse Only"       — tilt-specific settings.
+        val homeEntry: com.portalpad.app.data.AppEntry? = homeAction
+        val backEntry: com.portalpad.app.data.AppEntry? =
+            (backAction as? com.portalpad.app.data.BackAction.Launch)?.entry
+        val homeLabel = homeAction?.label ?: "Wallpaper (default)"
+        val backLabel = when (val b = backAction) {
+            is com.portalpad.app.data.BackAction.System -> "Back action (default)"
+            is com.portalpad.app.data.BackAction.Launch -> b.entry.label
+        }
+        SectionCard(title = "Home & Back buttons") {
+            Row(
+                Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val buttonColumn: @Composable RowScope.(String, String, com.portalpad.app.data.AppEntry?, () -> Unit) -> Unit =
+                    { title, value, entry, onClick ->
+                        Column(
+                            Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable { onClick() }
+                                .padding(vertical = 6.dp, horizontal = 8.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                title,
+                                color = PhoneOnSurfaceMuted,
+                                style = MaterialTheme.typography.bodyMedium,
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                            )
+                            if (entry != null) {
+                                com.portalpad.app.ui.common.AssignedActionLabel(
+                                    entry = entry,
+                                    fallback = value,
+                                    iconSizeDp = 28,
+                                )
+                            } else {
+                                Text(
+                                    value,
+                                    color = PhoneAccent,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                buttonColumn("Home button", homeLabel, homeEntry, onPickHome)
+                VerticalDivider(
+                    modifier = Modifier.fillMaxHeight().padding(horizontal = 4.dp),
+                    thickness = 1.dp,
+                    color = PhoneOnSurfaceDim.copy(alpha = 0.5f),
+                )
+                buttonColumn("Back button", backLabel, backEntry, onPickBack)
+            }
+        }
+        SectionCard(title = "Input devices") {
             val collapsible: @Composable (String, @Composable () -> Unit) -> Unit =
                 { title, content ->
                     var open by remember { mutableStateOf(false) }
@@ -6105,12 +5940,156 @@ private fun ButtonsTab(onPickHome: () -> Unit, onPickBack: () -> Unit, scrollToT
             }
         }
         ThreeFingerGesturesSection()
-        SectionCard(title = "Vibration") {
-            Text(
-                "Haptic feedback strength for taps — trackpad clicks and on-screen buttons. Affects the whole app. Some devices only support on/off regardless of level.",
-                color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
+        CollapsibleCard(title = "Keyboard & typing", defaultExpanded = false) {
+            ToggleRowWithDesc(
+                label = "Show keyboard button",
+                desc = "Add a keyboard button to the trackpad bottom bar. Tapping it brings up the keyboard you choose below.",
+                key = PreferencesRepository.Keys.SHOW_KEYBOARD,
+                default = true,
             )
-            // Presets → milliseconds. 0 = Off.
+            KeyboardDisplaySelector()
+
+            run {
+                val gOnExternal by prefs.bool(PreferencesRepository.Keys.IME_ON_EXTERNAL, default = false)
+                    .collectAsState(initial = false)
+                val gAutoOpen by prefs.bool(PreferencesRepository.Keys.AUTO_OPEN_RELAY_ON_FIELD, default = true)
+                    .collectAsState(initial = true)
+                val gAndroidTab by prefs.bool(PreferencesRepository.Keys.RELAY_OPENS_ON_ANDROID_TAB, default = false)
+                    .collectAsState(initial = false)
+                val gPpOnDisplay by prefs.bool(PreferencesRepository.Keys.PORTALPAD_KB_ON_DISPLAY, default = false)
+                    .collectAsState(initial = false)
+                val gPpFloating by prefs.bool(PreferencesRepository.Keys.PORTALPAD_KB_FLOATING, default = false)
+                    .collectAsState(initial = false)
+                val kbMode = com.portalpad.app.ui.common.KeyboardMode.of(
+                    gOnExternal, gAutoOpen, gAndroidTab, gPpOnDisplay, gPpFloating,
+                )
+                if (kbMode == com.portalpad.app.ui.common.KeyboardMode.TEXT_BOX) {
+                    val pauseFlush by prefs.int(PreferencesRepository.Keys.RELAY_PAUSE_FLUSH_MS, default = 600)
+                        .collectAsState(initial = 600)
+                    Text(
+                        "Android keyboard sync pause: $pauseFlush ms" +
+                            if (pauseFlush == 600) "  (default)" else "",
+                        color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Text(
+                        "On the \"Type to external display\" page's Android keyboard, typed text is sent to the external field only after you stop typing for this long. Shorter = the external display updates sooner; longer = fewer syncs mid-thought, so a resumed keystroke is less likely to be missed while a sync settles.",
+                        color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
+                    )
+                    Slider(
+                        value = pauseFlush.toFloat(),
+                        onValueChange = { n ->
+                            scope.launch { prefs.setInt(PreferencesRepository.Keys.RELAY_PAUSE_FLUSH_MS, n.toInt()) }
+                        },
+                        valueRange = 450f..900f,
+                        steps = 2,
+                    )
+                }
+            }
+            val keyboardOnExternalDisplay by prefs
+                .bool(PreferencesRepository.Keys.IME_ON_EXTERNAL, default = false)
+                .collectAsState(initial = false)
+            if (!keyboardOnExternalDisplay) {
+                val a11yLifecycleOwner = LocalLifecycleOwner.current
+                var a11yTick by remember { mutableIntStateOf(0) }
+                DisposableEffect(a11yLifecycleOwner) {
+                    val obs = LifecycleEventObserver { _, e ->
+                        if (e == Lifecycle.Event.ON_RESUME) a11yTick++
+                    }
+                    a11yLifecycleOwner.lifecycle.addObserver(obs)
+                    onDispose { a11yLifecycleOwner.lifecycle.removeObserver(obs) }
+                }
+                val a11yEnabled = remember(a11yTick) {
+                    runCatching {
+                        android.provider.Settings.Secure.getString(
+                            app.contentResolver,
+                            android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                        )?.contains(app.packageName) == true
+                    }.getOrDefault(false)
+                }
+                Text(
+                    "Required for auto-open: Enable the PortalPad accessibility service to detect when you tap or open a text field on the glasses. It also shows the field's current text in the typing page so you can edit it. Without it, the typing page won't open automatically.",
+                    color = PhoneOnSurfaceMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 8.dp, start = 4.dp, end = 4.dp),
+                )
+                if (!a11yEnabled) {
+                    Text(
+                        text = androidx.compose.ui.text.buildAnnotatedString {
+                            withStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold)) { append("Note: ") }
+                            append("On some devices the PortalPad switch in Accessibility is greyed out. Tap it once — Android then surfaces a 3-dot menu on PortalPad's App info page. Open that menu, choose \"Allow restricted settings,\" then return to Accessibility and enable PortalPad.")
+                        },
+                        color = PhoneDanger.copy(alpha = 0.9f),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 6.dp, start = 4.dp, end = 4.dp),
+                    )
+                    Text(
+                        "App info",
+                        color = PhonePrimaryBright,
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier
+                            .padding(top = 4.dp, start = 4.dp)
+                            .clickable {
+                                runCatching {
+                                    app.startActivity(
+                                        android.content.Intent(
+                                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                            android.net.Uri.fromParts("package", app.packageName, null),
+                                        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                                    )
+                                }
+                            },
+                    )
+                }
+                Text(
+                    if (a11yEnabled) "Status: Accessibility enabled ✓" else "Status: Not enabled",
+                    color = if (a11yEnabled) PhoneSuccess else PhoneOnSurfaceMuted,
+                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 8.dp, start = 4.dp),
+                )
+                OutlinedButton(
+                    onClick = {
+                        runCatching {
+                            app.startActivity(
+                                android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                            )
+                        }
+                    },
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = if (a11yEnabled) PhoneOnSurfaceMuted else PhonePrimaryBright,
+                    ),
+                    modifier = Modifier.padding(top = 6.dp, start = 4.dp),
+                ) {
+                    Text("Open Accessibility")
+                }
+            }
+        }
+        CollapsibleCard(title = "Cursor & haptics", defaultExpanded = false) {
+            ToggleRowWithDesc(
+                label = "Custom cursor on external display",
+                desc = "Render an amber cursor on the external display at the current pointer location. Useful when the OEM doesn't render a system cursor for injected mouse events.",
+                key = PreferencesRepository.Keys.ENABLE_MOUSE_HOVER,
+                default = true,
+            )
+            MediaCursorHideSection()
+            HorizontalDivider(
+                color = PhoneSurfaceElevated,
+                thickness = 1.dp,
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+            Text(
+                "Tap vibration strength",
+                color = PhoneOnSurface,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                "Haptic feedback strength for trackpad clicks and on-screen buttons across the app.",
+                color = PhoneOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
             val vibOptions = listOf(
                 "Off" to 0,
                 "Light" to 10,
@@ -6162,169 +6141,12 @@ private fun ButtonsTab(onPickHome: () -> Unit, onPickBack: () -> Unit, scrollToT
                 }
             }
         }
-        SectionCard(title = "Cursor") {
-            ToggleRowWithDesc(
-                label = "Custom cursor on external display",
-                desc = "Render an amber cursor on the external display at the current pointer location. Useful when the OEM doesn't render a system cursor for injected mouse events.",
-                key = PreferencesRepository.Keys.ENABLE_MOUSE_HOVER,
-                default = true,
-            )
-            MediaCursorHideSection()
-        }
-        SectionCard(title = "Keyboard & navigation") {
-            // 1) Whether the keyboard pill appears in the trackpad bottom bar.
-            ToggleRowWithDesc(
-                label = "Show keyboard button",
-                desc = "Add a keyboard button to the trackpad bottom bar. Tapping it brings up the keyboard you choose below.",
-                key = PreferencesRepository.Keys.SHOW_KEYBOARD,
-                default = true,
-            )
-            // 2) WHICH keyboard a field tap produces — the single four-way choice.
-            //    Absorbed the old "Auto-open typing page on field tap" toggle: it
-            //    was a second control over one of these same four states, and its
-            //    off position had to be explained in terms of the other control.
-            KeyboardDisplaySelector()
-
-            // Sync-pause applies ONLY to Android keyboard (with text box) - it
-            // is the relay Android tab's debounced push (SH). Shown only while
-            // that mode is selected, so the slider can't read as a setting for
-            // keyboards it does not affect.
-            run {
-                val gOnExternal by prefs.bool(PreferencesRepository.Keys.IME_ON_EXTERNAL, default = false)
-                    .collectAsState(initial = false)
-                val gAutoOpen by prefs.bool(PreferencesRepository.Keys.AUTO_OPEN_RELAY_ON_FIELD, default = true)
-                    .collectAsState(initial = true)
-                val gAndroidTab by prefs.bool(PreferencesRepository.Keys.RELAY_OPENS_ON_ANDROID_TAB, default = false)
-                    .collectAsState(initial = false)
-                val gPpOnDisplay by prefs.bool(PreferencesRepository.Keys.PORTALPAD_KB_ON_DISPLAY, default = false)
-                    .collectAsState(initial = false)
-                val gPpFloating by prefs.bool(PreferencesRepository.Keys.PORTALPAD_KB_FLOATING, default = false)
-                    .collectAsState(initial = false)
-                val kbMode = com.portalpad.app.ui.common.KeyboardMode.of(
-                    gOnExternal, gAutoOpen, gAndroidTab, gPpOnDisplay, gPpFloating,
-                )
-                if (kbMode == com.portalpad.app.ui.common.KeyboardMode.TEXT_BOX) {
-            val pauseFlush by prefs.int(PreferencesRepository.Keys.RELAY_PAUSE_FLUSH_MS, default = 600)
-                .collectAsState(initial = 600)
-            Text(
-                "Android keyboard sync pause: $pauseFlush ms" +
-                    if (pauseFlush == 600) "  (default)" else "",
-                color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
-            )
-            Text(
-                "On the \"Type to external display\" page's Android keyboard, typed text is sent to the external field only after you stop typing for this long. Shorter = the external display updates sooner; longer = fewer syncs mid-thought, so a resumed keystroke is less likely to be missed while a sync settles.",
-                color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
-            )
-            Slider(
-                value = pauseFlush.toFloat(),
-                onValueChange = { n ->
-                    scope.launch { prefs.setInt(PreferencesRepository.Keys.RELAY_PAUSE_FLUSH_MS, n.toInt()) }
-                },
-                valueRange = 450f..900f,
-                steps = 2,
-            )
-                }
-            }
-            // Accessibility is the detector for auto-open: it receives real focus/tap
-            // events with the field's display id, and for fields that focus silently it
-            // probes the focused node directly. When it's off, auto-open is unavailable
-            // (there's no fallback). Hidden when the keyboard is set to appear on the
-            // external display, where nothing here applies. The status refreshes when
-            // the user returns from the settings screen.
-            val keyboardOnExternalDisplay by prefs
-                .bool(PreferencesRepository.Keys.IME_ON_EXTERNAL, default = false)
-                .collectAsState(initial = false)
-            if (!keyboardOnExternalDisplay) {
-                val a11yLifecycleOwner = LocalLifecycleOwner.current
-                var a11yTick by remember { mutableIntStateOf(0) }
-                DisposableEffect(a11yLifecycleOwner) {
-                    val obs = LifecycleEventObserver { _, e ->
-                        if (e == Lifecycle.Event.ON_RESUME) a11yTick++
-                    }
-                    a11yLifecycleOwner.lifecycle.addObserver(obs)
-                    onDispose { a11yLifecycleOwner.lifecycle.removeObserver(obs) }
-                }
-                val a11yEnabled = remember(a11yTick) {
-                    runCatching {
-                        android.provider.Settings.Secure.getString(
-                            app.contentResolver,
-                            android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-                        )?.contains(app.packageName) == true
-                    }.getOrDefault(false)
-                }
-                Text(
-                    "Required for auto-open: Enable the PortalPad accessibility service to detect when you tap or open a text field on the glasses. It also shows the field's current text in the typing page so you can edit it. Without it, the typing page won't open automatically.",
-                    color = PhoneOnSurfaceMuted,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 8.dp, start = 4.dp, end = 4.dp),
-                )
-                // Restricted-settings workaround — only while not yet enabled (once
-                // it's on, the workaround is moot). Worded as "on some devices" since
-                // the exact steps vary by OEM (Samsung/Pixel both use this flow).
-                if (!a11yEnabled) {
-                    Text(
-                        text = androidx.compose.ui.text.buildAnnotatedString {
-                            withStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold)) { append("Note: ") }
-                            append("On some devices the PortalPad switch in Accessibility is greyed out. Tap it once — Android then surfaces a 3-dot menu on PortalPad's App info page. Open that menu, choose \"Allow restricted settings,\" then return to Accessibility and enable PortalPad.")
-                        },
-                        color = PhoneDanger.copy(alpha = 0.9f),
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(top = 6.dp, start = 4.dp, end = 4.dp),
-                    )
-                    Text(
-                        "App info",
-                        color = PhonePrimaryBright,
-                        fontWeight = FontWeight.SemiBold,
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier
-                            .padding(top = 4.dp, start = 4.dp)
-                            .clickable {
-                                runCatching {
-                                    app.startActivity(
-                                        android.content.Intent(
-                                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                            android.net.Uri.fromParts("package", app.packageName, null),
-                                        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
-                                    )
-                                }
-                            },
-                    )
-                }
-                // Status line carries the enabled/disabled state.
-                Text(
-                    if (a11yEnabled) "Status: Accessibility enabled ✓" else "Status: Not enabled",
-                    color = if (a11yEnabled) PhoneSuccess else PhoneOnSurfaceMuted,
-                    fontWeight = FontWeight.SemiBold,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 8.dp, start = 4.dp),
-                )
-                // Button stays action-focused ("Open Accessibility") and stays
-                // tappable even when enabled (so you can go turn it off) — just
-                // muted/secondary when already on, rather than a dead disabled look.
-                OutlinedButton(
-                    onClick = {
-                        runCatching {
-                            app.startActivity(
-                                android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
-                            )
-                        }
-                    },
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = if (a11yEnabled) PhoneOnSurfaceMuted else PhonePrimaryBright,
-                    ),
-                    modifier = Modifier.padding(top = 6.dp, start = 4.dp),
-                ) {
-                    Text("Open Accessibility")
-                }
-            }
-        }
         var showResetConfirm by remember { mutableStateOf(false) }
         ResetToDefaultsButton("Reset Controls to Defaults") { showResetConfirm = true }
         if (showResetConfirm) {
             ResetConfirmDialog(
                 title = "Reset Controls to defaults?",
-                message = "This resets trackpad, scrolling, cursor, vibration, and air-mouse settings to their defaults. Your Home/Back button assignments are kept.",
+                message = "This resets trackpad, scrolling, cursor, vibration, keyboard, and air-mouse settings to their defaults. Your Home/Back button assignments are kept.",
                 onConfirm = {
                     showResetConfirm = false
                     scope.launch {
@@ -6344,9 +6166,6 @@ private fun ButtonsTab(onPickHome: () -> Unit, onPickBack: () -> Unit, scrollToT
                         prefs.setBool(PreferencesRepository.Keys.SHOW_KEYBOARD, true)
                         prefs.setBool(PreferencesRepository.Keys.IME_ON_EXTERNAL, false)
                         prefs.setBool(PreferencesRepository.Keys.AUTO_OPEN_RELAY_ON_FIELD, true)
-                        // Together these three restore "Custom keyboard" in the
-                        // keyboard dropdown — they must be reset as a SET, or a
-                        // stale landing tab survives into a "default" state.
                         prefs.setBool(PreferencesRepository.Keys.RELAY_OPENS_ON_ANDROID_TAB, false)
                     }
                 },
@@ -9150,51 +8969,53 @@ private fun WorkspaceTab(
                     ),
                 )
             }
-        }
-        SectionCard(title = "Dock contents") {
+            HorizontalDivider(
+                color = PhonePrimaryDim.copy(alpha = 0.45f),
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
             ActionRow(
                 label = "Manage dock apps (multi-select)",
                 value = "${dockCfg.items.size} items",
                 onClick = onPickDock,
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             ActionRow(
                 label = "Manage dock folders",
                 value = "${dockCfg.items.count { it is com.portalpad.app.data.DockItem.Folder }} folders",
                 onClick = onOpenFolderManager,
             )
         }
-        SectionCard(title = "External Display Appearance") {
+        CollapsibleCard(title = "External display appearance", defaultExpanded = true) {
             Text(
                 "Customize the look and behavior of the dock, the top window bar, folder windows, and the widget overlay shown on the external display.",
                 color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             ActionRow(
                 label = "Dock Customization",
                 value = "Layout & style",
                 onClick = onOpenDockCustomization,
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             ActionRow(
                 label = "Top Bar Customization",
                 value = "Position & style",
                 onClick = onOpenTopBarCustomization,
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             ActionRow(
                 label = "Folder Window Customization",
                 value = "Background & labels",
                 onClick = onOpenFolderWindowCustomization,
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             ActionRow(
                 label = "Widget Overlay",
                 value = "Widgets & background",
                 onClick = onOpenWidgetOverlayCustomization,
             )
         }
-        SectionCard(title = "App search") {
+        CollapsibleCard(title = "App search", defaultExpanded = false) {
             ToggleRowWithDesc(
                 label = "Use phone keyboard for dock search",
                 desc = "When on, the dock app-search opens the phone keyboard relay so you type on your phone (reliable). When off, you type directly on the external-display search field. Voice search works either way.",
@@ -9202,110 +9023,25 @@ private fun WorkspaceTab(
                 default = true,
             )
         }
-        SectionCard(title = "Audio", tightSpacing = true) {
-            val audioStatus by app.audioRouter.status.collectAsState()
-            val selectedAudioMode by prefs.audioOutputMode.collectAsState(initial = AudioOutputMode.AUTO)
-            LaunchedEffect(Unit) {
-                app.audioRouter.refreshSnapshotOnly()
-            }
-            Text(
-                "Forces the selected media audio output as soon as an external display connects. " +
-                    "In Auto mode, audio plays on Bluetooth if connected (and shifts automatically if Bluetooth connects mid-session), " +
-                    "then External display audio, and falls back to Phone audio last.",
-                color = PhoneOnSurfaceMuted,
-                style = MaterialTheme.typography.bodySmall,
-            )
-            WorkspaceAudioStatusCard(status = audioStatus)
-            AudioOutputMode.entries.forEach { mode ->
-                val selected = selectedAudioMode == mode
-                val modeIcon = when (mode) {
-                    AudioOutputMode.AUTO -> Icons.Default.GraphicEq
-                    AudioOutputMode.BLUETOOTH -> Icons.Default.BluetoothAudio
-                    AudioOutputMode.EXTERNAL_DISPLAY -> Icons.Default.Tv
-                    AudioOutputMode.PHONE -> Icons.Default.SpeakerPhone
-                }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 48.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(
-                            if (selected) PhonePrimary.copy(alpha = 0.16f) else PhoneSurfaceElevated.copy(alpha = 0.7f),
-                        )
-                        .border(
-                            width = if (selected) 1.5.dp else 1.dp,
-                            color = if (selected) PhonePrimary else PhonePrimaryDim.copy(alpha = 0.45f),
-                            shape = RoundedCornerShape(14.dp),
-                        )
-                        .clickable {
-                            app.injector.buzz(longPress = false)
-                            scope.launch {
-                                prefs.setAudioOutputMode(mode)
-                                if (audioStatus.externalDisplayActive) {
-                                    app.audioRouter.reapplyRouting("ui-pick:${mode.id}")
-                                }
-                            }
-                        }
-                        .testTag("workspace_audio_mode_${mode.id}")
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        imageVector = modeIcon,
-                        contentDescription = null,
-                        tint = if (selected) PhonePrimaryBright else PhoneOnSurfaceMuted,
-                        modifier = Modifier.size(22.dp),
-                    )
-                    Spacer(Modifier.width(10.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            text = mode.title,
-                            color = if (selected) PhoneOnSurface else PhoneOnSurface.copy(alpha = 0.92f),
-                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        Text(
-                            text = mode.description,
-                            color = PhoneOnSurfaceMuted,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    Icon(
-                        imageVector = if (selected) Icons.Default.RadioButtonChecked else Icons.Default.RadioButtonUnchecked,
-                        contentDescription = if (selected) "Selected" else "Not selected",
-                        tint = if (selected) PhonePrimaryBright else PhoneOnSurfaceDim,
-                        modifier = Modifier.size(20.dp),
-                    )
-                }
-            }
-            RequirementBadge(Requirement.ROOT_OR_SHIZUKU)
-        }
         var showResetConfirm by remember { mutableStateOf(false) }
         ResetToDefaultsButton("Reset Workspace to Defaults") { showResetConfirm = true }
         if (showResetConfirm) {
             ResetConfirmDialog(
                 title = "Reset Workspace to defaults?",
-                message = "This resets the dock layout & style, top bar, folder windows, widget overlay background, audio routing, app-search, and wallpaper to their defaults. Your dock apps, folders, and widgets are kept.",
+                message = "This resets the dock layout & style, top bar, folder windows, widget overlay background, app-search, and wallpaper to their defaults. Your dock apps, folders, and widgets are kept.",
                 onConfirm = {
                     showResetConfirm = false
                     scope.launch {
-                        // Reset dock appearance/layout/behavior but PRESERVE items + folders.
                         val keptItems = dockCfg.items
                         prefs.setDockConfig(DockConfig().copy(items = keptItems))
                         prefs.setTopBarConfig(com.portalpad.app.data.TopBarConfig())
                         prefs.setFolderWindowConfig(com.portalpad.app.data.FolderWindowConfig())
-                        // Widget overlay: reset the backdrop style but KEEP the
-                        // added widgets (mirrors the dock-items rule — clearing
-                        // them would also orphan their system bindings).
                         prefs.setWidgetOverlayConfig(
                             com.portalpad.app.data.WidgetOverlayConfig()
                                 .copy(widgets = widgetOverlayCfg.widgets),
                         )
                         prefs.setBool(PreferencesRepository.Keys.DOCK_ENABLED, true)
                         prefs.setBool(PreferencesRepository.Keys.SEARCH_KEYBOARD_ON_PHONE, true)
-                        prefs.setAudioOutputMode(AudioOutputMode.AUTO)
                         prefs.resetHomeWallpapers()
                     }
                 },
@@ -9600,39 +9336,6 @@ private fun DockCustomizationPage(onBack: () -> Unit) {
                     )
                 }
                 Spacer(Modifier.height(4.dp))
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
-                        Text(
-                            "Show Recent Apps button",
-                            color = PhoneOnSurface,
-                            style = MaterialTheme.typography.bodyLarge,
-                        )
-                        Text(
-                            "Places a Recent Apps button to the right of Home on the dock to switch between or force-close apps opened on the external display.",
-                            color = PhoneOnSurfaceMuted,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                    Switch(
-                        checked = dockCfg.showRecentAppsButton,
-                        onCheckedChange = { show ->
-                            scope.launch { prefs.setDockConfig(dockCfg.copy(showRecentAppsButton = show)) }
-                        },
-                        colors = SwitchDefaults.colors(
-                            checkedTrackColor = PhonePrimary,
-                            checkedThumbColor = PhonePrimaryBright,
-                            uncheckedTrackColor = PhoneSurfaceElevated,
-                            uncheckedThumbColor = PhoneOnSurfaceDim,
-                        ),
-                        modifier = Modifier.testTag("dock_show_recent_apps_switch"),
-                    )
-                }
-                Spacer(Modifier.height(4.dp))
                 Text("Icon size: ${dockCfg.iconSizeDp} dp", color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium)
                 Slider(
                     value = dockCfg.iconSizeDp.toFloat(),
@@ -9668,7 +9371,6 @@ private fun DockCustomizationPage(onBack: () -> Unit) {
                             prefs.setDockConfig(
                                 dockCfg.copy(
                                     showLabels = true,
-                                    showRecentAppsButton = true,
                                     iconSizeDp = 60,
                                     labelSizeSp = 13,
                                     dockWidthPct = 92,
@@ -10204,6 +9906,7 @@ private fun FolderWindowCustomizationPage(onBack: () -> Unit) {
 @Composable
 private fun DisplayTab(
     onOpenDisplaySettings: () -> Unit,
+    onOpenAutoLaunch: () -> Unit = {},
     scrollToTopSignal: Int = 0,
 ) {
     val app = PortalPadApp.instance
@@ -10226,8 +9929,14 @@ private fun DisplayTab(
             } else null
         }
     }
+    val autoLaunch by prefs.autoLaunchOnStart.collectAsState(initial = com.portalpad.app.data.AutoLaunch.Wallpaper)
+    val audioStatus by app.audioRouter.status.collectAsState()
+    val selectedAudioMode by prefs.audioOutputMode.collectAsState(initial = AudioOutputMode.AUTO)
+    LaunchedEffect(Unit) {
+        app.audioRouter.refreshSnapshotOnly()
+    }
 
-    TabBody(spacing = 16.dp, scrollToTopSignal = scrollToTopSignal) {
+    TabBody(spacing = 14.dp, scrollToTopSignal = scrollToTopSignal) {
         SectionCard(title = "Connected external display") {
             val displayConnected = labelDisplayId != null
             val displaySettingsAvailable = serviceRunning && displayConnected
@@ -10312,7 +10021,57 @@ private fun DisplayTab(
             }
         }
 
-        SectionCard(title = "Display connect & session resume") {
+        CollapsibleCard(title = "Session & connect", defaultExpanded = true) {
+            val autoLaunchEntry = (autoLaunch as? com.portalpad.app.data.AutoLaunch.Launch)?.entry
+            val autoLaunchLabel = when (val a = autoLaunch) {
+                com.portalpad.app.data.AutoLaunch.Wallpaper -> "Wallpaper (default)"
+                com.portalpad.app.data.AutoLaunch.LastApp -> "Last app"
+                is com.portalpad.app.data.AutoLaunch.Launch -> a.entry.label
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(PhoneSurfaceElevated)
+                    .border(1.dp, PhonePrimaryDim.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
+                    .clickable { onOpenAutoLaunch() }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                    Text(
+                        "Auto Launch on Start",
+                        color = PhoneOnSurface,
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        "What appears on the external display when a session starts.",
+                        color = PhoneOnSurfaceMuted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                if (autoLaunchEntry != null) {
+                    com.portalpad.app.ui.common.AssignedActionLabel(
+                        entry = autoLaunchEntry,
+                        fallback = autoLaunchLabel,
+                        iconSizeDp = 24,
+                    )
+                } else {
+                    Text(
+                        autoLaunchLabel,
+                        color = PhoneAccent,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            HorizontalDivider(
+                color = PhonePrimaryDim.copy(alpha = 0.45f),
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
             ToggleRowWithDesc(
                 label = "Auto-open PortalPad when display connects",
                 desc = "Automatically open PortalPad's Start screen on your phone when an external display plugs in while Start Service is off, so you can tap Start Service right away. When the service is already running, normal connect behavior runs unchanged.",
@@ -10345,7 +10104,7 @@ private fun DisplayTab(
             )
         }
 
-        SectionCard(title = "Display mode (beta)") {
+        CollapsibleCard(title = "Display mode (beta)", defaultExpanded = false) {
             Text(
                 "How apps fill the external display.",
                 color = PhoneOnSurfaceDim,
@@ -10433,7 +10192,89 @@ private fun DisplayTab(
             )
         }
 
-        SectionCard(title = "Mirroring keep-awake") {
+        CollapsibleCard(title = "Audio output", defaultExpanded = false) {
+            Text(
+                "Forces the selected media audio output as soon as an external display connects. " +
+                    "In Auto mode, audio plays on Bluetooth if connected (and shifts automatically if Bluetooth connects mid-session), " +
+                    "then External display audio, and falls back to Phone audio last.",
+                color = PhoneOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            WorkspaceAudioStatusCard(status = audioStatus)
+            AudioOutputMode.entries.forEach { mode ->
+                val selected = selectedAudioMode == mode
+                val modeIcon = when (mode) {
+                    AudioOutputMode.AUTO -> Icons.Default.GraphicEq
+                    AudioOutputMode.BLUETOOTH -> Icons.Default.BluetoothAudio
+                    AudioOutputMode.EXTERNAL_DISPLAY -> Icons.Default.Tv
+                    AudioOutputMode.PHONE -> Icons.Default.SpeakerPhone
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(
+                            if (selected) PhonePrimary.copy(alpha = 0.16f) else PhoneSurfaceElevated.copy(alpha = 0.7f),
+                        )
+                        .border(
+                            width = if (selected) 1.5.dp else 1.dp,
+                            color = if (selected) PhonePrimary else PhonePrimaryDim.copy(alpha = 0.45f),
+                            shape = RoundedCornerShape(14.dp),
+                        )
+                        .clickable {
+                            app.injector.buzz(longPress = false)
+                            scope.launch {
+                                prefs.setAudioOutputMode(mode)
+                                if (audioStatus.externalDisplayActive) {
+                                    app.audioRouter.reapplyRouting("ui-pick:${mode.id}")
+                                }
+                            }
+                        }
+                        .testTag("workspace_audio_mode_${mode.id}")
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = modeIcon,
+                        contentDescription = null,
+                        tint = if (selected) PhonePrimaryBright else PhoneOnSurfaceMuted,
+                        modifier = Modifier.size(22.dp),
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            text = mode.title,
+                            color = if (selected) PhoneOnSurface else PhoneOnSurface.copy(alpha = 0.92f),
+                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = mode.description,
+                            color = PhoneOnSurfaceMuted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Icon(
+                        imageVector = if (selected) Icons.Default.RadioButtonChecked else Icons.Default.RadioButtonUnchecked,
+                        contentDescription = if (selected) "Selected" else "Not selected",
+                        tint = if (selected) PhonePrimaryBright else PhoneOnSurfaceDim,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+            RequirementBadge(Requirement.ROOT_OR_SHIZUKU)
+        }
+
+        CollapsibleCard(title = "Mirroring & orientation", defaultExpanded = false) {
+            Text(
+                "Mirroring keep-awake",
+                color = PhoneOnSurface,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Medium,
+            )
             Text(
                 "Choose how your phone screen stays awake during display mirroring so screen timeout doesn't turn off the external display.",
                 color = PhoneOnSurfaceMuted,
@@ -10498,9 +10339,10 @@ private fun DisplayTab(
                 color = PhoneOnSurfaceMuted,
                 style = MaterialTheme.typography.bodySmall,
             )
-        }
-
-        SectionCard(title = "Lock screen & orientation") {
+            HorizontalDivider(
+                color = PhonePrimaryDim.copy(alpha = 0.45f),
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
             ToggleRowWithDesc(
                 label = "Show controls over the lock screen",
                 desc = "Let the PortalPad controls (trackpad / remote / air mouse) open over your phone's lock screen, so you can drive the external display without unlocking. Leaving PortalPad to other apps still requires unlocking.",
@@ -10515,6 +10357,7 @@ private fun DisplayTab(
                 "App orientation",
                 color = PhoneOnSurface,
                 style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Medium,
             )
             Text(
                 "Locks PortalPad's phone screens to a fixed orientation so they don't auto-rotate. Affects only PortalPad — never apps shown on the external display. Pick Auto-rotate if you use a tablet.",
@@ -10571,6 +10414,35 @@ private fun DisplayTab(
                 "Changes apply when you return to a PortalPad screen.",
                 color = PhoneOnSurfaceMuted,
                 style = MaterialTheme.typography.bodySmall,
+            )
+        }
+
+        var showResetConfirm by remember { mutableStateOf(false) }
+        ResetToDefaultsButton("Reset Display to Defaults") { showResetConfirm = true }
+        if (showResetConfirm) {
+            ResetConfirmDialog(
+                title = "Reset Display to defaults?",
+                message = "This resets display connect & session resume, Display mode, audio output routing, mirroring keep-awake, lock screen, and app orientation settings to their defaults.",
+                onConfirm = {
+                    showResetConfirm = false
+                    scope.launch {
+                        prefs.setForceSeparateDisplay(false)
+                        prefs.setAutoLaunchOnStart(com.portalpad.app.data.AutoLaunch.Wallpaper)
+                        prefs.setAutoOpenMainOnDisplayConnect(false)
+                        prefs.setBool(PreferencesRepository.Keys.AUTO_RESUME_LAST_APP_30M, true)
+                        prefs.setBool(PreferencesRepository.Keys.FORWARD_VIDEO_ON_CONNECT, true)
+                        prefs.setBool(PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, false)
+                        prefs.setBool(PreferencesRepository.Keys.DOCK_OPENS_FREEFORM, true)
+                        prefs.setBool(PreferencesRepository.Keys.PERM_DIALOG_KEEP_ON_EXTERNAL, true)
+                        prefs.setBool(PreferencesRepository.Keys.CLOSE_REMOVES_FROM_RECENTS, true)
+                        prefs.setInt(PreferencesRepository.Keys.MAX_WINDOWS, 5)
+                        prefs.setAudioOutputMode(AudioOutputMode.AUTO)
+                        prefs.setMirrorKeepAwakeMode(MirrorKeepAwakeMode.OFF)
+                        prefs.setBool(PreferencesRepository.Keys.ALLOW_LOCKSCREEN, true)
+                        prefs.setString(PreferencesRepository.Keys.FORCE_ORIENTATION, OrientationLock.DEFAULT)
+                    }
+                },
+                onCancel = { showResetConfirm = false },
             )
         }
     }
@@ -12472,7 +12344,7 @@ private fun ActionRow(label: String, value: String, onClick: () -> Unit) {
 private fun ThreeFingerGesturesSection() {
     val prefs = PortalPadApp.instance.prefs
     val scope = rememberCoroutineScope()
-    SectionCard(title = "Three-Finger Gestures") {
+    CollapsibleCard(title = "Three-Finger Gestures", defaultExpanded = false) {
         ToggleRowWithDesc(
             label = androidx.compose.ui.res.stringResource(
                 com.portalpad.app.R.string.pref_three_finger_tap_enabled_label,
