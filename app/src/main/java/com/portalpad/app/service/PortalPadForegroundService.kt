@@ -949,6 +949,8 @@ class PortalPadForegroundService : Service() {
             return
         }
 
+        (applicationContext as PortalPadApp).ensureAccessibilityKeepAlive("fgs-start")
+
         // Live external-display DPI: apply the user's DPI to the running VD via
         // `wm density` whenever the pref changes, so the slider/text field take
         // effect without a reconnect. Debounced (200ms) so dragging doesn't spam

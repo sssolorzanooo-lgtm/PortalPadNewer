@@ -1147,9 +1147,10 @@ class PreferencesRepository(private val context: Context) {
     }
 
     /**
-     * Mark any unanswered permission-backed Setup cards as "yes" in a single
-     * DataStore transaction, preserving any explicit "no" picks and leaving
-     * the hardware-only External mouse prompt untouched.
+     * Mark any unanswered Setup question cards as "yes" in a single DataStore
+     * transaction, preserving any explicit "no" picks. When the External mouse
+     * question is unanswered, enable EXT_MOUSE_ENABLED as well to match
+     * choosing "Yes" on that card.
      */
     suspend fun markUnansweredSetupPermissionsYes() = context.dataStore.edit { p ->
         listOf(
@@ -1162,6 +1163,10 @@ class PreferencesRepository(private val context: Context) {
             if (p[key].isNullOrEmpty()) {
                 p[key] = "yes"
             }
+        }
+        if (p[Keys.SETUP_MOUSE_ANSWER].isNullOrEmpty()) {
+            p[Keys.SETUP_MOUSE_ANSWER] = "yes"
+            p[Keys.EXT_MOUSE_ENABLED] = true
         }
     }
 

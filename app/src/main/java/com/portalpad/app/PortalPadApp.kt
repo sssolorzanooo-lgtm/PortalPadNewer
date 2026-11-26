@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -821,6 +822,19 @@ class PortalPadApp : Application() {
 
     internal val appScope = CoroutineScope(SupervisorJob())
 
+    fun ensureAccessibilityKeepAlive(reason: String) {
+        appScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                com.portalpad.app.service.AccessibilityKeepAlive.ensureEnabledIfWanted(
+                    context = this@PortalPadApp,
+                    prefs = prefs,
+                    accessBackends = listOf(access, shizuku, root),
+                    reason = reason,
+                )
+            }
+        }
+    }
+
     /**
      * Bring PortalPad's MainActivity to the foreground after the given [delays]
      * (ms). Called from the foreground service's onDestroy on Disable: tearing
@@ -882,6 +896,7 @@ class PortalPadApp : Application() {
                             // injection parity with Shizuku. Safe no-op if it
                             // can't start — routing falls back to root shell.
                             rootClickBackend.bind()
+                            ensureAccessibilityKeepAlive("root-ready")
                         }
                     }
                     AccessMode.SHIZUKU -> {
@@ -1008,13 +1023,28 @@ class PortalPadApp : Application() {
         }
 
         // When Shizuku becomes ready, bind the UserService if user has chosen Shizuku
+        // and restore accessibility if SETUP_WANTS_ACCESSIBILITY is "yes".
         appScope.launch {
             shizuku.status.collectLatest { status ->
-                if (status == com.portalpad.app.shizuku.ShizukuManager.Status.READY
-                    && currentAccessMode == AccessMode.SHIZUKU) {
-                    shizukuClickBackend.bind()
+                if (status == com.portalpad.app.shizuku.ShizukuManager.Status.READY) {
+                    if (currentAccessMode == AccessMode.SHIZUKU) {
+                        shizukuClickBackend.bind()
+                    }
+                    ensureAccessibilityKeepAlive("shizuku-ready")
                 }
             }
+        }
+
+        // Keep PortalPadAccessibilityService enabled whenever Setup's
+        // "Auto-open typing page" is "yes" (restores after Force stop or restart).
+        appScope.launch {
+            prefs.string(com.portalpad.app.data.PreferencesRepository.Keys.SETUP_WANTS_ACCESSIBILITY)
+                .distinctUntilChanged()
+                .collectLatest { answer ->
+                    if (answer == "yes") {
+                        ensureAccessibilityKeepAlive("app-start-or-setup-yes")
+                    }
+                }
         }
 
         appScope.launch {

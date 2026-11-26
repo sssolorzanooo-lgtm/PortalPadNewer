@@ -48,14 +48,13 @@ class SetupEnableAllRequiredTest {
     }
 
     @Test
-    fun markUnansweredSetupPermissionsYes_setsBlankPermissionCardsToYes_andPreservesExplicitNoAndMouse() = runBlocking {
+    fun markUnansweredSetupPermissionsYes_setsBlankSetupCardsToYes_andPreservesExplicitNo() = runBlocking {
         val context: Context = ApplicationProvider.getApplicationContext()
         val prefs = PreferencesRepository(context)
         prefs.clearAllForFactoryReset()
 
-        // Explicit user opt-outs and hardware mouse choice remain untouched.
+        // Explicit user opt-out remains untouched; unanswered External mouse enables.
         prefs.setString(PreferencesRepository.Keys.SETUP_WANTS_VOICE_SEARCH, "no")
-        prefs.setString(PreferencesRepository.Keys.SETUP_MOUSE_ANSWER, "")
 
         prefs.markUnansweredSetupPermissionsYes()
 
@@ -64,7 +63,15 @@ class SetupEnableAllRequiredTest {
         assertEquals("yes", prefs.string(PreferencesRepository.Keys.SETUP_WANTS_BACKGROUND).first())
         assertEquals("yes", prefs.string(PreferencesRepository.Keys.SETUP_WANTS_PHONE_STATE).first())
         assertEquals("yes", prefs.string(PreferencesRepository.Keys.SETUP_WANTS_ACCESSIBILITY).first())
-        assertEquals("", prefs.string(PreferencesRepository.Keys.SETUP_MOUSE_ANSWER).first())
+        assertEquals("yes", prefs.string(PreferencesRepository.Keys.SETUP_MOUSE_ANSWER).first())
+        assertTrue(prefs.bool(PreferencesRepository.Keys.EXT_MOUSE_ENABLED, false).first())
+
+        // Explicit "no" on External mouse must remain untouched.
+        prefs.setString(PreferencesRepository.Keys.SETUP_MOUSE_ANSWER, "no")
+        prefs.setBool(PreferencesRepository.Keys.EXT_MOUSE_ENABLED, false)
+        prefs.markUnansweredSetupPermissionsYes()
+        assertEquals("no", prefs.string(PreferencesRepository.Keys.SETUP_MOUSE_ANSWER).first())
+        assertFalse(prefs.bool(PreferencesRepository.Keys.EXT_MOUSE_ENABLED, true).first())
     }
 
     @Test

@@ -12754,7 +12754,7 @@ private fun AutoDisableRow() {
             color = PhoneOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
         )
         Spacer(Modifier.height(8.dp))
-        val options = listOf(0 to "Never", 5 to "5 min", 15 to "15 min", 60 to "1 hour")
+        val options = listOf(0 to "Never", 5 to "5 min", 15 to "15 min", 30 to "30 min", 60 to "1 hour")
         androidx.compose.foundation.layout.FlowRow(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -13095,12 +13095,8 @@ internal data class EnableAllSettingsResult(
     val a11yOk: Boolean,
 )
 
-internal fun mergeColonSeparatedComponent(current: String, component: String): String {
-    val trimmed = current.trim()
-    if (trimmed.isEmpty() || trimmed == "null") return component
-    val parts = trimmed.split(":").filter { it.isNotBlank() }
-    return if (parts.contains(component)) parts.joinToString(":") else (parts + component).joinToString(":")
-}
+internal fun mergeColonSeparatedComponent(current: String, component: String): String =
+    com.portalpad.app.service.AccessibilityKeepAlive.mergeComponent(current, component)
 
 internal fun buildEnableAllShellCommands(
     pkg: String,
@@ -13156,12 +13152,7 @@ internal suspend fun runEnableAllRequiredSettings(
         }.getOrDefault(false)
     },
     checkA11y: () -> Boolean = {
-        runCatching {
-            android.provider.Settings.Secure.getString(
-                context.contentResolver,
-                android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-            )?.contains(context.packageName) == true
-        }.getOrDefault(false)
+        com.portalpad.app.service.AccessibilityKeepAlive.isEnabledInSettings(context)
     },
 ): EnableAllSettingsResult {
     val pkg = context.packageName
@@ -13191,6 +13182,23 @@ internal suspend fun runEnableAllRequiredSettings(
         }
         runCatching {
             shellAccess.execShell("settings put secure accessibility_enabled 1")
+        }
+        if (context.checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED &&
+            !com.portalpad.app.service.AccessibilityKeepAlive.isEnabledInSettings(context)
+        ) {
+            runCatching {
+                android.provider.Settings.Secure.putString(
+                    context.contentResolver,
+                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                    nextA11y,
+                )
+                android.provider.Settings.Secure.putInt(
+                    context.contentResolver,
+                    android.provider.Settings.Secure.ACCESSIBILITY_ENABLED,
+                    1,
+                )
+            }
         }
     }
 
