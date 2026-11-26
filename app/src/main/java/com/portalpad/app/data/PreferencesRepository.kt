@@ -1147,6 +1147,25 @@ class PreferencesRepository(private val context: Context) {
     }
 
     /**
+     * Mark any unanswered permission-backed Setup cards as "yes" in a single
+     * DataStore transaction, preserving any explicit "no" picks and leaving
+     * the hardware-only External mouse prompt untouched.
+     */
+    suspend fun markUnansweredSetupPermissionsYes() = context.dataStore.edit { p ->
+        listOf(
+            Keys.SETUP_WANTS_NOTIF_ACCESS,
+            Keys.SETUP_WANTS_VOICE_SEARCH,
+            Keys.SETUP_WANTS_BACKGROUND,
+            Keys.SETUP_WANTS_PHONE_STATE,
+            Keys.SETUP_WANTS_ACCESSIBILITY,
+        ).forEach { key ->
+            if (p[key].isNullOrEmpty()) {
+                p[key] = "yes"
+            }
+        }
+    }
+
+    /**
      * Wipe every stored preference. Used by Settings → Diagnostics → Reset
      * to factory defaults. After this returns, the process should be killed
      * so the next launch reads pure defaults everywhere.

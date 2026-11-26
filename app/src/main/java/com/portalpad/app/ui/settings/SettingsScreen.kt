@@ -11,6 +11,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.layout.layout
 import androidx.compose.foundation.layout.*
 import androidx.core.graphics.drawable.toBitmap
@@ -1425,137 +1426,31 @@ private fun PermissionsPage(scrollToTopSignal: Int = 0) {
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Spacer(Modifier.height(10.dp))
-            Button(
-                onClick = {
-                    val shellAccess = listOf(app.access, app.shizuku, app.root)
-                        .firstOrNull { it.isReady }
-                    if (shellAccess == null) {
-                        quickGrantNote = "Connect Shizuku or Root in Access source first."
-                        return@Button
-                    }
-                    quickGrantBusy = true
-                    quickGrantNote = "Applying required settings via ${if (app.root.isReady && accessMode == AccessMode.ROOT) "Root" else "Shizuku"}..."
-                    scope.launch {
-                        val pkg = context.packageName
-                        val notifComp = "$pkg/${com.portalpad.app.service.PortalPadNotificationListenerService::class.java.name}"
-                        val a11yComp = "$pkg/${com.portalpad.app.service.PortalPadAccessibilityService::class.java.name}"
-                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                            val cmds = mutableListOf(
-                                "appops set $pkg ACCESS_RESTRICTED_SETTINGS allow",
-                                "appops set $pkg SYSTEM_ALERT_WINDOW allow",
-                                "pm grant $pkg android.permission.WRITE_SECURE_SETTINGS",
-                                "pm grant $pkg android.permission.INJECT_EVENTS",
-                                "cmd deviceidle whitelist +$pkg",
-                                "dumpsys deviceidle whitelist +$pkg",
-                                "cmd notification allow_listener $notifComp",
-                                "pm grant $pkg android.permission.RECORD_AUDIO",
-                                "pm grant $pkg android.permission.READ_PHONE_STATE",
+                EnableAllRequiredSettingsButton(
+                    privilegeReady = privilegeReady,
+                    busy = quickGrantBusy,
+                    note = quickGrantNote,
+                    buttonTestTag = "permissions_enable_all_shizuku_button",
+                    onClick = {
+                        val shellAccess = listOf(app.access, app.shizuku, app.root)
+                            .firstOrNull { it.isReady }
+                        if (shellAccess == null) {
+                            quickGrantNote = "Connect Shizuku or Root in Access source first."
+                            return@EnableAllRequiredSettingsButton
+                        }
+                        quickGrantBusy = true
+                        quickGrantNote = "Applying required settings via ${if (app.root.isReady && accessMode == AccessMode.ROOT) "Root" else "Shizuku"}..."
+                        scope.launch {
+                            val result = runEnableAllRequiredSettings(
+                                context = context,
+                                shellAccess = shellAccess,
+                                onTick = { refreshTick++ },
                             )
-                            if (android.os.Build.VERSION.SDK_INT >= 33) {
-                                cmds += "pm grant $pkg android.permission.POST_NOTIFICATIONS"
-                            }
-                            if (android.os.Build.VERSION.SDK_INT >= 31) {
-                                cmds += "pm grant $pkg android.permission.BLUETOOTH_CONNECT"
-                            }
-                            cmds.forEach { cmd -> runCatching { shellAccess.execShell(cmd) } }
-
-                            val curNotif = runCatching {
-                                shellAccess.execShell("settings get secure enabled_notification_listeners").trim()
-                            }.getOrDefault("")
-                            if (!curNotif.split(":").contains(notifComp)) {
-                                val nextNotif = when {
-                                    curNotif.isEmpty() || curNotif == "null" -> notifComp
-                                    else -> "$curNotif:$notifComp"
-                                }
-                                runCatching {
-                                    shellAccess.execShell("settings put secure enabled_notification_listeners $nextNotif")
-                                }
-                            }
-
-                            val curA11y = runCatching {
-                                shellAccess.execShell("settings get secure enabled_accessibility_services").trim()
-                            }.getOrDefault("")
-                            val nextA11y = when {
-                                curA11y.isEmpty() || curA11y == "null" -> a11yComp
-                                curA11y.split(":").contains(a11yComp) -> curA11y
-                                else -> "$curA11y:$a11yComp"
-                            }
-                            runCatching {
-                                shellAccess.execShell("settings put secure enabled_accessibility_services $nextA11y")
-                            }
-                            runCatching {
-                                shellAccess.execShell("settings put secure accessibility_enabled 1")
-                            }
+                            quickGrantNote = formatEnableAllResultNote(result)
+                            quickGrantBusy = false
                         }
-
-                        var notifOk = false
-                        var a11yOk = false
-                        for (i in 0 until 6) {
-                            kotlinx.coroutines.delay(350)
-                            refreshTick++
-                            notifOk = runCatching {
-                                android.provider.Settings.Secure.getString(
-                                    context.contentResolver, "enabled_notification_listeners",
-                                )?.contains(pkg) == true
-                            }.getOrDefault(false)
-                            a11yOk = runCatching {
-                                android.provider.Settings.Secure.getString(
-                                    context.contentResolver,
-                                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-                                )?.contains(pkg) == true
-                            }.getOrDefault(false)
-                            if (notifOk && a11yOk) break
-                        }
-                        refreshTick++
-                        val overlayOk = android.provider.Settings.canDrawOverlays(context)
-                        quickGrantNote = if (overlayOk && notifOk && a11yOk) {
-                            "All required permissions & services enabled (Camera untouched)."
-                        } else {
-                            val blocked = buildList {
-                                if (!overlayOk) add("Overlay")
-                                if (!notifOk) add("Notification access")
-                                if (!a11yOk) add("Accessibility")
-                            }.joinToString(", ")
-                            "Applied Shizuku grants (Camera untouched). Still needs OS approval: $blocked (check App info \u2192 Allow restricted settings if blocked)."
-                        }
-                        quickGrantBusy = false
-                    }
-                },
-                enabled = !quickGrantBusy,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = PhonePrimary,
-                    contentColor = PhoneOnSurface,
-                    disabledContainerColor = PhoneSurfaceElevated,
-                    disabledContentColor = PhoneOnSurfaceDim,
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 48.dp)
-                    .testTag("permissions_enable_all_shizuku_button"),
-            ) {
-                if (quickGrantBusy) {
-                    CircularProgressIndicator(
-                        color = PhoneOnSurface,
-                        strokeWidth = 2.dp,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(Modifier.width(10.dp))
-                    Text("Enabling permissions...")
-                } else {
-                    Text(
-                        if (privilegeReady) "Enable all required settings"
-                        else "Enable all required settings (connect Shizuku)",
-                    )
-                }
-            }
-            quickGrantNote?.let { note ->
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    note,
-                    color = if (note.startsWith("All required")) PhoneAccent else PhoneOnSurfaceMuted,
-                    style = MaterialTheme.typography.bodySmall,
+                    },
                 )
-            }
             }
         }
 
@@ -2548,7 +2443,13 @@ private fun StartSetupPage(
 ) {
     val app = PortalPadApp.instance
     val context = LocalContext.current
+    val density = LocalDensity.current
     val scope = rememberCoroutineScope()
+
+    var quickGrantBusy by remember { mutableStateOf(false) }
+    var quickGrantNote by remember { mutableStateOf<String?>(null) }
+    var autoOpenRestrictedHelper by remember { mutableStateOf(false) }
+    var autoOpenTypingSectionY by remember { mutableIntStateOf(0) }
 
     // Re-check Android-settings-backed statuses on resume (user may have just
     // granted overlay / toggled the notification listener and returned).
@@ -2613,6 +2514,9 @@ private fun StartSetupPage(
                 android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
             )?.contains(context.packageName) == true
         }.getOrDefault(false)
+    }
+    LaunchedEffect(accessibilityEnabledNow) {
+        if (accessibilityEnabledNow) autoOpenRestrictedHelper = false
     }
     val privilegeReady = when (accessMode) {
         AccessMode.SHIZUKU -> shizukuStatus == ShizukuManager.Status.READY
@@ -2989,6 +2893,46 @@ private fun StartSetupPage(
                     )
                 }
                 Spacer(Modifier.height(6.dp))
+                EnableAllRequiredSettingsButton(
+                    privilegeReady = privilegeReady || app.shizuku.isReady || app.root.isReady,
+                    busy = quickGrantBusy,
+                    note = quickGrantNote,
+                    buttonTestTag = "setup_enable_all_required_button",
+                    onClick = {
+                        val shellAccess = listOf(app.access, app.shizuku, app.root)
+                            .firstOrNull { it.isReady }
+                        if (shellAccess == null) {
+                            quickGrantNote = "Connect Shizuku or Root in Privilege source first."
+                            return@EnableAllRequiredSettingsButton
+                        }
+                        quickGrantBusy = true
+                        quickGrantNote = "Applying required settings via ${if (app.root.isReady && accessMode == AccessMode.ROOT) "Root" else "Shizuku"}..."
+                        scope.launch {
+                            app.prefs.markUnansweredSetupPermissionsYes()
+                            val result = runEnableAllRequiredSettings(
+                                context = context,
+                                shellAccess = shellAccess,
+                                onTick = { refreshTick++ },
+                            )
+                            quickGrantNote = formatEnableAllResultNote(result)
+                            quickGrantBusy = false
+                            if (!result.a11yOk) {
+                                app.prefs.setString(
+                                    com.portalpad.app.data.PreferencesRepository.Keys.SETUP_WANTS_ACCESSIBILITY,
+                                    "yes",
+                                )
+                                autoOpenRestrictedHelper = true
+                                androidx.compose.runtime.withFrameNanos { }
+                                androidx.compose.runtime.withFrameNanos { }
+                                val topMarginPx = with(density) { 8.dp.roundToPx() }
+                                bodyScroll.animateScrollTo(
+                                    (autoOpenTypingSectionY - topMarginPx).coerceAtLeast(0),
+                                )
+                            }
+                        }
+                    },
+                )
+                Spacer(Modifier.height(6.dp))
                 SetupRequirementRow(
                     met = overlayGranted,
                     title = "Display overlay",
@@ -3261,6 +3205,12 @@ private fun StartSetupPage(
                 }
             }
 
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .onGloballyPositioned { autoOpenTypingSectionY = it.positionInParent().y.toInt() }
+                    .testTag("setup_auto_open_typing_card"),
+            ) {
             SectionCard(title = "Auto-open typing page") {
                 Row(
                     verticalAlignment = Alignment.Top,
@@ -3302,15 +3252,9 @@ private fun StartSetupPage(
                 if (accessibilityAnswer == "yes") {
                     Spacer(Modifier.height(5.dp))
                     // Restricted-settings helper (SH): fires when a "Tap to
-                    // enable" attempt FAILS its ~2.4s poll (Samsung's
-                    // restricted-settings gate silently swallowed the shell
-                    // write) - not on any wall-clock timer, so the "Android
-                    // blocked the automatic enable" copy is always literally
-                    // true when it appears. Resets once the service enables.
-                    var restrictedHelper by remember { mutableStateOf(false) }
-                    LaunchedEffect(accessibilityEnabledNow) {
-                        if (accessibilityEnabledNow) restrictedHelper = false
-                    }
+                    // enable" or one-tap Setup attempt FAILS its poll (e.g.
+                    // Samsung's restricted-settings gate swallowed the shell
+                    // write). Hoisted at StartSetupPage scope and cleared once enabled.
                     SetupRequirementRow(
                         met = accessibilityEnabledNow,
                         title = "Enable PortalPad accessibility",
@@ -3318,9 +3262,9 @@ private fun StartSetupPage(
                         // Once manual setup is needed, both destinations live
                         // together below the note instead of splitting one
                         // above it and one below it.
-                        actionLabel = if (privilegeReady && !restrictedHelper) "Tap to enable" else "",
+                        actionLabel = if (privilegeReady && !autoOpenRestrictedHelper) "Tap to enable" else "",
                         onAction = {
-                            if (privilegeReady && !restrictedHelper) {
+                            if (privilegeReady && !autoOpenRestrictedHelper) {
                                 // Root/Shizuku present: enable the service directly via a
                                 // read-modify-write of the secure list (append our component,
                                 // never overwrite other services) + accessibility_enabled.
@@ -3333,11 +3277,7 @@ private fun StartSetupPage(
                                                 "settings get secure enabled_accessibility_services",
                                             ).trim()
                                         }.getOrDefault("")
-                                        val list = when {
-                                            cur.isEmpty() || cur == "null" -> comp
-                                            cur.split(":").contains(comp) -> cur
-                                            else -> "$cur:$comp"
-                                        }
+                                        val list = mergeColonSeparatedComponent(cur, comp)
                                         runCatching {
                                             app.access.execShell(
                                                 "settings put secure enabled_accessibility_services $list",
@@ -3367,20 +3307,20 @@ private fun StartSetupPage(
                                         // No auto-bounce to the Accessibility screen (SH):
                                         // show the steps in place; the user taps "Open
                                         // Accessibility" themselves once they've read them.
-                                        restrictedHelper = true
+                                        autoOpenRestrictedHelper = true
                                     }
                                 }
                             } else {
                                 openIntent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
                             }
                         },
-                        extra = if (!accessibilityEnabledNow && (!privilegeReady || restrictedHelper)) {
+                        extra = if (!accessibilityEnabledNow && (!privilegeReady || autoOpenRestrictedHelper)) {
                             {
                                 Text(
                                     text = androidx.compose.ui.text.buildAnnotatedString {
                                         withStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold)) { append("Note: ") }
                                         append(
-                                            if (restrictedHelper) {
+                                            if (autoOpenRestrictedHelper) {
                                                 "Android blocked the automatic enable (restricted settings). " +
                                                     "Open Accessibility and tap PortalPad. If the switch is greyed " +
                                                     "out, tap it once, then open PortalPad's App info page, choose " +
@@ -3466,6 +3406,7 @@ private fun StartSetupPage(
                         } else null,
                     )
                 }
+            }
             }
 
             SectionCard(title = "External mouse") {
@@ -13147,3 +13088,172 @@ private fun FactoryResetRow() {
         }
     }
 }
+
+internal data class EnableAllSettingsResult(
+    val overlayOk: Boolean,
+    val notifOk: Boolean,
+    val a11yOk: Boolean,
+)
+
+internal fun mergeColonSeparatedComponent(current: String, component: String): String {
+    val trimmed = current.trim()
+    if (trimmed.isEmpty() || trimmed == "null") return component
+    val parts = trimmed.split(":").filter { it.isNotBlank() }
+    return if (parts.contains(component)) parts.joinToString(":") else (parts + component).joinToString(":")
+}
+
+internal fun buildEnableAllShellCommands(
+    pkg: String,
+    notifComponent: String,
+    sdkInt: Int = android.os.Build.VERSION.SDK_INT,
+): List<String> {
+    val cmds = mutableListOf(
+        "appops set $pkg ACCESS_RESTRICTED_SETTINGS allow",
+        "appops set $pkg SYSTEM_ALERT_WINDOW allow",
+        "pm grant $pkg android.permission.WRITE_SECURE_SETTINGS",
+        "pm grant $pkg android.permission.INJECT_EVENTS",
+        "cmd deviceidle whitelist +$pkg",
+        "dumpsys deviceidle whitelist +$pkg",
+        "cmd notification allow_listener $notifComponent",
+        "pm grant $pkg android.permission.RECORD_AUDIO",
+        "pm grant $pkg android.permission.READ_PHONE_STATE",
+    )
+    if (sdkInt >= 33) {
+        cmds += "pm grant $pkg android.permission.POST_NOTIFICATIONS"
+    }
+    if (sdkInt >= 31) {
+        cmds += "pm grant $pkg android.permission.BLUETOOTH_CONNECT"
+    }
+    return cmds
+}
+
+internal fun formatEnableAllResultNote(result: EnableAllSettingsResult): String {
+    return if (result.overlayOk && result.notifOk && result.a11yOk) {
+        "All required permissions & services enabled (Camera untouched)."
+    } else {
+        val blocked = buildList {
+            if (!result.overlayOk) add("Overlay")
+            if (!result.notifOk) add("Notification access")
+            if (!result.a11yOk) add("Accessibility")
+        }.joinToString(", ")
+        "Applied Shizuku grants (Camera untouched). Still needs OS approval: $blocked (check App info \u2192 Allow restricted settings if blocked)."
+    }
+}
+
+internal suspend fun runEnableAllRequiredSettings(
+    context: android.content.Context,
+    shellAccess: com.portalpad.app.service.ElevatedAccess,
+    onTick: () -> Unit,
+    ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO,
+    pollIntervalMs: Long = 350L,
+    pollAttempts: Int = 6,
+    checkOverlay: () -> Boolean = { android.provider.Settings.canDrawOverlays(context) },
+    checkNotif: () -> Boolean = {
+        runCatching {
+            android.provider.Settings.Secure.getString(
+                context.contentResolver, "enabled_notification_listeners",
+            )?.contains(context.packageName) == true
+        }.getOrDefault(false)
+    },
+    checkA11y: () -> Boolean = {
+        runCatching {
+            android.provider.Settings.Secure.getString(
+                context.contentResolver,
+                android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            )?.contains(context.packageName) == true
+        }.getOrDefault(false)
+    },
+): EnableAllSettingsResult {
+    val pkg = context.packageName
+    val notifComp = "$pkg/${com.portalpad.app.service.PortalPadNotificationListenerService::class.java.name}"
+    val a11yComp = "$pkg/${com.portalpad.app.service.PortalPadAccessibilityService::class.java.name}"
+    kotlinx.coroutines.withContext(ioDispatcher) {
+        buildEnableAllShellCommands(pkg = pkg, notifComponent = notifComp).forEach { cmd ->
+            runCatching { shellAccess.execShell(cmd) }
+        }
+
+        val curNotif = runCatching {
+            shellAccess.execShell("settings get secure enabled_notification_listeners").trim()
+        }.getOrDefault("")
+        if (!curNotif.split(":").contains(notifComp)) {
+            val nextNotif = mergeColonSeparatedComponent(curNotif, notifComp)
+            runCatching {
+                shellAccess.execShell("settings put secure enabled_notification_listeners $nextNotif")
+            }
+        }
+
+        val curA11y = runCatching {
+            shellAccess.execShell("settings get secure enabled_accessibility_services").trim()
+        }.getOrDefault("")
+        val nextA11y = mergeColonSeparatedComponent(curA11y, a11yComp)
+        runCatching {
+            shellAccess.execShell("settings put secure enabled_accessibility_services $nextA11y")
+        }
+        runCatching {
+            shellAccess.execShell("settings put secure accessibility_enabled 1")
+        }
+    }
+
+    var notifOk = false
+    var a11yOk = false
+    for (i in 0 until pollAttempts) {
+        if (pollIntervalMs > 0L) kotlinx.coroutines.delay(pollIntervalMs)
+        onTick()
+        notifOk = checkNotif()
+        a11yOk = checkA11y()
+        if (notifOk && a11yOk) break
+    }
+    onTick()
+    val overlayOk = checkOverlay()
+    return EnableAllSettingsResult(overlayOk = overlayOk, notifOk = notifOk, a11yOk = a11yOk)
+}
+
+@Composable
+private fun EnableAllRequiredSettingsButton(
+    privilegeReady: Boolean,
+    busy: Boolean,
+    note: String?,
+    buttonTestTag: String,
+    onClick: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth()) {
+        Button(
+            onClick = onClick,
+            enabled = !busy,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = PhonePrimary,
+                contentColor = PhoneOnSurface,
+                disabledContainerColor = PhoneSurfaceElevated,
+                disabledContentColor = PhoneOnSurfaceDim,
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 48.dp)
+                .testTag(buttonTestTag),
+        ) {
+            if (busy) {
+                CircularProgressIndicator(
+                    color = PhoneOnSurface,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(10.dp))
+                Text("Enabling permissions...")
+            } else {
+                Text(
+                    if (privilegeReady) "Enable all required settings"
+                    else "Enable all required settings (connect Shizuku)",
+                )
+            }
+        }
+        note?.let { status ->
+            Spacer(Modifier.height(8.dp))
+            Text(
+                status,
+                color = if (status.startsWith("All required")) PhoneAccent else PhoneOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
